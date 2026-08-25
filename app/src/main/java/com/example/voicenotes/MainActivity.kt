@@ -167,12 +167,16 @@ fun VoiceNotesScreen() {
                 value = displayText,
                 onValueChange = { },
                 readOnly = true,
-                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 140.dp)
+                    .fillMaxHeight()
+                    .verticalScroll(rememberScrollState()),
                 placeholder = { Text("Здесь появится обработанный текст…") }
             )
         }
 
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(12.dp))
 
         ConcentrationSlider(
             value = concentration,
@@ -191,35 +195,82 @@ fun VoiceNotesScreen() {
                 if (useAI) "режим ИИ" else "режим правил",
             fontSize = 12.sp, color = Color.Gray)
 
-        Spacer(Modifier.height(8.dp))
-        Text(status, color = Color.Gray, fontSize = 13.sp)
-        Spacer(Modifier.height(12.dp))
+        Spacer(Modifier.height(6.dp))
+        Text(status, color = Color.Gray, fontSize = 13.sp, maxLines = 1)
+        Spacer(Modifier.height(10.dp))
 
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            Button(onClick = {
+        // Крупная главная кнопка записи — её видно сразу.
+        Button(
+            onClick = {
                 if (!hasPermission) permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                 else if (isListening) { recognizer?.stopListening(); isListening = false }
                 else startListening()
-            }, enabled = !isProcessing) {
-                Text(if (isListening) "⏹ Стоп" else "🎤 Запись")
-            }
+            },
+            enabled = !isProcessing,
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (isListening) Color(0xFFE53935) else Color(0xFF3F51B5)
+            )
+        ) {
+            Text(
+                if (isListening) "⏹  Остановить запись" else "🎤  Начать запись",
+                fontSize = 17.sp, fontWeight = FontWeight.Medium
+            )
+        }
 
+        Spacer(Modifier.height(8.dp))
+
+        // Второй ряд: обработать (если ИИ), копировать, поделиться, очистить.
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
             if (useAI) {
-                Button(onClick = { processWithAI() },
-                    enabled = originalText.isNotBlank() && !isProcessing && !isListening) {
+                OutlinedButton(
+                    onClick = { processWithAI() },
+                    enabled = originalText.isNotBlank() && !isProcessing && !isListening,
+                    modifier = Modifier.weight(1f)
+                ) {
                     if (isProcessing) CircularProgressIndicator(
-                        Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp)
+                        Modifier.size(16.dp), strokeWidth = 2.dp)
                     else Text("Обработать")
                 }
             }
 
-            OutlinedButton(onClick = {
-                originalText = ""; displayText = ""; status = "Очищено."
-            }, enabled = originalText.isNotBlank() && !isProcessing) {
-                Text("Очистить")
-            }
+            OutlinedButton(
+                onClick = {
+                    val clip = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                    clip.setPrimaryClip(
+                        android.content.ClipData.newPlainText("Заметка", displayText))
+                    status = "Скопировано в буфер."
+                },
+                enabled = displayText.isNotBlank(),
+                modifier = Modifier.weight(1f)
+            ) { Text("Копировать") }
+
+            OutlinedButton(
+                onClick = {
+                    val share = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, displayText)
+                    }
+                    context.startActivity(Intent.createChooser(share, "Поделиться заметкой"))
+                },
+                enabled = displayText.isNotBlank(),
+                modifier = Modifier.weight(1f)
+            ) { Text("Отправить") }
         }
-        Spacer(Modifier.height(12.dp))
+
+        Spacer(Modifier.height(6.dp))
+
+        TextButton(
+            onClick = { originalText = ""; displayText = ""; status = "Очищено." },
+            enabled = originalText.isNotBlank() && !isProcessing,
+            modifier = Modifier.fillMaxWidth()
+        ) { Text("Очистить заметку", color = Color(0xFFC62828)) }
+
+        Spacer(Modifier.height(6.dp))
     }
 }
 
