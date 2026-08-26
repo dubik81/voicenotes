@@ -35,6 +35,7 @@ import java.util.Locale
 fun EditorScreen(
     note: Note,
     settings: Settings,
+    processor: VariantProcessor,
     onBack: () -> Unit,
     onChanged: () -> Unit,
     onDelete: () -> Unit
@@ -48,31 +49,24 @@ fun EditorScreen(
     val level = Level.fromIndex(levelIdx)
     val tone = Tone.fromIndex(toneIdx)
 
-    // Реактивное хранилище готовых вариантов. Ключ "levelOrdinal:toneOrdinal".
-    // Инициализируем из note (если заметка уже с вариантами).
-    val variants = remember(note.id) {
-        mutableStateMapOf<String, String>().apply { putAll(note.variants) }
-    }
-    // Реактивный оригинал.
     var original by remember(note.id) { mutableStateOf(note.original) }
-
     var isListening by remember { mutableStateOf(false) }
-    var busy by remember { mutableStateOf(false) }     // идёт хоть какой-то расчёт
     var liveText by remember { mutableStateOf("") }
     var status by remember { mutableStateOf(if (note.original.isBlank()) "Нажмите «Запись»" else "Готово") }
     var showRename by remember { mutableStateOf(false) }
+    // тикер, чтобы UI перечитывал note.variants при обновлениях процессора
+    var refreshTick by remember { mutableStateOf(0) }
 
     val accent = if (level.isRed) Palette.Red else Palette.Green
-    fun key(l: Level, t: Tone) = "${l.ordinal}:${t.ordinal}"
 
-    // Что показываем.
+    // Текст для показа.
     val shown: String = when {
         isListening -> liveText.ifBlank { "…" }
         original.isBlank() -> ""
         level == Level.VERBATIM -> Punctuator.punctuate(original)
-        else -> variants[key(level, tone)] ?: ""
+        else -> { refreshTick; note.getVariant(level, tone) ?: "" }
     }
-    val currentReady = level == Level.VERBATIM || variants.containsKey(key(level, tone))
+    val currentReady = level == Level.VERBATIM || note.getVariant(level, tone) != null
 
     var hasPermission by remember {
         mutableStateOf(ContextCompat.checkSelfPermission(
@@ -89,63 +83,17 @@ fun EditorScreen(
     var isPlaying by remember { mutableStateOf(false) }
     DisposableEffect(Unit) { onDispose { recognizer?.destroy(); audioPlayer.stop() } }
 
-    // Сохранить варианты обратно в note + на диск.
     fun persist() {
         note.original = original
-        note.variants.clear()
-        note.variants.putAll(variants)
         onChanged()
     }
 
-    // Посчитать один вариант (ИИ или правила).
-    suspend fun compute(l: Level, t: Tone): String {
-        if (l == Level.VERBATIM) return Punctuator.punctuate(original)
-        return if (settings.useAI) {
-            AiClient.process(original, l, t, settings.apiKey)
-        } else {
-            TextCondenser.condense(original, l)
-        }
-    }
-
-    /**
-     * Главная логика: считаем ТЕКУЩИЙ вариант (если ещё не готов),
-     * затем в фоне досчитываем все остальные комбинации и сохраняем.
-     * Готовые не пересчитываем.
-     */
-    fun ensureComputed(l: Level, t: Tone) {
-        if (original.isBlank()) return
-        scope.launch {
-            // 1) текущий, если нужен
-            val k = key(l, t)
-            if (l != Level.VERBATIM && !variants.containsKey(k)) {
-                busy = true
-                status = if (settings.useAI) "ИИ обрабатывает…" else "Обработка…"
-                try {
-                    variants[k] = compute(l, t)
-                    status = "Готово"
-                } catch (e: Exception) {
-                    status = e.message ?: "Ошибка обработки"
-                }
-                busy = false
-                persist()
-            }
-            // 2) фоном все остальные (если включено)
-            if (settings.precomputeAll) {
-                for (ll in Level.entries) {
-                    for (tt in Tone.entries) {
-                        if (ll == Level.VERBATIM) continue
-                        val kk = key(ll, tt)
-                        if (!variants.containsKey(kk)) {
-                            try {
-                                variants[kk] = compute(ll, tt)
-                                persist()
-                            } catch (_: Exception) { /* пропускаем, попробуется позже */ }
-                        }
-                    }
-                }
-                if (status != "Готово") status = "Готово"
-            }
-        }
+    // После нового текста: сбрасываем варианты и запускаем полный фоновый расчёт.
+    fun startProcessingAll() {
+        processor.reset(note.id)
+        note.variants.clear()
+        persist()
+        processor.ensureAll(note, level, tone)
     }
 
     fun onRecognized(text: String) {
@@ -153,20 +101,24 @@ fun EditorScreen(
         if (note.title == "Заметка") {
             note.title = original.take(30).trim().ifBlank { "Заметка" }
         }
-        variants.clear()           // текст изменился — старые варианты недействительны
-        persist()
-        ensureComputed(level, tone)
+        note.original = original
+        startProcessingAll()
     }
 
-    // Флаг «пользователь хочет продолжать» — для непрерывного режима.
+    // Периодически перечитываем статусы (лёгкий поллинг во время расчёта).
+    LaunchedEffect(note.id, original) {
+        while (true) {
+            kotlinx.coroutines.delay(400)
+            refreshTick++
+        }
+    }
+
     var keepListening by remember { mutableStateOf(false) }
 
     fun buildIntent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
         putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-        // Просим систему подождать паузу перед завершением (сек -> мс).
-        // 0 = непрерывный режим (перезапуск в колбэках), пауза не задаётся.
         val ms = settings.pauseSeconds * 1000L
         if (ms > 0) {
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, ms)
@@ -183,14 +135,12 @@ fun EditorScreen(
             override fun onBufferReceived(b: ByteArray?) {}
             override fun onEndOfSpeech() {}
             override fun onError(e: Int) {
-                // В непрерывном режиме пауза/таймаут — не конец, а повод перезапуститься.
                 if (keepListening && (e == SpeechRecognizer.ERROR_NO_MATCH ||
                             e == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
                     recognizer.startListening(buildIntent())
                 } else {
                     isListening = false
-                    if (!keepListening) { /* остановлено пользователем */ }
-                    else status = "Не расслышал, повторите"
+                    if (keepListening) status = "Не расслышал, повторите"
                 }
             }
             override fun onPartialResults(p: android.os.Bundle?) {
@@ -201,19 +151,13 @@ fun EditorScreen(
                 val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
                 liveText = ""
                 if (t.isNotBlank()) onRecognized(t)
-                if (keepListening) {
-                    // Непрерывно: сразу слушаем дальше.
-                    recognizer.startListening(buildIntent())
-                } else {
-                    isListening = false
-                    if (t.isBlank()) status = "Ничего не распознано"
-                }
+                if (keepListening) recognizer.startListening(buildIntent())
+                else { isListening = false; if (t.isBlank()) status = "Ничего не распознано" }
             }
             override fun onEvent(e: Int, p: android.os.Bundle?) {}
         })
         liveText = ""
         isListening = true
-        // pauseSeconds == 0 -> непрерывный режим (сам перезапускается)
         keepListening = settings.pauseSeconds == 0
         recognizer.startListening(buildIntent())
     }
@@ -224,12 +168,11 @@ fun EditorScreen(
         isListening = false
     }
 
-    // ── Vosk: офлайн-распознавание с записью аудио ──
+    // ── Vosk ──
     var voskEngine by remember { mutableStateOf<VoskEngine?>(null) }
-    var downloadProgress by remember { mutableStateOf(-1) }   // -1 = не качаем
+    var downloadProgress by remember { mutableStateOf(-1) }
     var lastSpeechAt by remember { mutableStateOf(0L) }
 
-    // Свой таймер паузы: если тишина дольше N секунд — останавливаем Vosk.
     LaunchedEffect(isListening, settings.pauseSeconds) {
         val pauseMs = settings.pauseSeconds * 1000L
         if (isListening && settings.useVosk && pauseMs > 0) {
@@ -247,61 +190,36 @@ fun EditorScreen(
 
     fun startVosk() {
         scope.launch {
-            // 1) модель готова?
             if (!VoskModelManager.isReady(context)) {
-                status = "Скачиваю модель…"
-                downloadProgress = 0
-                try {
-                    VoskModelManager.download(context) { p -> downloadProgress = p }
-                } catch (e: Exception) {
-                    status = "Не удалось скачать модель: ${e.message}"
-                    downloadProgress = -1
-                    return@launch
-                }
+                status = "Скачиваю модель…"; downloadProgress = 0
+                try { VoskModelManager.download(context) { p -> downloadProgress = p } }
+                catch (e: Exception) { status = "Не удалось скачать модель: ${e.message}"; downloadProgress = -1; return@launch }
                 downloadProgress = -1
             }
-            // 2) грузим модель
             status = "Готовлю распознавание…"
             val model = try { VoskHolder.getModel(context) }
             catch (e: Exception) { status = "Ошибка модели: ${e.message}"; return@launch }
-
-            // 3) аудио-файл, если включено
-            val audioFile = if (settings.saveAudio) {
+            val audioFile = if (settings.saveAudio)
                 File(context.filesDir, "audio_${note.id}.wav").also { note.audioPath = it.absolutePath }
-            } else null
-
-            // 4) запуск движка
+            else null
             lastSpeechAt = System.currentTimeMillis()
             val engine = VoskEngine(model, audioFile)
             voskEngine = engine
             isListening = true
             status = "Говорите… (Vosk)"
             engine.start(
-                onPartial = { p ->
-                    liveText = p
-                    lastSpeechAt = System.currentTimeMillis()
-                },
-                onFinal = { t ->
-                    if (t.isNotBlank()) {
-                        onRecognized(t)
-                        lastSpeechAt = System.currentTimeMillis()
-                    }
-                    liveText = ""
-                },
+                onPartial = { p -> liveText = p; lastSpeechAt = System.currentTimeMillis() },
+                onFinal = { t -> if (t.isNotBlank()) { onRecognized(t); lastSpeechAt = System.currentTimeMillis() }; liveText = "" },
                 onError = { msg -> status = msg; isListening = false }
             )
         }
     }
 
     fun stopVosk() {
-        voskEngine?.stop()
-        voskEngine = null
-        isListening = false
-        liveText = ""
-        persist()
+        voskEngine?.stop(); voskEngine = null
+        isListening = false; liveText = ""; persist()
     }
 
-    // Универсальные старт/стоп с учётом выбранного движка.
     fun startRecording() { if (settings.useVosk) startVosk() else startListening() }
     fun stopRecording() { if (settings.useVosk) stopVosk() else stopListening() }
 
@@ -310,6 +228,8 @@ fun EditorScreen(
             note.title = it.ifBlank { "Заметка" }; onChanged(); showRename = false
         }, onDismiss = { showRename = false })
     }
+
+    val processing = !isListening && original.isNotBlank() && !currentReady
 
     Scaffold(containerColor = cs.background) { pad ->
         Column(Modifier.fillMaxSize().padding(pad)) {
@@ -331,42 +251,21 @@ fun EditorScreen(
             Box(Modifier.weight(1f).fillMaxWidth().padding(16.dp)) {
                 Surface(color = cs.surface, shape = RoundedCornerShape(16.dp),
                     modifier = Modifier.fillMaxSize()) {
-
-                    val processing = !isListening && original.isNotBlank() &&
-                            (busy || !currentReady)
-
                     when {
-                        // 1) Идёт запись — показываем живой полный текст.
-                        isListening -> {
-                            Text(
-                                liveText.ifBlank { "Слушаю…" },
-                                color = cs.onSurface, fontSize = 17.sp,
-                                modifier = Modifier.fillMaxSize()
-                                    .verticalScroll(rememberScrollState()).padding(20.dp)
-                            )
-                        }
-                        // 2) Идёт обработка — красивый шиммер.
-                        processing -> {
-                            ShimmerText(
-                                label = if (settings.useAI) "Сжимаю смысл…" else "Обрабатываю…",
-                                accent = accent
-                            )
-                        }
-                        // 3) Пусто.
-                        shown.isBlank() -> {
-                            Text("Текст появится здесь.", color = cs.onSurfaceVariant,
-                                fontSize = 15.sp, modifier = Modifier.padding(20.dp))
-                        }
-                        // 4) Готовый результат.
-                        else -> {
-                            SelectionContainer {
-                                Text(
-                                    shown,
-                                    color = cs.onSurface, fontSize = 17.sp,
-                                    modifier = Modifier.fillMaxSize()
-                                        .verticalScroll(rememberScrollState()).padding(20.dp)
-                                )
-                            }
+                        isListening -> Text(
+                            liveText.ifBlank { "Слушаю…" },
+                            color = cs.onSurface, fontSize = 17.sp,
+                            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)
+                        )
+                        processing -> ShimmerText(
+                            label = if (settings.useAI) "Сжимаю смысл…" else "Обрабатываю…",
+                            accent = accent
+                        )
+                        shown.isBlank() -> Text("Текст появится здесь.", color = cs.onSurfaceVariant,
+                            fontSize = 15.sp, modifier = Modifier.padding(20.dp))
+                        else -> SelectionContainer {
+                            Text(shown, color = cs.onSurface, fontSize = 17.sp,
+                                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp))
                         }
                     }
                 }
@@ -375,18 +274,23 @@ fun EditorScreen(
             Surface(color = cs.surface, shadowElevation = 12.dp) {
                 Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
 
-                    LevelStepper(levelIdx, accent) {
-                        levelIdx = it
-                        ensureComputed(Level.fromIndex(it), tone)
-                    }
+                    // refreshTick заставляет бейджи готовности обновляться по мере расчёта
+                    val tick = refreshTick
+                    LevelStepper(
+                        selected = levelIdx,
+                        accent = accent,
+                        readyState = { i -> tick; variantStateFor(note, processor, Level.fromIndex(i), tone) }
+                    ) { levelIdx = it }
                     Text(TextCondenser.zoneHint(level), color = accent, fontSize = 12.sp)
 
                     Spacer(Modifier.height(8.dp))
 
-                    ToneStepper(toneIdx) {
-                        toneIdx = it
-                        ensureComputed(level, Tone.fromIndex(it))
-                    }
+                    // Тон неактивен при «Дословно».
+                    ToneStepper(
+                        selected = toneIdx,
+                        enabled = level != Level.VERBATIM,
+                        readyState = { i -> tick; variantStateFor(note, processor, level, Tone.fromIndex(i)) }
+                    ) { toneIdx = it }
 
                     Spacer(Modifier.height(6.dp))
                     Text(status, color = cs.onSurfaceVariant, fontSize = 11.sp, maxLines = 1)
@@ -394,11 +298,8 @@ fun EditorScreen(
                         Spacer(Modifier.height(4.dp))
                         LinearProgressIndicator(
                             progress = { downloadProgress / 100f },
-                            modifier = Modifier.fillMaxWidth(),
-                            color = Palette.Amber
-                        )
-                        Text("Загрузка модели: $downloadProgress%",
-                            color = cs.onSurfaceVariant, fontSize = 10.sp)
+                            modifier = Modifier.fillMaxWidth(), color = Palette.Amber)
+                        Text("Загрузка модели: $downloadProgress%", color = cs.onSurfaceVariant, fontSize = 10.sp)
                     }
                     Spacer(Modifier.height(10.dp))
 
@@ -408,7 +309,7 @@ fun EditorScreen(
                             else if (isListening) stopRecording()
                             else startRecording()
                         },
-                        enabled = !busy && downloadProgress < 0,
+                        enabled = downloadProgress < 0,
                         shape = RoundedCornerShape(14.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = if (isListening) Palette.Red else Palette.Ink),
@@ -420,17 +321,13 @@ fun EditorScreen(
 
                     Spacer(Modifier.height(8.dp))
 
-                    // Кнопка воспроизведения — только если у заметки есть аудио.
                     val audioPath = note.audioPath
-                    if (audioPath != null && java.io.File(audioPath).exists()) {
+                    if (audioPath != null && File(audioPath).exists()) {
                         OutlinedButton(
                             onClick = {
                                 if (isPlaying) { audioPlayer.stop(); isPlaying = false }
-                                else {
-                                    val ok = audioPlayer.play(audioPath) { isPlaying = false }
-                                    isPlaying = ok
-                                    if (!ok) status = "Не удалось воспроизвести"
-                                }
+                                else { val ok = audioPlayer.play(audioPath) { isPlaying = false }
+                                    isPlaying = ok; if (!ok) status = "Не удалось воспроизвести" }
                             },
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
@@ -462,6 +359,15 @@ fun EditorScreen(
             }
         }
     }
+}
+
+/** Состояние варианта для индикатора на кнопке. */
+private fun variantStateFor(
+    note: Note, processor: VariantProcessor, l: Level, t: Tone
+): VariantProcessor.State {
+    if (l == Level.VERBATIM) return VariantProcessor.State.DONE
+    if (note.getVariant(l, t) != null) return VariantProcessor.State.DONE
+    return processor.stateOf(note.id, l, t) ?: VariantProcessor.State.QUEUED
 }
 
 @Composable

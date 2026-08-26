@@ -5,6 +5,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.runtime.rememberCoroutineScope
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -18,6 +19,7 @@ fun App() {
     val context = LocalContext.current
     val settings = remember { Settings(context) }
     val store = remember { NoteStore(context) }
+    val appScope = rememberCoroutineScope()
 
     var notes by remember { mutableStateOf(store.load()) }
     var dark by remember { mutableStateOf(settings.darkTheme) }
@@ -26,19 +28,29 @@ fun App() {
 
     fun persist() { store.save(notes) }
 
+    // Фоновый процессор вариантов — живёт всё время работы приложения,
+    // поэтому расчёт не прерывается при закрытии заметки.
+    val processor = remember {
+        VariantProcessor(appScope, settings) {
+            store.save(notes)                       // сохраняем по мере готовности
+            notes = notes.toMutableList()           // триггерим обновление UI
+        }
+    }
+
     AppTheme(dark = dark) {
         val current = notes.find { it.id == openNoteId }
         if (current != null) {
             EditorScreen(
                 note = current,
                 settings = settings,
+                processor = processor,
                 onBack = { openNoteId = null; persist() },
                 onChanged = { notes = notes.toMutableList(); persist() },
                 onDelete = {
-                    // удаляем аудиофайл заметки, если был
                     current.audioPath?.let { path ->
                         try { java.io.File(path).delete() } catch (_: Exception) {}
                     }
+                    processor.reset(current.id)
                     notes = notes.filter { it.id != current.id }.toMutableList()
                     openNoteId = null; persist()
                 }
