@@ -33,6 +33,26 @@ class Settings(context: Context) {
         get() = prefs.getBoolean("use_vosk", false)
         set(v) = prefs.edit().putBoolean("use_vosk", v).apply()
 
+    /** Размер шрифта в заметках, в поинтах. */
+    var fontSize: Int
+        get() = prefs.getInt("font_size", 17)
+        set(v) = prefs.edit().putInt("font_size", v).apply()
+
+    /** Сортировка списка: true = новые сверху. */
+    var newestFirst: Boolean
+        get() = prefs.getBoolean("newest_first", true)
+        set(v) = prefs.edit().putBoolean("newest_first", v).apply()
+
+    /** Спрашивать подтверждение перед удалением. */
+    var confirmDelete: Boolean
+        get() = prefs.getBoolean("confirm_delete", true)
+        set(v) = prefs.edit().putBoolean("confirm_delete", v).apply()
+
+    /** Язык распознавания (BCP-47), пусто = системный. */
+    var recognitionLang: String
+        get() = prefs.getString("rec_lang", "") ?: ""
+        set(v) = prefs.edit().putString("rec_lang", v).apply()
+
     val useAI get() = apiKey.isNotBlank()
 }
 

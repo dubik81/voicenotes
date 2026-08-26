@@ -54,6 +54,7 @@ fun EditorScreen(
     var liveText by remember { mutableStateOf("") }
     var status by remember { mutableStateOf(if (note.original.isBlank()) "Нажмите «Запись»" else "Готово") }
     var showRename by remember { mutableStateOf(false) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
     // тикер, чтобы UI перечитывал note.variants при обновлениях процессора
     var refreshTick by remember { mutableStateOf(0) }
 
@@ -105,10 +106,10 @@ fun EditorScreen(
         startProcessingAll()
     }
 
-    // Периодически перечитываем статусы (лёгкий поллинг во время расчёта).
-    LaunchedEffect(note.id, original) {
+    // Периодически перечитываем статусы, пока идёт активная обработка.
+    LaunchedEffect(note.id) {
         while (true) {
-            kotlinx.coroutines.delay(400)
+            kotlinx.coroutines.delay(250)
             refreshTick++
         }
     }
@@ -229,6 +230,22 @@ fun EditorScreen(
         }, onDismiss = { showRename = false })
     }
 
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Удалить заметку?") },
+            text = { Text("Заметка и её аудиозапись будут удалены безвозвратно.") },
+            confirmButton = {
+                TextButton(onClick = { showDeleteConfirm = false; onDelete() }) {
+                    Text("Удалить", color = Palette.Red)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) { Text("Отмена") }
+            }
+        )
+    }
+
     val processing = !isListening && original.isNotBlank() && !currentReady
 
     Scaffold(containerColor = cs.background) { pad ->
@@ -245,7 +262,9 @@ fun EditorScreen(
                     Text(note.title.take(20), color = Color.White, fontWeight = FontWeight.SemiBold)
                 }
                 Spacer(Modifier.weight(1f))
-                TextButton(onClick = onDelete) { Text("Удалить", color = Palette.Red) }
+                TextButton(onClick = {
+                    if (settings.confirmDelete) showDeleteConfirm = true else onDelete()
+                }) { Text("Удалить", color = Palette.Red) }
             }
 
             Box(Modifier.weight(1f).fillMaxWidth().padding(16.dp)) {
@@ -254,17 +273,26 @@ fun EditorScreen(
                     when {
                         isListening -> Text(
                             liveText.ifBlank { "Слушаю…" },
-                            color = cs.onSurface, fontSize = 17.sp,
+                            color = cs.onSurface, fontSize = settings.fontSize.sp,
                             modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)
                         )
-                        processing -> ShimmerText(
-                            label = if (settings.useAI) "Сжимаю смысл…" else "Обрабатываю…",
-                            accent = accent
-                        )
+                        processing -> {
+                            val d = processor.doneCount(note.id)
+                            val tot = processor.totalCount(note.id)
+                            refreshTick
+                            ShimmerText(
+                                label = when {
+                                    settings.useAI && tot > 0 -> "ИИ обрабатывает варианты: $d из $tot…"
+                                    settings.useAI -> "ИИ обрабатывает…"
+                                    else -> "Обрабатываю…"
+                                },
+                                accent = accent
+                            )
+                        }
                         shown.isBlank() -> Text("Текст появится здесь.", color = cs.onSurfaceVariant,
                             fontSize = 15.sp, modifier = Modifier.padding(20.dp))
                         else -> SelectionContainer {
-                            Text(shown, color = cs.onSurface, fontSize = 17.sp,
+                            Text(shown, color = cs.onSurface, fontSize = settings.fontSize.sp,
                                 modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp))
                         }
                     }
@@ -293,7 +321,29 @@ fun EditorScreen(
                     ) { toneIdx = it }
 
                     Spacer(Modifier.height(6.dp))
-                    Text(status, color = cs.onSurfaceVariant, fontSize = 11.sp, maxLines = 1)
+                    // Легенда индикации готовности вариантов.
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("✓ готово", color = Palette.Green, fontSize = 9.sp)
+                        Text("⏳ считается", color = Palette.Amber, fontSize = 9.sp)
+                        Text("• в очереди", color = cs.onSurfaceVariant, fontSize = 9.sp)
+                        Text("⚠ ошибка", color = Palette.Red, fontSize = 9.sp)
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    // Честный статус: реальный ход обработки из процессора.
+                    val done = processor.doneCount(note.id)
+                    val total = processor.totalCount(note.id)
+                    val active = processor.isActive(note.id)
+                    val liveStatus = when {
+                        isListening -> status
+                        downloadProgress in 0..100 -> status
+                        original.isBlank() -> "Нажмите «Запись»"
+                        active && total > 0 -> "Обрабатываю варианты: $done из $total"
+                        total > 0 && done >= total -> "Все варианты готовы"
+                        total > 0 && done < total -> "Готово: $done из $total (часть не удалась)"
+                        else -> status
+                    }
+                    refreshTick // подписка на обновления
+                    Text(liveStatus, color = cs.onSurfaceVariant, fontSize = 11.sp, maxLines = 1)
                     if (downloadProgress in 0..100) {
                         Spacer(Modifier.height(4.dp))
                         LinearProgressIndicator(

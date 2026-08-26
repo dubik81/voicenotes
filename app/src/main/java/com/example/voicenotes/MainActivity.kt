@@ -56,8 +56,11 @@ fun App() {
                 }
             )
         } else {
+            val sorted = if (settings.newestFirst)
+                notes.sortedByDescending { it.createdAt }
+            else notes.sortedBy { it.createdAt }
             NotesListScreen(
-                notes = notes,
+                notes = sorted,
                 onOpen = { openNoteId = it.id },
                 onNew = {
                     val n = Note(
