@@ -32,6 +32,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -264,9 +265,9 @@ fun VoiceNotesScreen() {
                         }
                         OutlinedButton(
                             onClick = {
-                                val clip = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE)
                                         as android.content.ClipboardManager
-                                clip.setPrimaryClip(
+                                cm.setPrimaryClip(
                                     android.content.ClipData.newPlainText("Заметка", displayText))
                                 status = "Скопировано"
                             },
@@ -350,21 +351,37 @@ private fun SettingsDialog(
     onDismiss: () -> Unit
 ) {
     var key by remember { mutableStateOf(initialKey) }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Ключ OpenRouter (необязательно)") },
-        text = {
-            Column {
-                Text(
-                    "Без ключа приложение чистит текст по правилам бесплатно.\n\n" +
-                    "Вставьте бесплатный ключ OpenRouter — и ползунок начнёт делать " +
-                    "настоящий пересказ смыслом. Ключ хранится только на телефоне.\n\n" +
-                    "Получить ключ: openrouter.ai/keys (бесплатно, без карты).",
-                    fontSize = 13.sp
-                )
+    val info = "Без ключа приложение чистит текст по правилам бесплатно.\n\n" +
+        "Вставьте бесплатный ключ OpenRouter — и ползунок начнёт делать настоящий " +
+        "пересказ смыслом. Ключ хранится только на телефоне.\n\n" +
+        "Получить ключ: openrouter.ai/keys (бесплатно, без карты)."
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = RoundedCornerShape(16.dp), color = Color.White) {
+            Column(Modifier.padding(20.dp)) {
+                Text("Ключ OpenRouter (необязательно)",
+                    fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = Ink)
                 Spacer(Modifier.height(12.dp))
+                Text(info, fontSize = 13.sp, color = Ink)
+                Spacer(Modifier.height(16.dp))
                 OutlinedTextField(
-                    value = key, onValueChange = { key = it },
+                    value = key,
+                    onValueChange = { key = it },
                     label = { Text("Ключ (sk-or-…)") },
                     singleLine = true,
-                    visualTransformation = PasswordVisualTransformation()
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(16.dp))
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(onClick = { onSave("") }) { Text("Убрать ключ") }
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(onClick = { onSave(key) }) { Text("Сохранить") }
+                }
+            }
+        }
+    }
+}
