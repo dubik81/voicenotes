@@ -3,19 +3,18 @@ package com.example.voicenotes
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Пять ступеней сжатия смысла. Порядок = слева направо на ползунке. */
+/** Четыре ступени сжатия смысла. Порядок = слева направо. */
 enum class Level(val title: String, val short: String) {
     VERBATIM("Дословно", "Полный текст с пунктуацией, без изменений смысла"),
     CLEAN("Чисто", "Убраны паразиты, звуки и повторы"),
-    TIGHT("Сжато", "Убрана вода и эмоции, факты сохранены"),
     BRIEF("Кратко", "Пересказ главного своими словами"),
-    GIST("Суть", "Одна-две фразы с самой сутью");
+    GIST("Суть", "Красивое короткое резюме, самая суть");
 
     companion object {
         fun fromIndex(i: Int): Level = entries.getOrElse(i.coerceIn(0, entries.size - 1)) { VERBATIM }
         val count get() = entries.size
         /** Индекс, с которого начинается «красная зона» (потеря деталей). */
-        const val RED_FROM = 3 // BRIEF и GIST — красные
+        const val RED_FROM = 2 // BRIEF и GIST — красные
     }
 
     val isRed get() = ordinal >= RED_FROM
@@ -24,9 +23,8 @@ enum class Level(val title: String, val short: String) {
 /** Тон итогового текста. */
 enum class Tone(val title: String) {
     FORMAL("Формально"),
-    NEUTRAL("Нейтрально"),
-    CASUAL("Разговорно"),
-    EMOJI("Разговорно + эмодзи");
+    NEUTRAL("Обычно"),
+    CASUAL("Живой");
 
     companion object {
         fun fromIndex(i: Int): Tone = entries.getOrElse(i.coerceIn(0, entries.size - 1)) { NEUTRAL }

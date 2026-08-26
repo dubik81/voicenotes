@@ -35,6 +35,10 @@ fun App() {
                 onBack = { openNoteId = null; persist() },
                 onChanged = { notes = notes.toMutableList(); persist() },
                 onDelete = {
+                    // удаляем аудиофайл заметки, если был
+                    current.audioPath?.let { path ->
+                        try { java.io.File(path).delete() } catch (_: Exception) {}
+                    }
                     notes = notes.filter { it.id != current.id }.toMutableList()
                     openNoteId = null; persist()
                 }

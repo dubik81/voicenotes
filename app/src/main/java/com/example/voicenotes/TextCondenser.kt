@@ -53,8 +53,8 @@ object TextCondenser {
         }
         tokens = dedupeConsecutive(tokens)
 
-        // Со ступени TIGHT — эмоции и вводные.
-        if (level.ordinal >= Level.TIGHT.ordinal) {
+        // Со ступени BRIEF — эмоции и вводные (в CLEAN только паразиты).
+        if (level.ordinal >= Level.BRIEF.ordinal) {
             tokens = tokens.filter { w ->
                 w.trim(',', '.', '!', '?', ';', ':').lowercase() !in emotionalWords
             }

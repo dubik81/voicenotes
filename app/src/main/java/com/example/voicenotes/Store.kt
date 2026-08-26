@@ -28,6 +28,11 @@ class Settings(context: Context) {
         get() = prefs.getBoolean("precompute_all", true)
         set(v) = prefs.edit().putBoolean("precompute_all", v).apply()
 
+    /** Движок распознавания: false = Google (точный, без аудио), true = Vosk (офлайн + аудио). */
+    var useVosk: Boolean
+        get() = prefs.getBoolean("use_vosk", false)
+        set(v) = prefs.edit().putBoolean("use_vosk", v).apply()
+
     val useAI get() = apiKey.isNotBlank()
 }
 

@@ -66,9 +66,8 @@ fun ToneStepper(selected: Int, onSelect: (Int) -> Unit) {
                 Text(
                     when (t) {
                         Tone.FORMAL -> "Формально"
-                        Tone.NEUTRAL -> "Нейтрально"
-                        Tone.CASUAL -> "Разговорно"
-                        Tone.EMOJI -> "+ эмодзи"
+                        Tone.NEUTRAL -> "Обычно"
+                        Tone.CASUAL -> "Живой"
                     },
                     color = if (isSel) Color.White else cs.onSurfaceVariant,
                     fontSize = 10.sp,

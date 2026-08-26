@@ -8,117 +8,133 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * Подключение к OpenRouter. Ускорено: вместо медленного авто-роутера задаём
- * список конкретных быстрых бесплатных моделей — OpenRouter пробует их по
- * порядку (фолбэк), если первая занята.
- * Ключ хранится только на телефоне (в Settings).
+ * OpenRouter. Для скорости и надёжности сами перебираем несколько быстрых
+ * бесплатных моделей: если одна медленная/занята — быстро пробуем следующую.
+ * Короткий таймаут не даёт «думать минутами».
  */
 object AiClient {
 
     private const val ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
-    // Быстрые бесплатные модели. Порядок = приоритет. Список можно расширять.
+    // Быстрые бесплатные модели. Пробуем по очереди.
     private val MODELS = listOf(
         "google/gemini-2.0-flash-exp:free",
         "meta-llama/llama-3.3-70b-instruct:free",
-        "qwen/qwen-2.5-72b-instruct:free"
+        "google/gemma-2-9b-it:free",
+        "qwen/qwen-2.5-7b-instruct:free"
     )
 
+    private const val PER_MODEL_TIMEOUT_MS = 22000
+
+    /** Пробуем модели по очереди, возвращаем первый успешный ответ. */
     suspend fun process(rawText: String, level: Level, tone: Tone, apiKey: String): String =
         withContext(Dispatchers.IO) {
-            val body = JSONObject().apply {
-                put("models", JSONArray(MODELS))       // фолбэк-список
-                put("model", MODELS.first())           // основная
-                put("temperature", 0.4)
-                put("messages", JSONArray().apply {
-                    put(JSONObject().put("role", "system").put("content", systemPrompt(level, tone)))
-                    put(JSONObject().put("role", "user").put("content", rawText))
-                })
-            }
-
-            val conn = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 15000
-                readTimeout = 60000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("Authorization", "Bearer $apiKey")
-                setRequestProperty("HTTP-Referer", "https://github.com/dubik81/voicenotes")
-                setRequestProperty("X-Title", "Smysl-zametki")
-            }
-
-            try {
-                conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-                val code = conn.responseCode
-                val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-                val response = stream?.bufferedReader()?.use { it.readText() } ?: ""
-                if (code !in 200..299) {
-                    throw RuntimeException(when (code) {
-                        401 -> "Ключ отклонён. Проверьте ключ OpenRouter."
-                        402 -> "Закончились бесплатные запросы на сегодня."
-                        429 -> "Слишком часто. Подождите минуту."
-                        else -> "Ошибка сервера ($code): ${parseError(response)}"
-                    })
+            var lastError: String = "Не удалось связаться с ИИ"
+            for (model in MODELS) {
+                try {
+                    return@withContext callModel(model, rawText, level, tone, apiKey)
+                } catch (e: RetryableException) {
+                    lastError = e.message ?: lastError
+                    // пробуем следующую модель
+                } catch (e: FatalException) {
+                    throw RuntimeException(e.message)  // ключ/лимит — нет смысла перебирать
                 }
-                parseContent(response)
-            } finally {
-                conn.disconnect()
             }
+            throw RuntimeException(lastError)
         }
+
+    private class RetryableException(msg: String) : Exception(msg)
+    private class FatalException(msg: String) : Exception(msg)
+
+    private fun callModel(
+        model: String, rawText: String, level: Level, tone: Tone, apiKey: String
+    ): String {
+        val body = JSONObject().apply {
+            put("model", model)
+            put("temperature", 0.4)
+            put("messages", JSONArray().apply {
+                put(JSONObject().put("role", "system").put("content", systemPrompt(level, tone)))
+                put(JSONObject().put("role", "user").put("content", rawText))
+            })
+        }
+        val conn = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = 8000
+            readTimeout = PER_MODEL_TIMEOUT_MS
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Authorization", "Bearer $apiKey")
+            setRequestProperty("HTTP-Referer", "https://github.com/dubik81/voicenotes")
+            setRequestProperty("X-Title", "Smysl-zametki")
+        }
+        try {
+            conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            val code = conn.responseCode
+            val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+            val response = stream?.bufferedReader()?.use { it.readText() } ?: ""
+            when {
+                code in 200..299 -> return parseContent(response)
+                code == 401 -> throw FatalException("Ключ отклонён. Проверьте ключ OpenRouter.")
+                code == 402 -> throw FatalException("Закончились бесплатные запросы на сегодня.")
+                code == 429 -> throw RetryableException("Модель занята, пробую другую…")
+                else -> throw RetryableException("Ошибка $code, пробую другую модель…")
+            }
+        } catch (e: FatalException) {
+            throw e
+        } catch (e: Exception) {
+            throw RetryableException(e.message ?: "Таймаут, пробую другую модель…")
+        } finally {
+            conn.disconnect()
+        }
+    }
 
     private fun systemPrompt(level: Level, tone: Tone): String {
         val task = when (level) {
             Level.VERBATIM ->
                 "Приведи текст в порядок: расставь знаки препинания и заглавные буквы, " +
-                "убери повторы и оговорки. Смысл, все факты и детали сохрани полностью. " +
-                "Длину почти не меняй."
+                "убери повторы и оговорки. Смысл, все факты и детали сохрани полностью."
             Level.CLEAN ->
-                "Убери слова-паразиты, звуки («эээ», «ну», «типа»), повторы и оговорки. " +
-                "Сохрани ВСЕ факты, детали, числа и имена. Расставь правильную пунктуацию."
-            Level.TIGHT ->
-                "Убери воду, лишние эмоции, вводные обороты и красивости. Сохрани ВСЕ " +
-                "факты и детали, но подай их сухо и по делу. Не обобщай, не выбрасывай " +
-                "содержание. Если сказано «магазин, аптека, почта» — оставь все три."
+                "Убери слова-паразиты и звуки («эээ», «ну», «типа», «как бы», «короче»), " +
+                "повторы и оговорки. Сохрани ВСЕ факты, детали, числа и имена. Расставь " +
+                "правильную пунктуацию и заглавные буквы. Результат — гладкий, читаемый текст."
             Level.BRIEF ->
                 "Перескажи текст своими словами примерно вдвое короче. Объединяй мелкие " +
-                "детали в обобщения, оставь ключевые мысли. Пиши связными предложениями."
+                "детали в обобщения, оставь ключевые мысли. Обязательно связные, грамотные " +
+                "предложения с правильной пунктуацией."
             Level.GIST ->
-                "Сформулируй самую суть в одном-двух законченных предложениях. " +
-                "Максимальное обобщение, только главная мысль."
+                "Сформулируй самую суть в 1–3 красивых, законченных предложениях. Это должен " +
+                "быть аккуратный, грамотный текст с правильной пунктуацией — как хорошее " +
+                "резюме. Можно свободно переформулировать своими словами. Никаких обрывков."
         }
         val toneRule = when (tone) {
-            Tone.FORMAL -> "Тон официальный, деловой. Без разговорных слов."
-            Tone.NEUTRAL -> "Тон нейтральный, спокойный."
-            Tone.CASUAL -> "Тон живой, разговорный, но грамотный."
-            Tone.EMOJI -> "Тон живой, разговорный. Уместно добавь эмодзи по смыслу (не перебарщивай)."
+            Tone.FORMAL -> "Стиль официальный, деловой. Замени разговорные слова на нейтральные."
+            Tone.NEUTRAL -> "Стиль нейтральный, спокойный."
+            Tone.CASUAL -> "Стиль живой, разговорный, но грамотный. Уместно добавь 1–3 эмодзи по смыслу."
         }
         return """
-Ты — редактор голосовых заметок. Твоя задача: $task
+Ты — редактор голосовых заметок. Задача: $task
 $toneRule
 
-ЖЁСТКИЕ ТРЕБОВАНИЯ К ЛЮБОМУ ОТВЕТУ:
-1. Результат — всегда грамотный, СВЯЗНЫЙ текст с правильной пунктуацией и заглавными буквами. Никаких обрывков и рваных фраз.
-2. Каждое предложение — законченное и осмысленное.
-3. Отвечай на языке оригинала.
-4. Не придумывай факты, которых нет в оригинале.
-5. Верни ТОЛЬКО готовый текст — без пояснений, заголовков и кавычек.
+ЖЁСТКИЕ ТРЕБОВАНИЯ (нарушать нельзя):
+1. Ответ — всегда грамотный СВЯЗНЫЙ текст с правильной пунктуацией и заглавными буквами.
+2. Никаких рваных фраз, обрывков и слов-паразитов в ответе.
+3. Каждое предложение законченное и осмысленное.
+4. Отвечай на языке оригинала.
+5. Не выдумывай фактов, которых нет в оригинале.
+6. Верни ТОЛЬКО готовый текст — без пояснений, заголовков и кавычек.
 
-Пример ПЛОХО (так нельзя): «нам нужно это пойти улицу вместе не знаю гулять это точно»
-Пример ХОРОШО: «Нам нужно выйти на улицу и погулять вместе.»
+Плохо (так НЕЛЬЗЯ): «нам это как бы надо на улицу ну погулять короче»
+Хорошо: «Нам нужно выйти на улицу и погулять.»
 """.trim()
     }
 
     private fun parseContent(response: String): String {
         val choices = JSONObject(response).optJSONArray("choices")
-            ?: throw RuntimeException("Пустой ответ от ИИ")
-        if (choices.length() == 0) throw RuntimeException("ИИ не вернул результат")
+            ?: throw RetryableException("Пустой ответ")
+        if (choices.length() == 0) throw RetryableException("Пустой ответ")
         val text = choices.getJSONObject(0).optJSONObject("message")
             ?.optString("content", "")?.trim().orEmpty()
-        if (text.isBlank()) throw RuntimeException("ИИ вернул пустой текст")
+        if (text.isBlank()) throw RetryableException("Пустой текст")
         return text
     }
-
-    private fun parseError(response: String): String = try {
-        JSONObject(response).optJSONObject("error")?.optString("message") ?: "неизвестно"
-    } catch (_: Exception) { "неизвестно" }
 }

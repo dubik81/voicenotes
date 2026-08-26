@@ -29,6 +29,7 @@ fun SettingsScreen(
     var pause by remember { mutableStateOf(settings.pauseSeconds) }
     var saveAudio by remember { mutableStateOf(settings.saveAudio) }
     var precompute by remember { mutableStateOf(settings.precomputeAll) }
+    var useVosk by remember { mutableStateOf(settings.useVosk) }
 
     Dialog(onDismissRequest = onClose) {
         Surface(shape = RoundedCornerShape(18.dp), color = cs.surface) {
@@ -65,7 +66,14 @@ fun SettingsScreen(
 
                 Spacer(Modifier.height(18.dp))
                 ToggleRow("Тёмная тема", dark, onDarkChange)
-                ToggleRow("Сохранять аудио к заметкам", saveAudio) { saveAudio = it }
+                ToggleRow("Офлайн-распознавание Vosk (+ запись аудио)", useVosk) { useVosk = it }
+                Text(
+                    "Google: точнее, но без записи звука. Vosk: работает офлайн и " +
+                    "пишет аудио к заметке, но распознаёт менее точно. Модель (~45 МБ) " +
+                    "скачается при первом включении.",
+                    fontSize = 11.sp, color = cs.onSurfaceVariant
+                )
+                ToggleRow("Сохранять аудио к заметкам (только Vosk)", saveAudio) { saveAudio = it }
                 ToggleRow("Досчитывать все ступени в фоне", precompute) { precompute = it }
 
                 Spacer(Modifier.height(20.dp))
@@ -78,6 +86,7 @@ fun SettingsScreen(
                             settings.pauseSeconds = pause
                             settings.saveAudio = saveAudio
                             settings.precomputeAll = precompute
+                            settings.useVosk = useVosk
                             onClose()
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = Palette.Ink)
