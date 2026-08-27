@@ -17,12 +17,20 @@ object AiClient {
 
     private const val ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
-    // Актуальные рабочие бесплатные модели (проверено 2026). Первая — основная,
-    // остальные — фолбэк. OpenRouter разрешает максимум 3 модели в массиве.
+    // Актуальные бесплатные модели (проверено: август 2026). Gemini и Llama
+    // стали платными, поэтому используем стабильно-бесплатные. Максимум 3 в массиве.
+    // При ошибке «модель платная» приложение переберёт их автоматически.
     private val FREE_MODELS = listOf(
-        "google/gemini-2.0-flash-exp:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "z-ai/glm-4.5-air:free"
+        "z-ai/glm-4.5-air:free",
+        "qwen/qwen3-coder:free",
+        "nvidia/nemotron-3-super-120b-a12b:free"
+    )
+
+    // Запасные, если основные тоже станут платными (пробуются по одной).
+    private val BACKUP_MODELS = listOf(
+        "google/gemma-4-31b-it:free",
+        "deepseek/deepseek-v4-flash:free",
+        "qwen/qwen-2.5-7b-instruct:free"
     )
 
     /** Основной вызов обработки текста. */
@@ -57,8 +65,8 @@ object AiClient {
     }
 
     /**
-     * Низкоуровневый запрос. Возвращает (текст, использованная_модель).
-     * Кидает исключение с понятным сообщением при ошибке.
+     * Запрос с автоперебором: сначала основные модели (массивом), при провале —
+     * запасные по одной. Возвращает (текст, использованная_модель).
      */
     private fun request(
         messages: JSONArray,
@@ -66,10 +74,34 @@ object AiClient {
         temperature: Double,
         maxTokens: Int? = null
     ): Pair<String, String> {
+        var lastError = "Не удалось получить ответ ИИ"
+        // 1) основные — одним запросом (серверный фолбэк внутри массива)
+        try {
+            return requestOnce(FREE_MODELS, messages, apiKey, temperature, maxTokens)
+        } catch (e: Exception) {
+            lastError = e.message ?: lastError
+        }
+        // 2) запасные — по одной
+        for (m in BACKUP_MODELS) {
+            try {
+                return requestOnce(listOf(m), messages, apiKey, temperature, maxTokens)
+            } catch (e: Exception) {
+                lastError = e.message ?: lastError
+            }
+        }
+        throw RuntimeException(lastError)
+    }
+
+    private fun requestOnce(
+        models: List<String>,
+        messages: JSONArray,
+        apiKey: String,
+        temperature: Double,
+        maxTokens: Int?
+    ): Pair<String, String> {
         val body = JSONObject().apply {
-            // массив моделей = серверный фолбэк
-            put("models", JSONArray(FREE_MODELS))
-            put("model", FREE_MODELS.first())
+            if (models.size > 1) put("models", JSONArray(models))
+            put("model", models.first())
             put("messages", messages)
             put("temperature", temperature)
             if (maxTokens != null) put("max_tokens", maxTokens)
@@ -129,7 +161,8 @@ object AiClient {
             402 -> "Закончились бесплатные запросы (402). Подождите сутки или пополните баланс."
             403 -> "Доступ к модели закрыт (403). Обычно это временный лимит провайдера — " +
                    "подождите минуту. ${if (serverMsg.isNotBlank()) "[$serverMsg]" else ""}"
-            429 -> "Слишком часто (429). Подождите минуту и повторите."
+            404 -> "Модель стала платной (404). Пробую другую бесплатную…"
+            429 -> "Слишком часто (429). Лимит 20 запросов в минуту, подождите минуту."
             in 500..599 -> "Сервер OpenRouter перегружен ($code). Попробуйте позже."
             else -> "Ошибка $code. ${if (serverMsg.isNotBlank()) serverMsg else "Попробуйте позже."}"
         }

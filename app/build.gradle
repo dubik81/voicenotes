@@ -11,14 +11,36 @@ android {
         applicationId "com.example.voicenotes"
         minSdk 24
         targetSdk 34
-        versionCode 9
-        versionName "9.0"
+        versionCode 11
+        versionName "11.0"
         ndk {
             abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
         }
     }
+    signingConfigs {
+        release {
+            def ksFile = System.getenv("KEYSTORE_FILE")
+            if (ksFile != null) {
+                storeFile file(ksFile)
+                storePassword System.getenv("KEYSTORE_PASSWORD")
+                keyAlias System.getenv("KEY_ALIAS")
+                keyPassword System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
     buildTypes {
-        release { minifyEnabled false }
+        debug {
+            // подписываем debug тем же постоянным ключом, если он задан
+            if (System.getenv("KEYSTORE_FILE") != null) {
+                signingConfig signingConfigs.release
+            }
+        }
+        release {
+            minifyEnabled false
+            if (System.getenv("KEYSTORE_FILE") != null) {
+                signingConfig signingConfigs.release
+            }
+        }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
