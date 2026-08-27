@@ -18,13 +18,11 @@ object AiClient {
     private const val ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
     // Актуальные рабочие бесплатные модели (проверено 2026). Первая — основная,
-    // остальные — фолбэк. OpenRouter walk'ает список при ошибке.
+    // остальные — фолбэк. OpenRouter разрешает максимум 3 модели в массиве.
     private val FREE_MODELS = listOf(
         "google/gemini-2.0-flash-exp:free",
         "meta-llama/llama-3.3-70b-instruct:free",
-        "z-ai/glm-4.5-air:free",
-        "qwen/qwen3-235b-a22b:free",
-        "meta-llama/llama-3.1-8b-instruct:free"
+        "z-ai/glm-4.5-air:free"
     )
 
     /** Основной вызов обработки текста. */
