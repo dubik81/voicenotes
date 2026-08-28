@@ -68,16 +68,17 @@ class VariantProcessor(
 
         jobs[note.id] = scope.launch {
             if (settings.useAI) {
-                // УМНЫЙ ЗАПРОС: все варианты за один вызов.
+                // Лекция: отдельный запрос стенограммы; иначе умный запрос всех вариантов.
                 var attempt = 0
                 while (attempt < maxRetries) {
-                    // пометить недостающие как RUNNING
                     for ((l, t) in combos) {
                         if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.RUNNING
                     }
                     try {
-                        val all = AiClient.processAll(note.original, settings.apiKey)
-                        // раскладываем результат
+                        val all = if (note.isLecture)
+                            AiClient.processLecture(note.original, settings.apiKey)
+                        else
+                            AiClient.processAll(note.original, settings.apiKey)
                         for ((l, t) in combos) {
                             val key = "${l.ordinal}:${t.ordinal}"
                             val text = all[key]
@@ -91,7 +92,6 @@ class VariantProcessor(
                         val allDone = combos.all { (l, t) -> note.getVariant(l, t) != null }
                         if (allDone) break
                     } catch (e: Exception) {
-                        // помечаем оставшиеся как FAILED, но повторим
                         for ((l, t) in combos) {
                             if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.FAILED
                         }
@@ -100,7 +100,7 @@ class VariantProcessor(
                     attempt++
                     if (attempt < maxRetries &&
                         combos.any { (l, t) -> note.getVariant(l, t) == null }) {
-                        delay(10000)  // пауза перед повтором
+                        delay(10000)
                     }
                 }
             } else {

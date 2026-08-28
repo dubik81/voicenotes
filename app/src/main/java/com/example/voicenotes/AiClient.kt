@@ -50,10 +50,62 @@ object AiClient {
         }
 
     /**
-     * УМНЫЙ ЗАПРОС: за один вызов получаем все варианты (ступень × тон) + базовый.
-     * Возвращает Map с ключами "levelOrdinal:toneOrdinal" -> текст.
-     * Экономит лимит: 1 запрос вместо 9.
+     * СТЕНОГРАММА ЛЕКЦИИ: оформляет речь как конспект, НЕ искажая смысл и слова.
+     * Возвращает Map "levelOrd:toneOrd" (тон всегда NEUTRAL для лекции).
      */
+    suspend fun processLecture(rawText: String, apiKey: String): Map<String, String> =
+        withContext(Dispatchers.IO) {
+            val messages = JSONArray().apply {
+                put(JSONObject().put("role", "system").put("content", lecturePrompt()))
+                put(JSONObject().put("role", "user").put("content", rawText))
+            }
+            val (text, _) = request(messages, apiKey, temperature = 0.3)
+            parseLectureVariants(text, rawText)
+        }
+
+    private fun lecturePrompt(): String {
+        val sb = StringBuilder()
+        sb.append("Ты — стенографист лекции. На входе — распознанная речь лектора (возможны ошибки ")
+        sb.append("распознавания). Верни СТРОГО JSON с тремя версиями.\n\n")
+        sb.append("КЛЮЧЕВОЕ ПРАВИЛО для CLEAN (стенограмма): категорически НЕЛЬЗЯ менять смысл, ")
+        sb.append("слова, термины, формулировки лектора. Разрешено ТОЛЬКО: исправить очевидные ошибки ")
+        sb.append("распознавания (окончания, падежи, склейки слов), расставить пунктуацию и заглавные, ")
+        sb.append("разбить сплошной поток на логические АБЗАЦЫ, выделить смысловые части ЗАГОЛОВКАМИ ")
+        sb.append("(строка вида «## Название части»), оформить перечисления списком (строки «- пункт»), ")
+        sb.append("убрать чистый речевой мусор («э-э», «значит», «так вот», повторы-оговорки). ")
+        sb.append("НЕ перефразировать, НЕ сокращать, НЕ добавлять свои слова. Сохрани ВСЕ факты, ")
+        sb.append("числа, определения, имена дословно.\n\n")
+        sb.append("BRIEF (конспект): краткий конспект лекции своими словами, главные тезисы.\n")
+        sb.append("GIST (суть): 2-4 предложения — о чём была лекция.\n\n")
+        sb.append("Формат ответа:\n{\n")
+        sb.append("  \"CLEAN\": \"<стенограмма с ## заголовками, абзацами, - списками>\",\n")
+        sb.append("  \"BRIEF\": \"<конспект>\",\n")
+        sb.append("  \"GIST\": \"<суть>\"\n}\n\n")
+        sb.append("Абзацы и части разделяй пустой строкой. Верни ТОЛЬКО валидный JSON на языке лектора.")
+        return sb.toString()
+    }
+
+    private fun parseLectureVariants(response: String, fallback: String): Map<String, String> {
+        val result = mutableMapOf<String, String>()
+        val jsonStr = response.substringAfter('{', "").substringBeforeLast('}', "")
+            .let { if (it.isBlank()) response else "{$it}" }
+        val json = try { JSONObject(jsonStr) } catch (_: Exception) {
+            return mapOf("${Level.CLEAN.ordinal}:${Tone.NEUTRAL.ordinal}" to fallback)
+        }
+        // Лекция: тон всегда NEUTRAL
+        val t = Tone.NEUTRAL.ordinal
+        json.optString("CLEAN").takeIf { it.isNotBlank() }?.let {
+            result["${Level.CLEAN.ordinal}:$t"] = it
+        }
+        json.optString("BRIEF").takeIf { it.isNotBlank() }?.let {
+            result["${Level.BRIEF.ordinal}:$t"] = it
+        }
+        json.optString("GIST").takeIf { it.isNotBlank() }?.let {
+            result["${Level.GIST.ordinal}:$t"] = it
+        }
+        if (result.isEmpty()) throw RuntimeException("ИИ не вернул стенограмму")
+        return result
+    }
     suspend fun processAll(rawText: String, apiKey: String): Map<String, String> =
         withContext(Dispatchers.IO) {
             val messages = JSONArray().apply {

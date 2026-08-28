@@ -26,7 +26,7 @@ import java.util.Locale
 fun NotesListScreen(
     notes: List<Note>,
     onOpen: (Note) -> Unit,
-    onNew: (useVosk: Boolean) -> Unit,
+    onNew: (useVosk: Boolean, isLecture: Boolean) -> Unit,
     onOpenSettings: () -> Unit
 ) {
     var query by remember { mutableStateOf("") }
@@ -43,9 +43,17 @@ fun NotesListScreen(
         containerColor = cs.background,
         floatingActionButton = {
             Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                // Лекция (длинная запись, стенограмма)
+                ExtendedFloatingActionButton(
+                    onClick = { onNew(true, true) },
+                    containerColor = Palette.Amber,
+                    contentColor = Color.White,
+                    text = { Text("Лекция") },
+                    icon = { Text("🎓", fontSize = 16.sp) }
+                )
                 // Онлайн (Google — точнее, но без записи аудио)
                 ExtendedFloatingActionButton(
-                    onClick = { onNew(false) },
+                    onClick = { onNew(false, false) },
                     containerColor = Palette.Green,
                     contentColor = Color.White,
                     text = { Text("Онлайн (точно)") },
@@ -53,7 +61,7 @@ fun NotesListScreen(
                 )
                 // Офлайн (Vosk — с записью аудио)
                 ExtendedFloatingActionButton(
-                    onClick = { onNew(true) },
+                    onClick = { onNew(true, false) },
                     containerColor = Palette.Ink,
                     contentColor = Color.White,
                     text = { Text("Офлайн (+ аудио)") },

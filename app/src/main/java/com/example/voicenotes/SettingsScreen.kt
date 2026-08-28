@@ -30,6 +30,12 @@ fun SettingsScreen(
 ) {
     val cs = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
+    val context = androidx.compose.ui.platform.LocalContext.current
+
+    // Состояния загрузки моделей (для индикаторов).
+    var whisperDl by remember { mutableStateOf(-1) }
+    var whisperDlError by remember { mutableStateOf<String?>(null) }
+    var modelsTick by remember { mutableStateOf(0) }  // обновить статусы
 
     var key by remember { mutableStateOf(settings.apiKey) }
     var pause by remember { mutableStateOf(settings.pauseSeconds) }
@@ -174,6 +180,79 @@ fun SettingsScreen(
                     }
 
                     // ── Обработка ──
+                    SectionTitle("Модели распознавания")
+                    SettingCard {
+                        modelsTick // подписка на обновление статусов
+                        // Vosk
+                        val voskReady = VoskModelManager.isReady(context)
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Vosk (офлайн, черновик)", fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold, color = cs.onSurface,
+                                modifier = Modifier.weight(1f))
+                            Text(if (voskReady) "✓ скачана" else "не скачана",
+                                fontSize = 12.sp,
+                                color = if (voskReady) Palette.Green else cs.onSurfaceVariant)
+                        }
+                        Text("~45 МБ. Скачивается при первой офлайн-записи.",
+                            fontSize = 10.sp, color = cs.onSurfaceVariant)
+
+                        HorizontalDivider(Modifier.padding(vertical = 10.dp))
+
+                        // Whisper
+                        val whModelId = whisperModel
+                        val whInfo = WhisperModelManager.MODELS[whModelId]
+                        val whReady = WhisperModelManager.isReady(context, whModelId)
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Whisper (${whModelId}, точный)", fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold, color = cs.onSurface,
+                                modifier = Modifier.weight(1f))
+                            Text(if (whReady) "✓ скачана" else "не скачана",
+                                fontSize = 12.sp,
+                                color = if (whReady) Palette.Green else cs.onSurfaceVariant)
+                        }
+                        Text("~${whInfo?.sizeMb ?: 142} МБ. Скачивается с huggingface.co (нужен интернет).",
+                            fontSize = 10.sp, color = cs.onSurfaceVariant)
+
+                        if (whisperDl in 0..100) {
+                            Spacer(Modifier.height(6.dp))
+                            LinearProgressIndicator(
+                                progress = { whisperDl / 100f },
+                                modifier = Modifier.fillMaxWidth(), color = Palette.Amber)
+                            Text("Загрузка: $whisperDl%", fontSize = 10.sp, color = cs.onSurfaceVariant)
+                        }
+                        whisperDlError?.let { err ->
+                            Spacer(Modifier.height(6.dp))
+                            Text("✗ $err", color = Palette.Red, fontSize = 11.sp)
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                whisperDlError = null
+                                scope.launch {
+                                    try {
+                                        whisperDl = 0
+                                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                            WhisperModelManager.download(context, whModelId) { p -> whisperDl = p }
+                                        }
+                                        whisperDl = -1
+                                        modelsTick++
+                                    } catch (e: Exception) {
+                                        whisperDl = -1
+                                        whisperDlError = e.message ?: "Ошибка загрузки"
+                                    }
+                                }
+                            },
+                            enabled = whisperDl < 0 && !whReady,
+                            colors = ButtonDefaults.buttonColors(containerColor = Palette.Ink),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(if (whReady) "Модель Whisper скачана" else "Скачать модель Whisper",
+                                color = Color.White, fontSize = 13.sp)
+                        }
+                    }
+
                     SectionTitle("Обработка текста")
                     SettingCard {
                         ToggleRow("Досчитывать все варианты в фоне", precompute) { precompute = it }

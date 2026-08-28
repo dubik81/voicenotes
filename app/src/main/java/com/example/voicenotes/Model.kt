@@ -43,7 +43,8 @@ data class Note(
     val createdAt: Long,
     var original: String,                       // текущий рабочий текст (с пунктуацией)
     var audioPath: String? = null,              // путь к аудио, если сохранялось
-    var recordMode: String = "",                // "vosk" или "google" — чем записана
+    var recordMode: String = "",                // "vosk"/"google"/"lecture"
+    var isLecture: Boolean = false,             // режим лекции (стенограмма, без тона)
     var refinedText: String? = null,            // не используется (совместимость)
     var isRefined: Boolean = false,             // не используется (совместимость)
     val variants: MutableMap<String, String> = mutableMapOf(),
@@ -106,6 +107,7 @@ data class Note(
         put("createdAt", createdAt)
         put("original", original)
         put("recordMode", recordMode)
+        put("isLecture", isLecture)
         put("audioPath", audioPath ?: JSONObject.NULL)
         put("refinedText", refinedText ?: JSONObject.NULL)
         put("isRefined", isRefined)
@@ -148,6 +150,7 @@ data class Note(
                 createdAt = o.getLong("createdAt"),
                 original = o.getString("original"),
                 recordMode = o.optString("recordMode", ""),
+                isLecture = o.optBoolean("isLecture", false),
                 audioPath = o.optString("audioPath").takeIf { it.isNotBlank() && it != "null" },
                 refinedText = o.optString("refinedText").takeIf { it.isNotBlank() && it != "null" },
                 isRefined = o.optBoolean("isRefined", false),

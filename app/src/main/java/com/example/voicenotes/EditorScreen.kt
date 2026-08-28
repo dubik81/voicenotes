@@ -130,6 +130,8 @@ fun EditorScreen(
     }
 
     var keepListening by remember { mutableStateOf(false) }
+    // Лекция: переключатель онлайн(Google)/офлайн(Vosk+Whisper), меняется между кусками.
+    var lectureOnline by remember { mutableStateOf(false) }
 
     fun buildIntent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -273,8 +275,14 @@ fun EditorScreen(
         }
     }
 
-    fun startRecording() { if (settings.useVosk) startVosk() else startListening() }
-    fun stopRecording() { if (settings.useVosk) stopVosk() else stopListening() }
+    fun startRecording() {
+        val useOffline = if (note.isLecture) !lectureOnline else settings.useVosk
+        if (useOffline) startVosk() else startListening()
+    }
+    fun stopRecording() {
+        val useOffline = if (note.isLecture) !lectureOnline else settings.useVosk
+        if (useOffline) stopVosk() else stopListening()
+    }
 
     if (showRename) {
         RenameDialog(note.title, onSave = {
@@ -314,9 +322,10 @@ fun EditorScreen(
                     Text(note.title.take(20), color = Color.White, fontWeight = FontWeight.SemiBold)
                 }
                 // индикация режима записи
-                val modeLabel = when (note.recordMode) {
-                    "vosk" -> "🎤 офлайн"
-                    "google" -> "🌐 онлайн"
+                val modeLabel = when {
+                    note.isLecture -> "🎓 лекция"
+                    note.recordMode == "vosk" -> "🎤 офлайн"
+                    note.recordMode == "google" -> "🌐 онлайн"
                     else -> ""
                 }
                 if (modeLabel.isNotBlank()) {
@@ -326,6 +335,27 @@ fun EditorScreen(
                 TextButton(onClick = {
                     if (settings.confirmDelete) showDeleteConfirm = true else onDelete()
                 }) { Text("Удалить", color = Palette.Red) }
+            }
+
+            // Переключатель онлайн/офлайн для лекции (меняется между кусками записи).
+            if (note.isLecture && !isListening) {
+                Row(
+                    Modifier.fillMaxWidth().background(cs.surfaceVariant)
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Режим лекции:", fontSize = 12.sp, color = cs.onSurface,
+                        modifier = Modifier.weight(1f))
+                    FilterChip(
+                        selected = !lectureOnline,
+                        onClick = { lectureOnline = false },
+                        label = { Text("🎤 Офлайн", fontSize = 11.sp) })
+                    Spacer(Modifier.width(6.dp))
+                    FilterChip(
+                        selected = lectureOnline,
+                        onClick = { lectureOnline = true },
+                        label = { Text("🌐 Онлайн", fontSize = 11.sp) })
+                }
             }
 
             Box(Modifier.weight(1f).fillMaxWidth().padding(16.dp)) {
@@ -392,14 +422,15 @@ fun EditorScreen(
 
                     Spacer(Modifier.height(8.dp))
 
-                    // Тон неактивен при «Дословно».
-                    ToneStepper(
-                        selected = toneIdx,
-                        enabled = level != Level.VERBATIM,
-                        readyState = { i -> tick; variantStateFor(note, processor, level, Tone.fromIndex(i)) }
-                    ) { toneIdx = it }
-
-                    Spacer(Modifier.height(6.dp))
+                    // Тон: скрыт в режиме лекции, неактивен при «Дословно».
+                    if (!note.isLecture) {
+                        ToneStepper(
+                            selected = toneIdx,
+                            enabled = level != Level.VERBATIM,
+                            readyState = { i -> tick; variantStateFor(note, processor, level, Tone.fromIndex(i)) }
+                        ) { toneIdx = it }
+                        Spacer(Modifier.height(6.dp))
+                    }
                     // Легенда индикации готовности вариантов.
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("✓ готово", color = Palette.Green, fontSize = 9.sp)
@@ -581,6 +612,29 @@ fun EditorScreen(
                         val exportLabel = if (note.recordMode == "google")
                             "⤓ Экспорт (текст, zip)" else "⤓ Экспорт (текст + аудио, zip)"
                         Text(exportLabel, fontSize = 13.sp)
+                    }
+
+                    // Экспорт в Word (.docx) — стенограмма с форматированием (для лекции).
+                    if (note.isLecture) {
+                        Spacer(Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                try {
+                                    val file = DocxExporter.export(context, note)
+                                    val uri = androidx.core.content.FileProvider.getUriForFile(
+                                        context, "${context.packageName}.fileprovider", file)
+                                    val share = Intent(Intent.ACTION_SEND).apply {
+                                        type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                                        putExtra(Intent.EXTRA_STREAM, uri)
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    context.startActivity(Intent.createChooser(share, "Экспорт в Word"))
+                                } catch (e: Exception) { status = "Ошибка Word: ${e.message}" }
+                            },
+                            enabled = original.isNotBlank(),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("⤓ Экспорт Word (.docx)", fontSize = 13.sp) }
                     }
                 }
             }
