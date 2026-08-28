@@ -43,7 +43,7 @@ fun NotesListScreen(
         containerColor = cs.background,
         floatingActionButton = {
             Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                // Онлайн (Google — точнее, без аудио)
+                // Онлайн (Google — точнее, но без записи аудио)
                 ExtendedFloatingActionButton(
                     onClick = { onNew(false) },
                     containerColor = Palette.Green,
@@ -56,7 +56,7 @@ fun NotesListScreen(
                     onClick = { onNew(true) },
                     containerColor = Palette.Ink,
                     contentColor = Color.White,
-                    text = { Text("Офлайн (+аудио)") },
+                    text = { Text("Офлайн (+ аудио)") },
                     icon = { Text("🎤", fontSize = 16.sp) }
                 )
             }

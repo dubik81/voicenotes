@@ -34,6 +34,8 @@ fun SettingsScreen(
     var key by remember { mutableStateOf(settings.apiKey) }
     var pause by remember { mutableStateOf(settings.pauseSeconds) }
     var saveAudio by remember { mutableStateOf(settings.saveAudio) }
+    var useWhisper by remember { mutableStateOf(settings.useWhisper) }
+    var whisperModel by remember { mutableStateOf(settings.whisperModel) }
     var precompute by remember { mutableStateOf(settings.precomputeAll) }
     var fontSize by remember { mutableStateOf(settings.fontSize) }
     var newestFirst by remember { mutableStateOf(settings.newestFirst) }
@@ -46,6 +48,8 @@ fun SettingsScreen(
         settings.apiKey = key.trim()
         settings.pauseSeconds = pause
         settings.saveAudio = saveAudio
+        settings.useWhisper = useWhisper
+        settings.whisperModel = whisperModel
         settings.precomputeAll = precompute
         settings.fontSize = fontSize
         settings.newestFirst = newestFirst
@@ -144,6 +148,29 @@ fun SettingsScreen(
                         }
                         HorizontalDivider(Modifier.padding(vertical = 10.dp))
                         ToggleRow("Сохранять аудио (офлайн-режим)", saveAudio) { saveAudio = it }
+                        HorizontalDivider(Modifier.padding(vertical = 10.dp))
+                        // Whisper — точное офлайн-уточнение
+                        ToggleRow("Уточнять через Whisper (точнее)", useWhisper) { useWhisper = it }
+                        Text("После офлайн-записи текст автоматически уточняется точной " +
+                             "офлайн-моделью Whisper. Модель скачается один раз.",
+                            fontSize = 11.sp, color = cs.onSurfaceVariant)
+                        if (useWhisper) {
+                            Spacer(Modifier.height(8.dp))
+                            Text("Модель Whisper:", fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold, color = cs.onSurface)
+                            Spacer(Modifier.height(4.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                listOf(
+                                    "tiny" to "Tiny 75МБ",
+                                    "base" to "Base 142МБ",
+                                    "small" to "Small 466МБ"
+                                ).forEach { (id, lbl) ->
+                                    FilterChip(selected = whisperModel == id,
+                                        onClick = { whisperModel = id },
+                                        label = { Text(lbl, fontSize = 10.sp) })
+                                }
+                            }
+                        }
                     }
 
                     // ── Обработка ──

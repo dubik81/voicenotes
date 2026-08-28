@@ -53,6 +53,16 @@ class Settings(context: Context) {
         get() = prefs.getString("rec_lang", "") ?: ""
         set(v) = prefs.edit().putString("rec_lang", v).apply()
 
+    /** Уточнять офлайн-запись через Whisper (точнее Vosk). */
+    var useWhisper: Boolean
+        get() = prefs.getBoolean("use_whisper", true)
+        set(v) = prefs.edit().putBoolean("use_whisper", v).apply()
+
+    /** Размер модели Whisper: "tiny"/"base"/"small". */
+    var whisperModel: String
+        get() = prefs.getString("whisper_model", "base") ?: "base"
+        set(v) = prefs.edit().putString("whisper_model", v).apply()
+
     val useAI get() = apiKey.isNotBlank()
 }
 

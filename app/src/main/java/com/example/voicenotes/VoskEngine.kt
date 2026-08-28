@@ -52,24 +52,27 @@ class VoskEngine(
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT
                 )
-                val bufSize = maxOf(minBuf, sampleRate) // ~1 сек буфер
+                // Меньший буфер чтения (~0.25с) — быстрее реакция, меньше потерь начала.
+                val bufSize = maxOf(minBuf, sampleRate / 4)
                 audioRecord = AudioRecord(
                     MediaRecorder.AudioSource.MIC,
                     sampleRate,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
-                    bufSize
+                    maxOf(minBuf, sampleRate) // сам буфер AudioRecord побольше
                 )
+                // Запускаем захват СРАЗУ, чтобы не терять первые слова, пока
+                // инициализируется распознаватель.
+                audioRecord.startRecording()
                 recognizer = Recognizer(model, sampleRate.toFloat())
 
                 // Готовим WAV. Если файл уже есть (дозапись) — продолжаем с конца.
                 if (saveAudioTo != null) {
                     val exists = saveAudioTo.exists() && saveAudioTo.length() > 44
                     if (exists) {
-                        // читаем текущую длину PCM из заголовка и пишем в конец
                         wav = RandomAccessFile(saveAudioTo, "rw")
-                        pcmBytes = saveAudioTo.length() - 44  // вычитаем заголовок
-                        wav.seek(saveAudioTo.length())        // в конец
+                        pcmBytes = saveAudioTo.length() - 44
+                        wav.seek(saveAudioTo.length())
                     } else {
                         wav = RandomAccessFile(saveAudioTo, "rw").apply {
                             setLength(0)
@@ -79,7 +82,6 @@ class VoskEngine(
                 }
 
                 val buffer = ByteArray(bufSize)
-                audioRecord.startRecording()
 
                 while (running) {
                     val n = audioRecord.read(buffer, 0, buffer.size)

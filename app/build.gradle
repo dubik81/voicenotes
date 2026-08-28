@@ -11,10 +11,12 @@ android {
         applicationId "com.example.voicenotes"
         minSdk 24
         targetSdk 34
-        versionCode 19
-        versionName "19.0"
+        versionCode 22
+        versionName "22.0"
         ndk {
-            abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
+            // Whisper работает только на arm64-v8a (покрывает все современные телефоны,
+            // включая Samsung S25). Ограничение упрощает и ускоряет сборку.
+            abiFilters 'arm64-v8a'
         }
     }
     signingConfigs {
@@ -64,4 +66,6 @@ dependencies {
     // Офлайн-распознавание Vosk (аудио + текст из одного потока)
     implementation 'net.java.dev.jna:jna:5.13.0@aar'
     implementation 'com.alphacephei:vosk-android:0.3.47@aar'
+    // Офлайн-распознавание Whisper (точное, по записанному файлу, arm64)
+    implementation 'dev.ffmpegkit-maintained:whisper-android:1.0.0'
 }

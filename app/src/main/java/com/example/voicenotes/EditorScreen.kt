@@ -9,6 +9,12 @@ import android.speech.RecognitionListener
 import android.speech.SpeechRecognizer
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -184,6 +190,9 @@ fun EditorScreen(
     var voskEngine by remember { mutableStateOf<VoskEngine?>(null) }
     var downloadProgress by remember { mutableStateOf(-1) }
     var lastSpeechAt by remember { mutableStateOf(0L) }
+    // ── Whisper (точное уточнение) ──
+    var whisperRunning by remember { mutableStateOf(false) }
+    var whisperDownload by remember { mutableStateOf(-1) }
 
     LaunchedEffect(isListening, settings.pauseSeconds) {
         val pauseMs = settings.pauseSeconds * 1000L
@@ -230,26 +239,36 @@ fun EditorScreen(
     fun stopVosk() {
         voskEngine?.stop(); voskEngine = null
         isListening = false; liveText = ""; persist()
-        // Эксперимент: офлайн-ансамбль перераспознаёт аудио и, если получает
-        // заметно более полный текст, обновляет базовый.
+        // Автоматическое уточнение через Whisper (точнее Vosk), пока мигает пиктограмма.
         val path = note.audioPath
-        if (path != null && File(path).exists()) {
+        if (settings.useWhisper && path != null && File(path).exists()) {
+            whisperRunning = true
             scope.launch {
                 try {
-                    val model = VoskHolder.getModel(context)
-                    val better = RecognitionEnsemble.refine(model, File(path))
-                    if (better != null) {
-                        val curWords = original.split(Regex("\\s+")).size
-                        val newWords = better.split(Regex("\\s+")).size
-                        // берём только если ансамбль дал ощутимо больше слов (>10%)
-                        if (newWords > curWords * 1.1) {
-                            original = better
-                            note.original = Punctuator.punctuate(better)
-                            startProcessingAll()
-                            status = "Текст уточнён (ансамбль)"
-                        }
+                    val modelId = settings.whisperModel
+                    // скачиваем модель при первом использовании
+                    if (!WhisperModelManager.isReady(context, modelId)) {
+                        status = "Скачиваю модель Whisper…"
+                        whisperDownload = 0
+                        WhisperModelManager.download(context, modelId) { p -> whisperDownload = p }
+                        whisperDownload = -1
                     }
-                } catch (_: Exception) { /* ансамбль не обязателен */ }
+                    status = "Уточняю через Whisper…"
+                    val precise = WhisperEngine.transcribe(context, path, modelId)
+                    if (!precise.isNullOrBlank()) {
+                        original = precise
+                        note.original = Punctuator.punctuate(precise)
+                        startProcessingAll()
+                        status = "Текст уточнён (Whisper)"
+                    } else {
+                        status = "Whisper не смог уточнить"
+                    }
+                } catch (e: Exception) {
+                    status = "Whisper: ${e.message}"
+                    whisperDownload = -1
+                } finally {
+                    whisperRunning = false
+                }
             }
         }
     }
@@ -339,6 +358,24 @@ fun EditorScreen(
                         }
                     }
                     }
+                    // Мигающая пиктограмма Whisper — текст сейчас улучшится.
+                    if (whisperRunning) {
+                        val blink = rememberInfiniteTransition(label = "wh")
+                        val a by blink.animateFloat(
+                            initialValue = 0.3f, targetValue = 1f,
+                            animationSpec = infiniteRepeatable(
+                                tween(600, easing = LinearEasing), RepeatMode.Reverse), label = "a")
+                        Row(
+                            Modifier.align(Alignment.TopEnd).padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                if (whisperDownload in 0..99) "⬇ ${whisperDownload}%" else "✦ Whisper",
+                                color = Palette.Amber.copy(alpha = a),
+                                fontSize = 12.sp, fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
             }
 
             Surface(color = cs.surface, shadowElevation = 12.dp) {
@@ -386,10 +423,8 @@ fun EditorScreen(
                         total > 0 && done < total -> "Готово: $done из $total"
                         else -> status
                     }
-                    val limitInfo = if (settings.useAI && AiClient.rateLimitRemaining >= 0)
-                        "  ·  осталось запросов: ${AiClient.rateLimitRemaining}" else ""
                     refreshTick // подписка на обновления
-                    Text(liveStatus + limitInfo, color = cs.onSurfaceVariant, fontSize = 11.sp, maxLines = 1)
+                    Text(liveStatus, color = cs.onSurfaceVariant, fontSize = 11.sp, maxLines = 1)
                     if (downloadProgress in 0..100) {
                         Spacer(Modifier.height(4.dp))
                         LinearProgressIndicator(
@@ -418,18 +453,51 @@ fun EditorScreen(
                     Spacer(Modifier.height(8.dp))
 
                     val audioPath = note.audioPath
-                    if (audioPath != null && File(audioPath).exists()) {
-                        OutlinedButton(
-                            onClick = {
-                                if (isPlaying) { audioPlayer.stop(); isPlaying = false }
-                                else { val ok = audioPlayer.play(audioPath) { isPlaying = false }
-                                    isPlaying = ok; if (!ok) status = "Не удалось воспроизвести" }
-                            },
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(if (isPlaying) "⏹ Остановить воспроизведение" else "▶ Прослушать запись",
-                                fontSize = 13.sp)
+                    val hasAudio = note.recordMode != "google" &&
+                            audioPath != null && File(audioPath).exists()
+                    if (hasAudio && audioPath != null) {
+                        var updating by remember(note.id) { mutableStateOf(false) }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            // «Обновить текст» — дотошное перераспознавание аудио (только в Дословно)
+                            if (level == Level.VERBATIM) {
+                                OutlinedButton(
+                                    onClick = {
+                                        updating = true
+                                        status = "Перераспознаю аудио…"
+                                        scope.launch {
+                                            try {
+                                                val model = VoskHolder.getModel(context)
+                                                val better = RecognitionEnsemble.refine(
+                                                    model, File(audioPath), thorough = true)
+                                                if (!better.isNullOrBlank()) {
+                                                    original = better
+                                                    note.original = Punctuator.punctuate(better)
+                                                    startProcessingAll()
+                                                    status = "Текст обновлён из аудио"
+                                                } else status = "Не удалось улучшить"
+                                            } catch (e: Exception) {
+                                                status = "Ошибка: ${e.message}"
+                                            } finally { updating = false }
+                                        }
+                                    },
+                                    enabled = !updating && !isListening,
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.weight(1f)
+                                ) { Text(if (updating) "Обрабатываю…" else "⟳ Обновить текст", fontSize = 13.sp) }
+                            }
+                            // Прослушать запись
+                            OutlinedButton(
+                                onClick = {
+                                    if (isPlaying) { audioPlayer.stop(); isPlaying = false }
+                                    else { val ok = audioPlayer.play(audioPath) { isPlaying = false }
+                                        isPlaying = ok; if (!ok) status = "Не удалось воспроизвести" }
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(if (isPlaying) "⏹ Стоп" else "▶ Прослушать",
+                                    fontSize = 13.sp)
+                            }
                         }
                         Spacer(Modifier.height(8.dp))
                     }
@@ -509,7 +577,11 @@ fun EditorScreen(
                         enabled = original.isNotBlank(),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier.fillMaxWidth()
-                    ) { Text("⤓ Экспорт (текст + аудио, zip)", fontSize = 13.sp) }
+                    ) {
+                        val exportLabel = if (note.recordMode == "google")
+                            "⤓ Экспорт (текст, zip)" else "⤓ Экспорт (текст + аудио, zip)"
+                        Text(exportLabel, fontSize = 13.sp)
+                    }
                 }
             }
         }

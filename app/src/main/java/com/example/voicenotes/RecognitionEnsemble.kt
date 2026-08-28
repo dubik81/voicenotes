@@ -23,28 +23,44 @@ object RecognitionEnsemble {
 
     /**
      * Перераспознаёт WAV-файл несколькими способами и возвращает лучший текст.
-     * Если ансамбль не дал улучшения — вернёт null (оставляем исходный).
+     * thorough=true — «дотошный» режим (кнопка «Обновить текст»): больше прогонов.
+     * Если ансамбль не дал улучшения — вернёт null.
      */
-    suspend fun refine(model: Model, wav: File): String? = withContext(Dispatchers.IO) {
+    suspend fun refine(model: Model, wav: File, thorough: Boolean = false): String? = withContext(Dispatchers.IO) {
         if (!wav.exists() || wav.length() < 44) return@withContext null
         val pcm = readPcm(wav) ?: return@withContext null
 
         val candidates = mutableListOf<String>()
-        // 1) оригинал
-        candidates.add(recognizePcm(model, pcm))
-        // 2) усиленная громкость (x2 с ограничением)
-        candidates.add(recognizePcm(model, amplify(pcm, 2.0)))
-        // 3) слегка усиленная (x1.5)
-        candidates.add(recognizePcm(model, amplify(pcm, 1.5)))
+        // нормализация громкости — ключевое для тихих записей
+        val normalized = normalize(pcm)
+        candidates.add(recognizePcm(model, normalized))
+        candidates.add(recognizePcm(model, pcm))               // оригинал
+        candidates.add(recognizePcm(model, amplify(pcm, 2.0))) // усиление x2
 
-        // Голосование: берём результат с наибольшим числом слов (самый полный),
-        // но не абсурдно длинный (защита от шумовых артефактов).
+        if (thorough) {
+            // дотошный режим: ещё варианты обработки
+            candidates.add(recognizePcm(model, amplify(normalized, 1.3)))
+            candidates.add(recognizePcm(model, amplify(pcm, 3.0)))
+            candidates.add(recognizePcm(model, amplify(pcm, 1.5)))
+        }
+
+        // Голосование: самый полный результат (больше всего слов).
         val best = candidates
             .filter { it.isNotBlank() }
             .maxByOrNull { it.split(Regex("\\s+")).size }
             ?: return@withContext null
 
         return@withContext best.ifBlank { null }
+    }
+
+    /** Нормализация: усиливаем сигнал так, чтобы пик достигал ~85% максимума. */
+    private fun normalize(pcm: ShortArray): ShortArray {
+        var peak = 1
+        for (s in pcm) { val a = kotlin.math.abs(s.toInt()); if (a > peak) peak = a }
+        val target = (32767 * 0.85).toInt()
+        val factor = target.toDouble() / peak
+        if (factor <= 1.05) return pcm  // уже достаточно громко
+        return amplify(pcm, factor)
     }
 
     private fun readPcm(wav: File): ShortArray? = try {

@@ -62,13 +62,15 @@ object NoteExporter {
             zos.putNextEntry(ZipEntry(jsonFile.name))
             zos.write(jsonFile.readBytes())
             zos.closeEntry()
-            // аудио, если есть
-            note.audioPath?.let { path ->
-                val audio = File(path)
-                if (audio.exists() && audio.length() > 44) {
-                    zos.putNextEntry(ZipEntry("audio_${note.id}.wav"))
-                    zos.write(audio.readBytes())
-                    zos.closeEntry()
+            // аудио, если есть и это офлайн-заметка (в онлайне звук не пишется)
+            if (note.recordMode != "google") {
+                note.audioPath?.let { path ->
+                    val audio = File(path)
+                    if (audio.exists() && audio.length() > 44) {
+                        zos.putNextEntry(ZipEntry("audio_${note.id}.wav"))
+                        zos.write(audio.readBytes())
+                        zos.closeEntry()
+                    }
                 }
             }
         }
