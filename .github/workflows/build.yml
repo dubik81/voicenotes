@@ -21,6 +21,24 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Restore keystore from secret
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > $RUNNER_TEMP/release.keystore
+            echo "KEYSTORE_FILE=$RUNNER_TEMP/release.keystore" >> $GITHUB_ENV
+            echo "KEYSTORE_PASSWORD=$KS_PASSWORD" >> $GITHUB_ENV
+            echo "KEY_ALIAS=$KS_ALIAS" >> $GITHUB_ENV
+            echo "KEY_PASSWORD=$KS_KEYPASS" >> $GITHUB_ENV
+            echo "Keystore restored."
+          else
+            echo "No keystore secret."
+          fi
+
       - name: Generate Gradle wrapper
         run: gradle wrapper --gradle-version 8.9
 
