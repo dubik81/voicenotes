@@ -11,8 +11,8 @@ android {
         applicationId "com.example.voicenotes"
         minSdk 24
         targetSdk 34
-        versionCode 13
-        versionName "13.0"
+        versionCode 14
+        versionName "14.0"
         ndk {
             abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86', 'x86_64'
         }

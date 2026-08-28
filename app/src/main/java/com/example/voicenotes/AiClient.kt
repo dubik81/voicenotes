@@ -49,6 +49,78 @@ object AiClient {
         }
 
     /**
+     * УМНЫЙ ЗАПРОС: за один вызов получаем все варианты (ступень × тон) + базовый.
+     * Возвращает Map с ключами "levelOrdinal:toneOrdinal" -> текст.
+     * Экономит лимит: 1 запрос вместо 9.
+     */
+    suspend fun processAll(rawText: String, apiKey: String): Map<String, String> =
+        withContext(Dispatchers.IO) {
+            val messages = JSONArray().apply {
+                put(JSONObject().put("role", "system").put("content", allVariantsPrompt()))
+                put(JSONObject().put("role", "user").put("content", rawText))
+            }
+            val (text, _) = request(messages, apiKey, temperature = 0.4)
+            parseAllVariants(text, rawText)
+        }
+
+    private fun allVariantsPrompt(): String {
+        // Просим строгий JSON со всеми комбинациями.
+        val sb = StringBuilder()
+        sb.append("Ты — редактор голосовых заметок. Обработай текст и верни СТРОГО JSON-объект ")
+        sb.append("(без markdown, без пояснений) со всеми вариантами обработки.\n\n")
+        sb.append("Ступени сжатия:\n")
+        sb.append("- CLEAN: убери паразиты, звуки, повторы; сохрани ВСЕ факты; правильная пунктуация.\n")
+        sb.append("- BRIEF: пересказ вдвое короче, главные мысли, связные предложения.\n")
+        sb.append("- GIST: суть в 1–3 красивых предложениях, максимальное обобщение.\n\n")
+        sb.append("Тона:\n")
+        sb.append("- FORMAL: официальный, деловой.\n")
+        sb.append("- NEUTRAL: нейтральный.\n")
+        sb.append("- CASUAL: живой, разговорный, 1–3 эмодзи по смыслу.\n\n")
+        sb.append("Формат ответа (заполни ВСЕ поля готовым текстом):\n")
+        sb.append("{\n")
+        sb.append("  \"VERBATIM\": \"<текст с пунктуацией, без изменений смысла>\",\n")
+        for (l in listOf("CLEAN", "BRIEF", "GIST")) {
+            for (t in listOf("FORMAL", "NEUTRAL", "CASUAL")) {
+                sb.append("  \"${l}_${t}\": \"<...>\"")
+                sb.append(if (l == "GIST" && t == "CASUAL") "\n" else ",\n")
+            }
+        }
+        sb.append("}\n\n")
+        sb.append("ТРЕБОВАНИЯ: связный грамотный текст с пунктуацией; сжатые варианты КОРОЧЕ оригинала; ")
+        sb.append("не выдумывай факты; отвечай на языке оригинала; верни ТОЛЬКО валидный JSON.")
+        return sb.toString()
+    }
+
+    /** Парсит JSON-ответ в Map ключей "levelOrd:toneOrd". Устойчив к мелким огрехам. */
+    private fun parseAllVariants(response: String, fallbackOrig: String): Map<String, String> {
+        val result = mutableMapOf<String, String>()
+        // вырезаем JSON, даже если модель обернула в markdown ```json ... ```
+        val jsonStr = response.substringAfter('{', "").substringBeforeLast('}', "")
+            .let { if (it.isBlank()) response else "{$it}" }
+        val json = try { JSONObject(jsonStr) } catch (_: Exception) {
+            // формат сломан — вернём хотя бы базовый как оригинал
+            return mapOf("${Level.VERBATIM.ordinal}:0" to fallbackOrig)
+        }
+
+        val levelMap = mapOf("CLEAN" to Level.CLEAN, "BRIEF" to Level.BRIEF, "GIST" to Level.GIST)
+        val toneMap = mapOf("FORMAL" to Tone.FORMAL, "NEUTRAL" to Tone.NEUTRAL, "CASUAL" to Tone.CASUAL)
+
+        // базовый
+        json.optString("VERBATIM").takeIf { it.isNotBlank() }?.let {
+            for (t in Tone.entries) result["${Level.VERBATIM.ordinal}:${t.ordinal}"] = it
+        }
+        // все комбинации
+        for ((lName, l) in levelMap) {
+            for ((tName, t) in toneMap) {
+                val v = json.optString("${lName}_${tName}")
+                if (v.isNotBlank()) result["${l.ordinal}:${t.ordinal}"] = v
+            }
+        }
+        if (result.isEmpty()) throw RuntimeException("ИИ не вернул варианты в нужном формате")
+        return result
+    }
+
+    /**
      * Проверка ключа: шлёт крошечный запрос и возвращает человекочитаемый результат.
      * Возвращает пару (успех, сообщение).
      */

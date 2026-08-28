@@ -415,7 +415,9 @@ fun EditorScreen(
                         original.isBlank() -> "Нажмите «Запись»"
                         active && total > 0 -> "Обрабатываю варианты: $done из $total"
                         total > 0 && done >= total -> "Все варианты готовы"
-                        total > 0 && done < total -> "Готово: $done из $total (часть не удалась)"
+                        total > 0 && done < total && processor.lastAiError != null ->
+                            "ИИ: ${processor.lastAiError}"
+                        total > 0 && done < total -> "Готово: $done из $total"
                         else -> status
                     }
                     refreshTick // подписка на обновления

@@ -32,6 +32,10 @@ class VariantProcessor(
     private val requestSpacingMs = 3500L
     private val maxRetries = 4
 
+    // Последняя ошибка ИИ (для показа причины пользователю).
+    var lastAiError: String? = null
+        private set
+
     fun isActive(noteId: Long): Boolean = activeNote[noteId] == true
     fun doneCount(noteId: Long): Int = progressDone[noteId] ?: 0
     fun totalCount(noteId: Long): Int = progressTotal[noteId] ?: 0
@@ -63,38 +67,52 @@ class VariantProcessor(
         activeNote[note.id] = true
 
         jobs[note.id] = scope.launch {
-            // очередь: приоритет первым
-            val order = buildList {
-                add(priorityLevel to priorityTone)
-                for (c in combos) if (c != (priorityLevel to priorityTone)) add(c)
-            }
-            // повторяем проходы, пока есть незавершённые (агрессивные повторы)
-            var attempt = 0
-            while (attempt < maxRetries) {
-                var remaining = 0
-                for ((l, t) in order) {
-                    if (note.getVariant(l, t) != null) {
-                        states[k(note.id, l, t)] = State.DONE
-                        continue
+            if (settings.useAI) {
+                // УМНЫЙ ЗАПРОС: все варианты за один вызов.
+                var attempt = 0
+                while (attempt < maxRetries) {
+                    // пометить недостающие как RUNNING
+                    for ((l, t) in combos) {
+                        if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.RUNNING
                     }
-                    remaining++
-                    states[k(note.id, l, t)] = State.RUNNING
                     try {
-                        val text = computeOne(note, l, t)
-                        note.putVariant(l, t, text)
-                        states[k(note.id, l, t)] = State.DONE
-                        progressDone[note.id] = combos.count { (ll, tt) -> note.getVariant(ll, tt) != null }
-                        persist()  // сохраняем сразу на диск
+                        val all = AiClient.processAll(note.original, settings.apiKey)
+                        // раскладываем результат
+                        for ((l, t) in combos) {
+                            val key = "${l.ordinal}:${t.ordinal}"
+                            val text = all[key]
+                            if (text != null && text.isNotBlank()) {
+                                note.putVariant(l, t, text)
+                                states[k(note.id, l, t)] = State.DONE
+                            }
+                        }
+                        progressDone[note.id] = combos.count { (l, t) -> note.getVariant(l, t) != null }
+                        persist()
+                        val allDone = combos.all { (l, t) -> note.getVariant(l, t) != null }
+                        if (allDone) break
                     } catch (e: Exception) {
-                        states[k(note.id, l, t)] = State.FAILED
+                        // помечаем оставшиеся как FAILED, но повторим
+                        for ((l, t) in combos) {
+                            if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.FAILED
+                        }
+                        lastAiError = e.message ?: "Ошибка ИИ"
                     }
-                    if (settings.useAI) delay(requestSpacingMs)  // не превышаем лимит
+                    attempt++
+                    if (attempt < maxRetries &&
+                        combos.any { (l, t) -> note.getVariant(l, t) == null }) {
+                        delay(10000)  // пауза перед повтором
+                    }
                 }
-                // всё готово?
-                val allDone = combos.all { (l, t) -> note.getVariant(l, t) != null }
-                if (allDone) break
-                attempt++
-                if (attempt < maxRetries) delay(8000)  // пауза перед новым проходом
+            } else {
+                // Бесплатные правила: считаем каждый локально (мгновенно, без лимитов).
+                for ((l, t) in combos) {
+                    if (note.getVariant(l, t) == null) {
+                        note.putVariant(l, t, TextCondenser.condense(note.original, l))
+                        states[k(note.id, l, t)] = State.DONE
+                    }
+                }
+                progressDone[note.id] = combos.size
+                persist()
             }
             activeNote[note.id] = false
         }
