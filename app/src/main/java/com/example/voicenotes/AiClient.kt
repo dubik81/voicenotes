@@ -17,6 +17,10 @@ object AiClient {
 
     private const val ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
+    // Остаток запросов из последнего ответа (-1 = неизвестно).
+    @Volatile var rateLimitRemaining: Int = -1
+        private set
+
     // openrouter/free — специальный роутер: OpenRouter САМ выбирает живую
     // бесплатную модель. Не устаревает, когда конкретные модели уходят из free.
     private val FREE_MODELS = listOf(
@@ -204,6 +208,10 @@ object AiClient {
         try {
             conn.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
+            // Остаток лимита из заголовков (OpenRouter шлёт X-RateLimit-*).
+            conn.getHeaderField("X-RateLimit-Remaining")?.toIntOrNull()?.let {
+                rateLimitRemaining = it
+            }
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
             val response = stream?.bufferedReader()?.use { it.readText() } ?: ""
 

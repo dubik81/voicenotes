@@ -27,13 +27,25 @@ object Punctuator {
         if (raw.isBlank()) return ""
         var t = raw.trim().replace(Regex("\\s+"), " ")
 
-        // Запятые перед союзами.
+        // Деление потока на предложения: перед словом-маркером начала фразы
+        // ставим точку (грубо, но делает длинный поток читаемым).
         val words = t.split(" ")
         val out = StringBuilder()
         for ((i, w) in words.withIndex()) {
             val clean = w.lowercase().trim(',', '.', '!', '?')
-            val needComma = i > 0 && clean in commaBefore && !out.trimEnd().endsWith(",")
-            if (needComma && clean !in setOf("и", "или")) {
+            // маркер нового предложения — но не в самом начале и не подряд
+            if (i > 3 && clean in sentenceStarters &&
+                !out.trimEnd().endsWith(".") && out.length > 10) {
+                while (out.isNotEmpty() && out.last() == ' ') out.deleteCharAt(out.length - 1)
+                out.append(". ")
+                out.append(w).append(" ")
+                continue
+            }
+            // запятая перед союзом
+            val needComma = i > 0 && clean in commaBefore &&
+                    clean !in setOf("и", "или") && !out.trimEnd().endsWith(",") &&
+                    !out.trimEnd().endsWith(".")
+            if (needComma) {
                 while (out.isNotEmpty() && out.last() == ' ') out.deleteCharAt(out.length - 1)
                 out.append(", ")
             }

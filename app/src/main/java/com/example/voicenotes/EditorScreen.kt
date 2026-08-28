@@ -85,7 +85,8 @@ fun EditorScreen(
     DisposableEffect(Unit) { onDispose { recognizer?.destroy(); audioPlayer.stop() } }
 
     fun persist() {
-        note.original = original
+        // Сохраняем пунктуированный текст (иначе теряется пунктуация).
+        note.original = Punctuator.punctuate(original)
         onChanged()
     }
 
@@ -123,6 +124,8 @@ fun EditorScreen(
     }
 
     var keepListening by remember { mutableStateOf(false) }
+    // Параллельная запись аудио в Google-режиме (может не завестись — микрофон занят).
+    var googleRecorder by remember { mutableStateOf<AudioRecorder?>(null) }
 
     fun buildIntent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -168,12 +171,21 @@ fun EditorScreen(
         liveText = ""
         isListening = true
         keepListening = settings.pauseSeconds == 0
+        // Пробуем писать аудио параллельно (для прослушивания). Может не выйти — микрофон занят.
+        if (settings.saveAudio) {
+            val audioFile = File(context.filesDir, "audio_${note.id}.wav")
+                .also { note.audioPath = it.absolutePath }
+            val rec = AudioRecorder(audioFile, appendMode = true)
+            val ok = rec.start()
+            if (ok) googleRecorder = rec
+        }
         recognizer.startListening(buildIntent())
     }
 
     fun stopListening() {
         keepListening = false
         recognizer?.stopListening()
+        googleRecorder?.stop(); googleRecorder = null
         isListening = false
     }
 
@@ -181,9 +193,6 @@ fun EditorScreen(
     var voskEngine by remember { mutableStateOf<VoskEngine?>(null) }
     var downloadProgress by remember { mutableStateOf(-1) }
     var lastSpeechAt by remember { mutableStateOf(0L) }
-    // Двухступенчатое распознавание: статус уточнения через Whisper.
-    var refining by remember { mutableStateOf(false) }       // идёт облачное уточнение
-    var refinedReady by remember { mutableStateOf(note.refinedText != null && !note.isRefined) }
 
     LaunchedEffect(isListening, settings.pauseSeconds) {
         val pauseMs = settings.pauseSeconds * 1000L
@@ -227,44 +236,31 @@ fun EditorScreen(
         }
     }
 
-    // Облачное уточнение через Whisper: шлём записанное аудио, точный текст в refinedText.
-    fun refineWithWhisper() {
-        val path = note.audioPath ?: return
-        if (!settings.useAI) return  // нужен ключ OpenRouter
-        val file = File(path)
-        if (!file.exists() || file.length() < 44) return
-        refining = true
-        scope.launch {
-            try {
-                val precise = Transcriber.transcribe(file, settings.apiKey, "ru")
-                if (precise.isNotBlank()) {
-                    note.refinedText = Punctuator.punctuate(precise)
-                    refinedReady = true
-                    persist()
-                }
-            } catch (e: Exception) {
-                status = "Уточнение не удалось: ${e.message}"
-            } finally {
-                refining = false
-            }
-        }
-    }
-
     fun stopVosk() {
         voskEngine?.stop(); voskEngine = null
         isListening = false; liveText = ""; persist()
-        // автоматически шлём на облачное уточнение
-        refineWithWhisper()
-    }
-
-    // Применить уточнённый текст как основной и пересчитать варианты.
-    fun applyRefined() {
-        val refined = note.refinedText ?: return
-        original = refined
-        note.original = refined
-        note.isRefined = true
-        refinedReady = false
-        startProcessingAll()   // пересчёт всех вариантов с точного текста
+        // Эксперимент: офлайн-ансамбль перераспознаёт аудио и, если получает
+        // заметно более полный текст, обновляет базовый.
+        val path = note.audioPath
+        if (path != null && File(path).exists()) {
+            scope.launch {
+                try {
+                    val model = VoskHolder.getModel(context)
+                    val better = RecognitionEnsemble.refine(model, File(path))
+                    if (better != null) {
+                        val curWords = original.split(Regex("\\s+")).size
+                        val newWords = better.split(Regex("\\s+")).size
+                        // берём только если ансамбль дал ощутимо больше слов (>10%)
+                        if (newWords > curWords * 1.1) {
+                            original = better
+                            note.original = Punctuator.punctuate(better)
+                            startProcessingAll()
+                            status = "Текст уточнён (ансамбль)"
+                        }
+                    }
+                } catch (_: Exception) { /* ансамбль не обязателен */ }
+            }
+        }
     }
 
     fun startRecording() { if (settings.useVosk) startVosk() else startListening() }
@@ -314,36 +310,6 @@ fun EditorScreen(
             }
 
             Box(Modifier.weight(1f).fillMaxWidth().padding(16.dp)) {
-                Column(Modifier.fillMaxSize()) {
-                    // Индикатор двухступенчатого распознавания (только в Vosk-режиме).
-                    if (settings.useVosk && original.isNotBlank()) {
-                        val label = when {
-                            refining -> "⏳ Уточняю распознавание через ИИ…"
-                            refinedReady -> "✓ Готов уточнённый текст — применить?"
-                            note.isRefined -> "✓ Текст уточнён"
-                            else -> "черновой текст (Vosk)"
-                        }
-                        val color = when {
-                            refining -> Palette.Amber
-                            refinedReady -> Palette.Green
-                            note.isRefined -> Palette.Green
-                            else -> cs.onSurfaceVariant
-                        }
-                        Row(
-                            Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(label, color = color, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                            if (refinedReady) {
-                                Button(
-                                    onClick = { applyRefined() },
-                                    shape = RoundedCornerShape(10.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = Palette.Green),
-                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
-                                ) { Text("Применить", fontSize = 12.sp, color = Color.White) }
-                            }
-                        }
-                    }
                     Surface(color = cs.surface, shape = RoundedCornerShape(16.dp),
                         modifier = Modifier.fillMaxSize()) {
                     when {
@@ -373,7 +339,6 @@ fun EditorScreen(
                         }
                     }
                     }
-                }
             }
 
             Surface(color = cs.surface, shadowElevation = 12.dp) {
@@ -421,8 +386,10 @@ fun EditorScreen(
                         total > 0 && done < total -> "Готово: $done из $total"
                         else -> status
                     }
+                    val limitInfo = if (settings.useAI && AiClient.rateLimitRemaining >= 0)
+                        "  ·  осталось запросов: ${AiClient.rateLimitRemaining}" else ""
                     refreshTick // подписка на обновления
-                    Text(liveStatus, color = cs.onSurfaceVariant, fontSize = 11.sp, maxLines = 1)
+                    Text(liveStatus + limitInfo, color = cs.onSurfaceVariant, fontSize = 11.sp, maxLines = 1)
                     if (downloadProgress in 0..100) {
                         Spacer(Modifier.height(4.dp))
                         LinearProgressIndicator(
@@ -469,17 +436,24 @@ fun EditorScreen(
 
                     // «Другой вариант» — переделать только текущий текст (не для Дословно).
                     if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
+                        var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
                         OutlinedButton(
                             onClick = {
+                                regenerating = true
                                 status = "Готовлю другой вариант…"
                                 processor.regenerateOne(note, level, tone) {
-                                    onChanged(); status = "Готово"
+                                    onChanged()
+                                    refreshTick++          // форсируем перечитывание текста
+                                    regenerating = false
+                                    status = "Готово"
                                 }
                             },
-                            enabled = !isListening,
+                            enabled = !isListening && !regenerating,
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
-                        ) { Text("↻ Другой вариант", fontSize = 13.sp) }
+                        ) {
+                            Text(if (regenerating) "Генерирую…" else "↻ Другой вариант", fontSize = 13.sp)
+                        }
                         Spacer(Modifier.height(8.dp))
                     }
 
