@@ -28,12 +28,25 @@ fun App() {
 
     fun persist() { store.save(notes) }
 
-    // Фоновый процессор вариантов — живёт всё время работы приложения,
-    // поэтому расчёт не прерывается при закрытии заметки.
+    // Живучий процессор: доступ к заметкам + сохранение на диск.
     val processor = remember {
-        VariantProcessor(appScope, settings) {
-            store.save(notes)                       // сохраняем по мере готовности
-            notes = notes.toMutableList()           // триггерим обновление UI
+        VariantProcessor(
+            scope = appScope,
+            settings = settings,
+            notesProvider = { notes },
+            persist = {
+                store.save(notes)
+                notes = notes.toMutableList()  // триггер обновления UI
+            }
+        )
+    }
+
+    // Периодически продолжаем недосчитанное во ВСЕХ заметках (фон надёжного уровня:
+    // работает пока приложение живо — открыто или свёрнуто).
+    LaunchedEffect(Unit) {
+        while (true) {
+            processor.resumeAll()
+            kotlinx.coroutines.delay(15000)
         }
     }
 

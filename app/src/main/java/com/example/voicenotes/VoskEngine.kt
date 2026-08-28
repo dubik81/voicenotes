@@ -58,11 +58,19 @@ class VoskEngine(
                 )
                 recognizer = Recognizer(model, sampleRate.toFloat())
 
-                // Готовим WAV с временным заголовком (перезапишем размеры в конце).
+                // Готовим WAV. Если файл уже есть (дозапись) — продолжаем с конца.
                 if (saveAudioTo != null) {
-                    wav = RandomAccessFile(saveAudioTo, "rw").apply {
-                        setLength(0)
-                        writeWavHeader(this, sampleRate, 0)
+                    val exists = saveAudioTo.exists() && saveAudioTo.length() > 44
+                    if (exists) {
+                        // читаем текущую длину PCM из заголовка и пишем в конец
+                        wav = RandomAccessFile(saveAudioTo, "rw")
+                        pcmBytes = saveAudioTo.length() - 44  // вычитаем заголовок
+                        wav.seek(saveAudioTo.length())        // в конец
+                    } else {
+                        wav = RandomAccessFile(saveAudioTo, "rw").apply {
+                            setLength(0)
+                            writeWavHeader(this, sampleRate, 0)
+                        }
                     }
                 }
 

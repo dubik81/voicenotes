@@ -41,8 +41,10 @@ data class Note(
     val id: Long,
     var title: String,
     val createdAt: Long,
-    var original: String,                       // дословный текст (с пунктуацией)
+    var original: String,                       // текущий рабочий текст (с пунктуацией)
     var audioPath: String? = null,              // путь к аудио, если сохранялось
+    var refinedText: String? = null,            // уточнённый текст от Whisper (если готов)
+    var isRefined: Boolean = false,             // применён ли уточнённый как основной
     val variants: MutableMap<String, String> = mutableMapOf()
 ) {
     fun variantKey(level: Level, tone: Tone) = "${level.ordinal}:${tone.ordinal}"
@@ -60,6 +62,8 @@ data class Note(
         put("createdAt", createdAt)
         put("original", original)
         put("audioPath", audioPath ?: JSONObject.NULL)
+        put("refinedText", refinedText ?: JSONObject.NULL)
+        put("isRefined", isRefined)
         val v = JSONObject()
         variants.forEach { (k, value) -> v.put(k, value) }
         put("variants", v)
@@ -77,6 +81,8 @@ data class Note(
                 createdAt = o.getLong("createdAt"),
                 original = o.getString("original"),
                 audioPath = o.optString("audioPath").takeIf { it.isNotBlank() && it != "null" },
+                refinedText = o.optString("refinedText").takeIf { it.isNotBlank() && it != "null" },
+                isRefined = o.optBoolean("isRefined", false),
                 variants = variants
             )
         }

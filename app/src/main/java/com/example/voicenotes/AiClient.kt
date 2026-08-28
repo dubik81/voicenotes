@@ -33,14 +33,18 @@ object AiClient {
         "qwen/qwen-2.5-7b-instruct:free"
     )
 
-    /** Основной вызов обработки текста. */
-    suspend fun process(rawText: String, level: Level, tone: Tone, apiKey: String): String =
+    /** Основной вызов обработки текста. vary=true просит переформулировать иначе. */
+    suspend fun process(rawText: String, level: Level, tone: Tone, apiKey: String, vary: Boolean = false): String =
         withContext(Dispatchers.IO) {
+            val sys = systemPrompt(level, tone) + if (vary)
+                "\n\nВАЖНО: дай ДРУГОЙ вариант формулировки, отличный от обычного — " +
+                "переставь акценты, смени структуру фразы, но сохрани смысл и требования выше."
+            else ""
             val messages = JSONArray().apply {
-                put(JSONObject().put("role", "system").put("content", systemPrompt(level, tone)))
+                put(JSONObject().put("role", "system").put("content", sys))
                 put(JSONObject().put("role", "user").put("content", rawText))
             }
-            val (text, _) = request(messages, apiKey, temperature = 0.4)
+            val (text, _) = request(messages, apiKey, temperature = if (vary) 0.9 else 0.4)
             text
         }
 
@@ -199,9 +203,10 @@ $toneRule
 1. Ответ — всегда грамотный СВЯЗНЫЙ текст с правильной пунктуацией и заглавными буквами.
 2. Никаких рваных фраз, обрывков и слов-паразитов в ответе.
 3. Каждое предложение законченное и осмысленное.
-4. Отвечай на языке оригинала.
-5. Не выдумывай фактов, которых нет в оригинале.
-6. Верни ТОЛЬКО готовый текст — без пояснений, заголовков и кавычек.
+4. Результат ДОЛЖЕН быть КОРОЧЕ исходного текста (для «Кратко» — примерно вдвое, для «Суть» — в несколько раз). Никогда не длиннее оригинала.
+5. Отвечай на языке оригинала.
+6. Не выдумывай фактов, которых нет в оригинале.
+7. Верни ТОЛЬКО готовый текст — без пояснений, заголовков и кавычек.
 
 Плохо (так НЕЛЬЗЯ): «нам это как бы надо на улицу ну погулять короче»
 Хорошо: «Нам нужно выйти на улицу и погулять.»

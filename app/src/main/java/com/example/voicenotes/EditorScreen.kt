@@ -106,6 +106,13 @@ fun EditorScreen(
         startProcessingAll()
     }
 
+    // При открытии заметки: продолжаем недосчитанное (готовое НЕ трогаем).
+    LaunchedEffect(note.id) {
+        if (note.original.isNotBlank()) {
+            processor.ensureAll(note, level, tone)
+        }
+    }
+
     // Периодически перечитываем статусы, пока идёт активная обработка.
     LaunchedEffect(note.id) {
         while (true) {
@@ -173,6 +180,9 @@ fun EditorScreen(
     var voskEngine by remember { mutableStateOf<VoskEngine?>(null) }
     var downloadProgress by remember { mutableStateOf(-1) }
     var lastSpeechAt by remember { mutableStateOf(0L) }
+    // Двухступенчатое распознавание: статус уточнения через Whisper.
+    var refining by remember { mutableStateOf(false) }       // идёт облачное уточнение
+    var refinedReady by remember { mutableStateOf(note.refinedText != null && !note.isRefined) }
 
     LaunchedEffect(isListening, settings.pauseSeconds) {
         val pauseMs = settings.pauseSeconds * 1000L
@@ -216,9 +226,44 @@ fun EditorScreen(
         }
     }
 
+    // Облачное уточнение через Whisper: шлём записанное аудио, точный текст в refinedText.
+    fun refineWithWhisper() {
+        val path = note.audioPath ?: return
+        if (!settings.useAI) return  // нужен ключ OpenRouter
+        val file = File(path)
+        if (!file.exists() || file.length() < 44) return
+        refining = true
+        scope.launch {
+            try {
+                val precise = Transcriber.transcribe(file, settings.apiKey, "ru")
+                if (precise.isNotBlank()) {
+                    note.refinedText = Punctuator.punctuate(precise)
+                    refinedReady = true
+                    persist()
+                }
+            } catch (e: Exception) {
+                status = "Уточнение не удалось: ${e.message}"
+            } finally {
+                refining = false
+            }
+        }
+    }
+
     fun stopVosk() {
         voskEngine?.stop(); voskEngine = null
         isListening = false; liveText = ""; persist()
+        // автоматически шлём на облачное уточнение
+        refineWithWhisper()
+    }
+
+    // Применить уточнённый текст как основной и пересчитать варианты.
+    fun applyRefined() {
+        val refined = note.refinedText ?: return
+        original = refined
+        note.original = refined
+        note.isRefined = true
+        refinedReady = false
+        startProcessingAll()   // пересчёт всех вариантов с точного текста
     }
 
     fun startRecording() { if (settings.useVosk) startVosk() else startListening() }
@@ -268,8 +313,38 @@ fun EditorScreen(
             }
 
             Box(Modifier.weight(1f).fillMaxWidth().padding(16.dp)) {
-                Surface(color = cs.surface, shape = RoundedCornerShape(16.dp),
-                    modifier = Modifier.fillMaxSize()) {
+                Column(Modifier.fillMaxSize()) {
+                    // Индикатор двухступенчатого распознавания (только в Vosk-режиме).
+                    if (settings.useVosk && original.isNotBlank()) {
+                        val label = when {
+                            refining -> "⏳ Уточняю распознавание через ИИ…"
+                            refinedReady -> "✓ Готов уточнённый текст — применить?"
+                            note.isRefined -> "✓ Текст уточнён"
+                            else -> "черновой текст (Vosk)"
+                        }
+                        val color = when {
+                            refining -> Palette.Amber
+                            refinedReady -> Palette.Green
+                            note.isRefined -> Palette.Green
+                            else -> cs.onSurfaceVariant
+                        }
+                        Row(
+                            Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(label, color = color, fontSize = 12.sp, modifier = Modifier.weight(1f))
+                            if (refinedReady) {
+                                Button(
+                                    onClick = { applyRefined() },
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = Palette.Green),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp)
+                                ) { Text("Применить", fontSize = 12.sp, color = Color.White) }
+                            }
+                        }
+                    }
+                    Surface(color = cs.surface, shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.fillMaxSize()) {
                     when {
                         isListening -> Text(
                             liveText.ifBlank { "Слушаю…" },
@@ -295,6 +370,7 @@ fun EditorScreen(
                             Text(shown, color = cs.onSurface, fontSize = settings.fontSize.sp,
                                 modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp))
                         }
+                    }
                     }
                 }
             }
@@ -388,6 +464,22 @@ fun EditorScreen(
                         Spacer(Modifier.height(8.dp))
                     }
 
+                    // «Другой вариант» — переделать только текущий текст (не для Дословно).
+                    if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
+                        OutlinedButton(
+                            onClick = {
+                                status = "Готовлю другой вариант…"
+                                processor.regenerateOne(note, level, tone) {
+                                    onChanged(); status = "Готово"
+                                }
+                            },
+                            enabled = !isListening,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("↻ Другой вариант", fontSize = 13.sp) }
+                        Spacer(Modifier.height(8.dp))
+                    }
+
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedButton(onClick = {
                             val cm = context.getSystemService(Context.CLIPBOARD_SERVICE)
@@ -405,6 +497,27 @@ fun EditorScreen(
                         }, enabled = shown.isNotBlank(), shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.weight(1f)) { Text("Поделиться", fontSize = 13.sp) }
                     }
+
+                    Spacer(Modifier.height(8.dp))
+                    // Экспорт всей заметки в JSON-файл (для разбора).
+                    OutlinedButton(
+                        onClick = {
+                            try {
+                                val file = NoteExporter.exportJson(context, note)
+                                val uri = androidx.core.content.FileProvider.getUriForFile(
+                                    context, "${context.packageName}.fileprovider", file)
+                                val share = Intent(Intent.ACTION_SEND).apply {
+                                    type = "application/json"
+                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                context.startActivity(Intent.createChooser(share, "Экспорт заметки"))
+                            } catch (e: Exception) { status = "Ошибка экспорта: ${e.message}" }
+                        },
+                        enabled = original.isNotBlank(),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("⤓ Экспорт заметки (JSON)", fontSize = 13.sp) }
                 }
             }
         }
