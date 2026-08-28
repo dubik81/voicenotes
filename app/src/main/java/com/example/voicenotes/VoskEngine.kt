@@ -28,6 +28,10 @@ class VoskEngine(
     @Volatile private var running = false
     private var recordThread: Thread? = null
 
+    // Средняя громкость последнего участка (для будущего детекта пропусков).
+    @Volatile var lastRms: Double = 0.0
+        private set
+
     @SuppressLint("MissingPermission")
     fun start(
         onPartial: (String) -> Unit,
@@ -80,6 +84,16 @@ class VoskEngine(
                 while (running) {
                     val n = audioRecord.read(buffer, 0, buffer.size)
                     if (n > 0) {
+                        // громкость (RMS) куска — для детекта речи без распознанного текста
+                        var sum = 0.0
+                        var i = 0
+                        while (i + 1 < n) {
+                            val sample = (buffer[i].toInt() and 0xff) or (buffer[i + 1].toInt() shl 8)
+                            sum += (sample * sample).toDouble()
+                            i += 2
+                        }
+                        lastRms = if (n > 0) Math.sqrt(sum / (n / 2)) else 0.0
+
                         // в файл
                         if (wav != null) {
                             wav.write(buffer, 0, n)

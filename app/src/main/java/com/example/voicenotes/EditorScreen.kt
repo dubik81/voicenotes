@@ -102,7 +102,8 @@ fun EditorScreen(
         if (note.title == "Заметка") {
             note.title = original.take(30).trim().ifBlank { "Заметка" }
         }
-        note.original = original
+        // Сохраняем СРАЗУ пунктуированный текст (чистый и на экране, и в экспорте).
+        note.original = Punctuator.punctuate(original)
         startProcessingAll()
     }
 
@@ -505,11 +506,11 @@ fun EditorScreen(
                     OutlinedButton(
                         onClick = {
                             try {
-                                val file = NoteExporter.exportJson(context, note)
+                                val file = NoteExporter.exportFull(context, note)
                                 val uri = androidx.core.content.FileProvider.getUriForFile(
                                     context, "${context.packageName}.fileprovider", file)
                                 val share = Intent(Intent.ACTION_SEND).apply {
-                                    type = "application/json"
+                                    type = "application/zip"
                                     putExtra(Intent.EXTRA_STREAM, uri)
                                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                 }
@@ -519,7 +520,7 @@ fun EditorScreen(
                         enabled = original.isNotBlank(),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier.fillMaxWidth()
-                    ) { Text("⤓ Экспорт заметки (JSON)", fontSize = 13.sp) }
+                    ) { Text("⤓ Экспорт (текст + аудио, zip)", fontSize = 13.sp) }
                 }
             }
         }
