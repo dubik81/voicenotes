@@ -75,12 +75,14 @@ fun App() {
             NotesListScreen(
                 notes = sorted,
                 onOpen = { openNoteId = it.id },
-                onNew = {
+                onNew = { useVosk ->
+                    settings.useVosk = useVosk
                     val n = Note(
                         id = System.currentTimeMillis(),
                         title = "Заметка",
                         createdAt = System.currentTimeMillis(),
-                        original = ""
+                        original = "",
+                        recordMode = if (useVosk) "vosk" else "google"
                     )
                     notes = (mutableListOf(n) + notes).toMutableList()
                     openNoteId = n.id

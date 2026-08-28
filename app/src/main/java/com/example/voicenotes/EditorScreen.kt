@@ -124,8 +124,6 @@ fun EditorScreen(
     }
 
     var keepListening by remember { mutableStateOf(false) }
-    // Параллельная запись аудио в Google-режиме (может не завестись — микрофон занят).
-    var googleRecorder by remember { mutableStateOf<AudioRecorder?>(null) }
 
     fun buildIntent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -171,21 +169,14 @@ fun EditorScreen(
         liveText = ""
         isListening = true
         keepListening = settings.pauseSeconds == 0
-        // Пробуем писать аудио параллельно (для прослушивания). Может не выйти — микрофон занят.
-        if (settings.saveAudio) {
-            val audioFile = File(context.filesDir, "audio_${note.id}.wav")
-                .also { note.audioPath = it.absolutePath }
-            val rec = AudioRecorder(audioFile, appendMode = true)
-            val ok = rec.start()
-            if (ok) googleRecorder = rec
-        }
+        // Google держит микрофон эксклюзивно — параллельно писать звук нельзя
+        // (это ломало распознавание). В Google-режиме аудио не записываем.
         recognizer.startListening(buildIntent())
     }
 
     fun stopListening() {
         keepListening = false
         recognizer?.stopListening()
-        googleRecorder?.stop(); googleRecorder = null
         isListening = false
     }
 
@@ -302,6 +293,15 @@ fun EditorScreen(
                 Spacer(Modifier.weight(1f))
                 TextButton(onClick = { showRename = true }) {
                     Text(note.title.take(20), color = Color.White, fontWeight = FontWeight.SemiBold)
+                }
+                // индикация режима записи
+                val modeLabel = when (note.recordMode) {
+                    "vosk" -> "🎤 офлайн"
+                    "google" -> "🌐 онлайн"
+                    else -> ""
+                }
+                if (modeLabel.isNotBlank()) {
+                    Text(modeLabel, color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp)
                 }
                 Spacer(Modifier.weight(1f))
                 TextButton(onClick = {
@@ -434,25 +434,40 @@ fun EditorScreen(
                         Spacer(Modifier.height(8.dp))
                     }
 
-                    // «Другой вариант» — переделать только текущий текст (не для Дословно).
+                    // «Другой вариант» из трёх частей: ‹ назад по версиям · генерация · вперёд ›
                     if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
                         var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
-                        OutlinedButton(
-                            onClick = {
-                                regenerating = true
-                                status = "Готовлю другой вариант…"
-                                processor.regenerateOne(note, level, tone) {
-                                    onChanged()
-                                    refreshTick++          // форсируем перечитывание текста
-                                    regenerating = false
-                                    status = "Готово"
-                                }
-                            },
-                            enabled = !isListening && !regenerating,
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Text(if (regenerating) "Генерирую…" else "↻ Другой вариант", fontSize = 13.sp)
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            // назад к предыдущей редакции
+                            OutlinedButton(
+                                onClick = { note.goBack(level, tone); onChanged(); refreshTick++ },
+                                enabled = note.canGoBack(level, tone) && !regenerating,
+                                shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(0.dp),
+                                modifier = Modifier.size(48.dp)
+                            ) { Text("‹", fontSize = 20.sp) }
+
+                            // генерация нового варианта
+                            OutlinedButton(
+                                onClick = {
+                                    regenerating = true
+                                    processor.regenerateOne(note, level, tone) {
+                                        onChanged(); refreshTick++; regenerating = false
+                                    }
+                                },
+                                enabled = !isListening && !regenerating,
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.weight(1f)
+                            ) { Text(if (regenerating) "Генерирую…" else "↻ Другой вариант", fontSize = 13.sp) }
+
+                            // вперёд к более поздней редакции
+                            OutlinedButton(
+                                onClick = { note.goForward(level, tone); onChanged(); refreshTick++ },
+                                enabled = note.canGoForward(level, tone) && !regenerating,
+                                shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(0.dp),
+                                modifier = Modifier.size(48.dp)
+                            ) { Text("›", fontSize = 20.sp) }
                         }
                         Spacer(Modifier.height(8.dp))
                     }

@@ -35,7 +35,6 @@ fun SettingsScreen(
     var pause by remember { mutableStateOf(settings.pauseSeconds) }
     var saveAudio by remember { mutableStateOf(settings.saveAudio) }
     var precompute by remember { mutableStateOf(settings.precomputeAll) }
-    var useVosk by remember { mutableStateOf(settings.useVosk) }
     var fontSize by remember { mutableStateOf(settings.fontSize) }
     var newestFirst by remember { mutableStateOf(settings.newestFirst) }
     var confirmDelete by remember { mutableStateOf(settings.confirmDelete) }
@@ -48,7 +47,6 @@ fun SettingsScreen(
         settings.pauseSeconds = pause
         settings.saveAudio = saveAudio
         settings.precomputeAll = precompute
-        settings.useVosk = useVosk
         settings.fontSize = fontSize
         settings.newestFirst = newestFirst
         settings.confirmDelete = confirmDelete
@@ -130,9 +128,9 @@ fun SettingsScreen(
                     // ── Распознавание ──
                     SectionTitle("Распознавание речи")
                     SettingCard {
-                        ToggleRow("Офлайн-режим Vosk (+ запись аудио)", useVosk) { useVosk = it }
-                        Text("Google: точнее, онлайн, без аудио. Vosk: офлайн, пишет звук, " +
-                             "но менее точно. Модель (~45 МБ) скачается при первом включении.",
+                        Text("Режим записи выбирается на главном экране кнопками " +
+                             "«Онлайн» (Google, точнее) и «Офлайн» (Vosk, с записью аудио). " +
+                             "Модель Vosk (~45 МБ) скачается при первом офлайн-запуске.",
                             fontSize = 11.sp, color = cs.onSurfaceVariant)
                         HorizontalDivider(Modifier.padding(vertical = 10.dp))
                         Text("Авто-остановка при паузе", fontSize = 13.sp,
@@ -145,7 +143,7 @@ fun SettingsScreen(
                             }
                         }
                         HorizontalDivider(Modifier.padding(vertical = 10.dp))
-                        ToggleRow("Сохранять аудио (только Vosk)", saveAudio) { saveAudio = it }
+                        ToggleRow("Сохранять аудио (офлайн-режим)", saveAudio) { saveAudio = it }
                     }
 
                     // ── Обработка ──

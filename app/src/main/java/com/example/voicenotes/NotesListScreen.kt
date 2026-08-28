@@ -26,7 +26,7 @@ import java.util.Locale
 fun NotesListScreen(
     notes: List<Note>,
     onOpen: (Note) -> Unit,
-    onNew: () -> Unit,
+    onNew: (useVosk: Boolean) -> Unit,
     onOpenSettings: () -> Unit
 ) {
     var query by remember { mutableStateOf("") }
@@ -42,13 +42,24 @@ fun NotesListScreen(
     Scaffold(
         containerColor = cs.background,
         floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = onNew,
-                containerColor = Palette.Ink,
-                contentColor = Color.White,
-                text = { Text("Новая запись") },
-                icon = { Text("🎤", fontSize = 18.sp) }
-            )
+            Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                // Онлайн (Google — точнее, без аудио)
+                ExtendedFloatingActionButton(
+                    onClick = { onNew(false) },
+                    containerColor = Palette.Green,
+                    contentColor = Color.White,
+                    text = { Text("Онлайн (точно)") },
+                    icon = { Text("🌐", fontSize = 16.sp) }
+                )
+                // Офлайн (Vosk — с записью аудио)
+                ExtendedFloatingActionButton(
+                    onClick = { onNew(true) },
+                    containerColor = Palette.Ink,
+                    contentColor = Color.White,
+                    text = { Text("Офлайн (+аудио)") },
+                    icon = { Text("🎤", fontSize = 16.sp) }
+                )
+            }
         }
     ) { pad ->
         Column(Modifier.fillMaxSize().padding(pad)) {

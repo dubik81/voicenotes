@@ -43,9 +43,14 @@ data class Note(
     val createdAt: Long,
     var original: String,                       // текущий рабочий текст (с пунктуацией)
     var audioPath: String? = null,              // путь к аудио, если сохранялось
-    var refinedText: String? = null,            // уточнённый текст от Whisper (если готов)
-    var isRefined: Boolean = false,             // применён ли уточнённый как основной
-    val variants: MutableMap<String, String> = mutableMapOf()
+    var recordMode: String = "",                // "vosk" или "google" — чем записана
+    var refinedText: String? = null,            // не используется (совместимость)
+    var isRefined: Boolean = false,             // не используется (совместимость)
+    val variants: MutableMap<String, String> = mutableMapOf(),
+    // История редакций: ключ "levelOrd:toneOrd" -> список версий текста.
+    val history: MutableMap<String, MutableList<String>> = mutableMapOf(),
+    // Текущий индекс в истории для каждого варианта.
+    val historyIndex: MutableMap<String, Int> = mutableMapOf()
 ) {
     fun variantKey(level: Level, tone: Tone) = "${level.ordinal}:${tone.ordinal}"
 
@@ -53,7 +58,46 @@ data class Note(
         if (level == Level.VERBATIM) original else variants[variantKey(level, tone)]
 
     fun putVariant(level: Level, tone: Tone, text: String) {
-        variants[variantKey(level, tone)] = text
+        val key = variantKey(level, tone)
+        variants[key] = text
+        // добавляем в историю (если это новая версия, не дубль текущей)
+        val hist = history.getOrPut(key) { mutableListOf() }
+        if (hist.isEmpty() || hist.last() != text) {
+            // если мы не в конце истории — обрезаем «будущее» перед добавлением
+            val idx = historyIndex[key] ?: (hist.size - 1)
+            while (hist.size > idx + 1) hist.removeAt(hist.size - 1)
+            hist.add(text)
+            historyIndex[key] = hist.size - 1
+        }
+    }
+
+    /** Можно ли шагнуть к предыдущей версии. */
+    fun canGoBack(level: Level, tone: Tone): Boolean {
+        val key = variantKey(level, tone)
+        return (historyIndex[key] ?: 0) > 0
+    }
+
+    /** Можно ли шагнуть к более поздней версии. */
+    fun canGoForward(level: Level, tone: Tone): Boolean {
+        val key = variantKey(level, tone)
+        val hist = history[key] ?: return false
+        return (historyIndex[key] ?: 0) < hist.size - 1
+    }
+
+    /** Шаг к предыдущей версии. */
+    fun goBack(level: Level, tone: Tone) {
+        val key = variantKey(level, tone)
+        val hist = history[key] ?: return
+        val idx = (historyIndex[key] ?: 0) - 1
+        if (idx >= 0) { historyIndex[key] = idx; variants[key] = hist[idx] }
+    }
+
+    /** Шаг к более поздней версии. */
+    fun goForward(level: Level, tone: Tone) {
+        val key = variantKey(level, tone)
+        val hist = history[key] ?: return
+        val idx = (historyIndex[key] ?: 0) + 1
+        if (idx < hist.size) { historyIndex[key] = idx; variants[key] = hist[idx] }
     }
 
     fun toJson(): JSONObject = JSONObject().apply {
@@ -61,12 +105,22 @@ data class Note(
         put("title", title)
         put("createdAt", createdAt)
         put("original", original)
+        put("recordMode", recordMode)
         put("audioPath", audioPath ?: JSONObject.NULL)
         put("refinedText", refinedText ?: JSONObject.NULL)
         put("isRefined", isRefined)
         val v = JSONObject()
         variants.forEach { (k, value) -> v.put(k, value) }
         put("variants", v)
+        // история редакций
+        val h = JSONObject()
+        history.forEach { (k, list) ->
+            val arr = JSONArray(); list.forEach { arr.put(it) }; h.put(k, arr)
+        }
+        put("history", h)
+        val hi = JSONObject()
+        historyIndex.forEach { (k, idx) -> hi.put(k, idx) }
+        put("historyIndex", hi)
     }
 
     companion object {
@@ -75,15 +129,31 @@ data class Note(
             o.optJSONObject("variants")?.let { vj ->
                 vj.keys().forEach { k -> variants[k] = vj.getString(k) }
             }
+            val history = mutableMapOf<String, MutableList<String>>()
+            o.optJSONObject("history")?.let { hj ->
+                hj.keys().forEach { k ->
+                    val arr = hj.getJSONArray(k)
+                    val list = mutableListOf<String>()
+                    for (i in 0 until arr.length()) list.add(arr.getString(i))
+                    history[k] = list
+                }
+            }
+            val historyIndex = mutableMapOf<String, Int>()
+            o.optJSONObject("historyIndex")?.let { hij ->
+                hij.keys().forEach { k -> historyIndex[k] = hij.getInt(k) }
+            }
             return Note(
                 id = o.getLong("id"),
                 title = o.getString("title"),
                 createdAt = o.getLong("createdAt"),
                 original = o.getString("original"),
+                recordMode = o.optString("recordMode", ""),
                 audioPath = o.optString("audioPath").takeIf { it.isNotBlank() && it != "null" },
                 refinedText = o.optString("refinedText").takeIf { it.isNotBlank() && it != "null" },
                 isRefined = o.optBoolean("isRefined", false),
-                variants = variants
+                variants = variants,
+                history = history,
+                historyIndex = historyIndex
             )
         }
 
