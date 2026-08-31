@@ -43,10 +43,15 @@ class VariantProcessor(
     private fun k(noteId: Long, l: Level, t: Tone) = "$noteId:${l.ordinal}:${t.ordinal}"
     fun stateOf(noteId: Long, l: Level, t: Tone): State? = states[k(noteId, l, t)]
 
-    private fun allCombos(): List<Pair<Level, Tone>> = buildList {
-        for (l in Level.entries) for (t in Tone.entries) {
+    private fun allCombos(lecture: Boolean = false): List<Pair<Level, Tone>> = buildList {
+        for (l in Level.entries) {
             if (l == Level.VERBATIM) continue
-            add(l to t)
+            if (lecture) {
+                // Лекция: тон не используется, только NEUTRAL (3 варианта вместо 9).
+                add(l to Tone.NEUTRAL)
+            } else {
+                for (t in Tone.entries) add(l to t)
+            }
         }
     }
 
@@ -55,7 +60,7 @@ class VariantProcessor(
         if (note.original.isBlank()) return
         if (jobs[note.id]?.isActive == true) return
 
-        val combos = allCombos()
+        val combos = allCombos(note.isLecture)
         for ((l, t) in combos) {
             val key = k(note.id, l, t)
             if (note.getVariant(l, t) == null) {
@@ -160,7 +165,7 @@ class VariantProcessor(
     fun resumeAll() {
         for (note in notesProvider()) {
             if (note.original.isBlank()) continue
-            val hasGaps = allCombos().any { (l, t) -> note.getVariant(l, t) == null }
+            val hasGaps = allCombos(note.isLecture).any { (l, t) -> note.getVariant(l, t) == null }
             if (hasGaps && jobs[note.id]?.isActive != true) {
                 ensureAll(note, Level.CLEAN, Tone.NEUTRAL)
             }

@@ -19,6 +19,8 @@ object NoteExporter {
             put("id", note.id)
             put("title", note.title)
             put("created", dateFmt.format(Date(note.createdAt)))
+            put("is_lecture", note.isLecture)
+            put("record_mode", note.recordMode)
             put("original", note.original)
             put("original_length", note.original.length)
             put("refined_text", note.refinedText ?: JSONObject.NULL)

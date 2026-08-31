@@ -16,6 +16,21 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.clickable
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -106,11 +121,19 @@ fun EditorScreen(
 
     fun onRecognized(text: String) {
         original = if (original.isBlank()) text else "$original $text"
-        if (note.title == "Заметка") {
-            note.title = original.take(30).trim().ifBlank { "Заметка" }
+        if (note.title == "Заметка" || note.title == "Лекция") {
+            val t = original.take(30).trim()
+            if (t.isNotBlank()) note.title = t
         }
-        // Сохраняем СРАЗУ пунктуированный текст (чистый и на экране, и в экспорте).
+        // Во время записи только накапливаем текст. Обработку ИИ НЕ запускаем —
+        // иначе на каждый кусок речи шёл бы запрос (трата лимита и мигание текста).
         note.original = Punctuator.punctuate(original)
+        persist()
+    }
+
+    // Запуск обработки ИИ — вызывается ОДИН раз после остановки записи.
+    fun processAfterRecording() {
+        if (original.isBlank()) return
         startProcessingAll()
     }
 
@@ -131,7 +154,9 @@ fun EditorScreen(
 
     var keepListening by remember { mutableStateOf(false) }
     // Лекция: переключатель онлайн(Google)/офлайн(Vosk+Whisper), меняется между кусками.
-    var lectureOnline by remember { mutableStateOf(false) }
+    var isOnline by remember { mutableStateOf(note.recordMode == "google") }
+    var showMenu by remember { mutableStateOf(false) }
+    var showInfo by remember { mutableStateOf(false) }
 
     fun buildIntent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -186,6 +211,8 @@ fun EditorScreen(
         keepListening = false
         recognizer?.stopListening()
         isListening = false
+        // Запускаем обработку ИИ один раз после остановки.
+        processAfterRecording()
     }
 
     // ── Vosk ──
@@ -241,14 +268,13 @@ fun EditorScreen(
     fun stopVosk() {
         voskEngine?.stop(); voskEngine = null
         isListening = false; liveText = ""; persist()
-        // Автоматическое уточнение через Whisper (точнее Vosk), пока мигает пиктограмма.
         val path = note.audioPath
         if (settings.useWhisper && path != null && File(path).exists()) {
+            // Уточнение через Whisper, пока мигает пиктограмма. Обработка ИИ — после него.
             whisperRunning = true
             scope.launch {
                 try {
                     val modelId = settings.whisperModel
-                    // скачиваем модель при первом использовании
                     if (!WhisperModelManager.isReady(context, modelId)) {
                         status = "Скачиваю модель Whisper…"
                         whisperDownload = 0
@@ -260,7 +286,6 @@ fun EditorScreen(
                     if (!precise.isNullOrBlank()) {
                         original = precise
                         note.original = Punctuator.punctuate(precise)
-                        startProcessingAll()
                         status = "Текст уточнён (Whisper)"
                     } else {
                         status = "Whisper не смог уточнить"
@@ -270,18 +295,60 @@ fun EditorScreen(
                     whisperDownload = -1
                 } finally {
                     whisperRunning = false
+                    processAfterRecording()  // обработка ИИ после уточнения
                 }
             }
+        } else {
+            // Whisper выключен — сразу обработка ИИ.
+            processAfterRecording()
         }
     }
 
     fun startRecording() {
-        val useOffline = if (note.isLecture) !lectureOnline else settings.useVosk
+        val useOffline = !isOnline
         if (useOffline) startVosk() else startListening()
     }
     fun stopRecording() {
-        val useOffline = if (note.isLecture) !lectureOnline else settings.useVosk
+        val useOffline = !isOnline
         if (useOffline) stopVosk() else stopListening()
+    }
+
+    fun doExportZip() {
+        try {
+            val file = NoteExporter.exportFull(context, note)
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                context, "${context.packageName}.fileprovider", file)
+            context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                type = "application/zip"; putExtra(Intent.EXTRA_STREAM, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }, "Экспорт заметки"))
+        } catch (e: Exception) { status = "Ошибка экспорта: ${e.message}" }
+    }
+    fun doExportWord() {
+        try {
+            val file = DocxExporter.export(context, note)
+            val uri = androidx.core.content.FileProvider.getUriForFile(
+                context, "${context.packageName}.fileprovider", file)
+            context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                putExtra(Intent.EXTRA_STREAM, uri); addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }, "Экспорт в Word"))
+        } catch (e: Exception) { status = "Ошибка Word: ${e.message}" }
+    }
+    fun doUpdateText() {
+        val path = note.audioPath ?: return
+        if (!File(path).exists()) return
+        status = "Перераспознаю аудио…"
+        scope.launch {
+            try {
+                val model = VoskHolder.getModel(context)
+                val better = RecognitionEnsemble.refine(model, File(path), thorough = true)
+                if (!better.isNullOrBlank()) {
+                    original = better; note.original = Punctuator.punctuate(better)
+                    startProcessingAll(); status = "Текст обновлён из аудио"
+                } else status = "Не удалось улучшить"
+            } catch (e: Exception) { status = "Ошибка: ${e.message}" }
+        }
     }
 
     if (showRename) {
@@ -306,6 +373,30 @@ fun EditorScreen(
         )
     }
 
+    if (showInfo) {
+        val dateFmt = remember { java.text.SimpleDateFormat("d MMMM yyyy, HH:mm", java.util.Locale.getDefault()) }
+        val words = note.original.split(Regex("\\s+")).filter { it.isNotBlank() }.size
+        val audioInfo = note.audioPath?.let { p ->
+            val f = File(p)
+            if (f.exists()) "${(f.length() / 1024 / 16).coerceAtLeast(1)} сек (прибл.)" else "нет"
+        } ?: "нет"
+        AlertDialog(
+            onDismissRequest = { showInfo = false },
+            title = { Text("Информация") },
+            text = {
+                Column {
+                    Text("Тип: ${if (note.isLecture) "Лекция" else "Заметка"}")
+                    Text("Режим: ${if (note.recordMode == "google") "онлайн" else "офлайн"}")
+                    Text("Создана: ${dateFmt.format(java.util.Date(note.createdAt))}")
+                    Text("Слов: $words")
+                    Text("Символов: ${note.original.length}")
+                    Text("Аудио: $audioInfo")
+                }
+            },
+            confirmButton = { TextButton(onClick = { showInfo = false }) { Text("Закрыть") } }
+        )
+    }
+
     val processing = !isListening && original.isNotBlank() && !currentReady
 
     Scaffold(containerColor = cs.background) { pad ->
@@ -313,48 +404,99 @@ fun EditorScreen(
 
             Row(
                 Modifier.fillMaxWidth().background(Palette.Ink)
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                    .padding(horizontal = 8.dp, vertical = 12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                TextButton(onClick = { persist(); onBack() }) { Text("‹ Назад", color = Color.White) }
-                Spacer(Modifier.weight(1f))
-                TextButton(onClick = { showRename = true }) {
-                    Text(note.title.take(20), color = Color.White, fontWeight = FontWeight.SemiBold)
+                IconButton(onClick = { persist(); onBack() }) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад", tint = Color.White)
                 }
-                // индикация режима записи
+                // Заголовок — доминанта, клик = переименовать
+                Text(
+                    note.title.take(18),
+                    color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.clickable { showRename = true }.padding(vertical = 4.dp)
+                )
+                Spacer(Modifier.width(8.dp))
                 val modeLabel = when {
-                    note.isLecture -> "🎓 лекция"
-                    note.recordMode == "vosk" -> "🎤 офлайн"
-                    note.recordMode == "google" -> "🌐 онлайн"
-                    else -> ""
+                    note.isLecture -> "лекция"
+                    note.recordMode == "google" -> "онлайн"
+                    else -> "офлайн"
                 }
-                if (modeLabel.isNotBlank()) {
-                    Text(modeLabel, color = Color.White.copy(alpha = 0.7f), fontSize = 10.sp)
-                }
+                Text(modeLabel, color = Color.White.copy(alpha = 0.55f), fontSize = 11.sp)
                 Spacer(Modifier.weight(1f))
-                TextButton(onClick = {
-                    if (settings.confirmDelete) showDeleteConfirm = true else onDelete()
-                }) { Text("Удалить", color = Palette.Red) }
+                // Меню «три точки»
+                Box {
+                    IconButton(onClick = { showMenu = true }) {
+                        Icon(Icons.Filled.MoreVert, "Меню", tint = Color.White)
+                    }
+                    DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Экспорт (текст + аудио)") },
+                            leadingIcon = { Icon(Icons.Filled.Archive, null) },
+                            onClick = { showMenu = false; doExportZip() })
+                        if (note.isLecture) {
+                            DropdownMenuItem(
+                                text = { Text("Экспорт Word (.docx)") },
+                                leadingIcon = { Icon(Icons.Filled.Description, null) },
+                                onClick = { showMenu = false; doExportWord() })
+                        }
+                        if (note.recordMode != "google" && note.audioPath != null) {
+                            DropdownMenuItem(
+                                text = { Text("Обновить текст из аудио") },
+                                leadingIcon = { Icon(Icons.Filled.Refresh, null) },
+                                onClick = { showMenu = false; doUpdateText() })
+                        }
+                        DropdownMenuItem(
+                            text = { Text("Информация") },
+                            leadingIcon = { Icon(Icons.Filled.Info, null) },
+                            onClick = { showMenu = false; showInfo = true })
+                        HorizontalDivider()
+                        DropdownMenuItem(
+                            text = { Text("Удалить", color = Palette.Red) },
+                            leadingIcon = { Icon(Icons.Filled.Delete, null, tint = Palette.Red) },
+                            onClick = { showMenu = false
+                                if (settings.confirmDelete) showDeleteConfirm = true else onDelete() })
+                    }
+                }
             }
 
-            // Переключатель онлайн/офлайн для лекции (меняется между кусками записи).
-            if (note.isLecture && !isListening) {
+            // Верхняя панель: переключатель Онлайн/Офлайн (для всех заметок, меняется между кусками).
+            if (!isListening) {
                 Row(
-                    Modifier.fillMaxWidth().background(cs.surfaceVariant)
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Режим лекции:", fontSize = 12.sp, color = cs.onSurface,
-                        modifier = Modifier.weight(1f))
-                    FilterChip(
-                        selected = !lectureOnline,
-                        onClick = { lectureOnline = false },
-                        label = { Text("🎤 Офлайн", fontSize = 11.sp) })
-                    Spacer(Modifier.width(6.dp))
-                    FilterChip(
-                        selected = lectureOnline,
-                        onClick = { lectureOnline = true },
-                        label = { Text("🌐 Онлайн", fontSize = 11.sp) })
+                    Text("Режим", fontSize = 12.sp, color = cs.onSurfaceVariant)
+                    Spacer(Modifier.width(10.dp))
+                    // сегмент офлайн/онлайн
+                    Surface(shape = RoundedCornerShape(18.dp), color = cs.surface,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, cs.outlineVariant)) {
+                        Row {
+                            val offSel = !isOnline
+                            Surface(
+                                color = if (offSel) Palette.Ink else Color.Transparent,
+                                shape = RoundedCornerShape(18.dp),
+                                modifier = Modifier.clip(RoundedCornerShape(18.dp))
+                                    .clickable { isOnline = false; note.recordMode = if (note.isLecture) "lecture" else "vosk" }
+                            ) {
+                                Text("Офлайн", fontSize = 13.sp,
+                                    color = if (offSel) Color.White else cs.onSurfaceVariant,
+                                    fontWeight = if (offSel) FontWeight.Bold else FontWeight.Normal,
+                                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp))
+                            }
+                            Surface(
+                                color = if (isOnline) Palette.Ink else Color.Transparent,
+                                shape = RoundedCornerShape(18.dp),
+                                modifier = Modifier.clip(RoundedCornerShape(18.dp))
+                                    .clickable { isOnline = true; note.recordMode = "google" }
+                            ) {
+                                Text("Онлайн", fontSize = 13.sp,
+                                    color = if (isOnline) Color.White else cs.onSurfaceVariant,
+                                    fontWeight = if (isOnline) FontWeight.Bold else FontWeight.Normal,
+                                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp))
+                            }
+                        }
+                    }
                 }
             }
 
@@ -405,6 +547,22 @@ fun EditorScreen(
                                 fontSize = 12.sp, fontWeight = FontWeight.Bold
                             )
                         }
+                    }
+                    // Кнопка записи — в правом нижнем углу поля (текст заезжает под неё).
+                    FloatingActionButton(
+                        onClick = {
+                            if (!hasPermission) permLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            else if (isListening) stopRecording()
+                            else startRecording()
+                        },
+                        containerColor = if (isListening) Palette.Red else Palette.Ink,
+                        contentColor = Color.White,
+                        modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp)
+                    ) {
+                        Icon(
+                            if (isListening) Icons.Filled.Stop else Icons.Filled.Mic,
+                            if (isListening) "Остановить" else "Запись"
+                        )
                     }
             }
 
@@ -465,79 +623,10 @@ fun EditorScreen(
                     }
                     Spacer(Modifier.height(10.dp))
 
-                    Button(
-                        onClick = {
-                            if (!hasPermission) permLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                            else if (isListening) stopRecording()
-                            else startRecording()
-                        },
-                        enabled = downloadProgress < 0,
-                        shape = RoundedCornerShape(14.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isListening) Palette.Red else Palette.Ink),
-                        modifier = Modifier.fillMaxWidth().height(52.dp)
-                    ) {
-                        Text(if (isListening) "Остановить" else "Запись",
-                            fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Color.White)
-                    }
-
-                    Spacer(Modifier.height(8.dp))
-
-                    val audioPath = note.audioPath
-                    val hasAudio = note.recordMode != "google" &&
-                            audioPath != null && File(audioPath).exists()
-                    if (hasAudio && audioPath != null) {
-                        var updating by remember(note.id) { mutableStateOf(false) }
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            // «Обновить текст» — дотошное перераспознавание аудио (только в Дословно)
-                            if (level == Level.VERBATIM) {
-                                OutlinedButton(
-                                    onClick = {
-                                        updating = true
-                                        status = "Перераспознаю аудио…"
-                                        scope.launch {
-                                            try {
-                                                val model = VoskHolder.getModel(context)
-                                                val better = RecognitionEnsemble.refine(
-                                                    model, File(audioPath), thorough = true)
-                                                if (!better.isNullOrBlank()) {
-                                                    original = better
-                                                    note.original = Punctuator.punctuate(better)
-                                                    startProcessingAll()
-                                                    status = "Текст обновлён из аудио"
-                                                } else status = "Не удалось улучшить"
-                                            } catch (e: Exception) {
-                                                status = "Ошибка: ${e.message}"
-                                            } finally { updating = false }
-                                        }
-                                    },
-                                    enabled = !updating && !isListening,
-                                    shape = RoundedCornerShape(12.dp),
-                                    modifier = Modifier.weight(1f)
-                                ) { Text(if (updating) "Обрабатываю…" else "⟳ Обновить текст", fontSize = 13.sp) }
-                            }
-                            // Прослушать запись
-                            OutlinedButton(
-                                onClick = {
-                                    if (isPlaying) { audioPlayer.stop(); isPlaying = false }
-                                    else { val ok = audioPlayer.play(audioPath) { isPlaying = false }
-                                        isPlaying = ok; if (!ok) status = "Не удалось воспроизвести" }
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier.weight(1f)
-                            ) {
-                                Text(if (isPlaying) "⏹ Стоп" else "▶ Прослушать",
-                                    fontSize = 13.sp)
-                            }
-                        }
-                        Spacer(Modifier.height(8.dp))
-                    }
-
-                    // «Другой вариант» из трёх частей: ‹ назад по версиям · генерация · вперёд ›
+                    // «Другой вариант» из трёх частей: ‹ назад · генерация · вперёд ›
                     if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
                         var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            // назад к предыдущей редакции
                             OutlinedButton(
                                 onClick = { note.goBack(level, tone); onChanged(); refreshTick++ },
                                 enabled = note.canGoBack(level, tone) && !regenerating,
@@ -545,8 +634,6 @@ fun EditorScreen(
                                 contentPadding = PaddingValues(0.dp),
                                 modifier = Modifier.size(48.dp)
                             ) { Text("‹", fontSize = 20.sp) }
-
-                            // генерация нового варианта
                             OutlinedButton(
                                 onClick = {
                                     regenerating = true
@@ -558,8 +645,6 @@ fun EditorScreen(
                                 shape = RoundedCornerShape(12.dp),
                                 modifier = Modifier.weight(1f)
                             ) { Text(if (regenerating) "Генерирую…" else "↻ Другой вариант", fontSize = 13.sp) }
-
-                            // вперёд к более поздней редакции
                             OutlinedButton(
                                 onClick = { note.goForward(level, tone); onChanged(); refreshTick++ },
                                 enabled = note.canGoForward(level, tone) && !regenerating,
@@ -568,73 +653,44 @@ fun EditorScreen(
                                 modifier = Modifier.size(48.dp)
                             ) { Text("›", fontSize = 20.sp) }
                         }
-                        Spacer(Modifier.height(8.dp))
+                        Spacer(Modifier.height(10.dp))
                     }
 
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE)
-                                    as android.content.ClipboardManager
-                            cm.setPrimaryClip(android.content.ClipData.newPlainText("Заметка", shown))
-                            status = "Скопировано"
-                        }, enabled = shown.isNotBlank(), shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(1f)) { Text("Копировать", fontSize = 13.sp) }
-
-                        OutlinedButton(onClick = {
-                            val share = Intent(Intent.ACTION_SEND).apply {
-                                type = "text/plain"; putExtra(Intent.EXTRA_TEXT, shown)
-                            }
-                            context.startActivity(Intent.createChooser(share, "Поделиться"))
-                        }, enabled = shown.isNotBlank(), shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.weight(1f)) { Text("Поделиться", fontSize = 13.sp) }
-                    }
-
-                    Spacer(Modifier.height(8.dp))
-                    // Экспорт всей заметки в JSON-файл (для разбора).
-                    OutlinedButton(
-                        onClick = {
-                            try {
-                                val file = NoteExporter.exportFull(context, note)
-                                val uri = androidx.core.content.FileProvider.getUriForFile(
-                                    context, "${context.packageName}.fileprovider", file)
-                                val share = Intent(Intent.ACTION_SEND).apply {
-                                    type = "application/zip"
-                                    putExtra(Intent.EXTRA_STREAM, uri)
-                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    // Компактный ряд действий: Прослушать (если есть аудио), Копировать, Поделиться.
+                    val audioPath = note.audioPath
+                    val hasAudio = note.recordMode != "google" &&
+                            audioPath != null && File(audioPath).exists()
+                    Surface(color = cs.surfaceVariant.copy(alpha = 0.4f),
+                        shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+                        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                            verticalAlignment = Alignment.CenterVertically) {
+                            if (hasAudio && audioPath != null) {
+                                IconButton(onClick = {
+                                    if (isPlaying) { audioPlayer.stop(); isPlaying = false }
+                                    else { val ok = audioPlayer.play(audioPath) { isPlaying = false }
+                                        isPlaying = ok; if (!ok) status = "Не удалось воспроизвести" }
+                                }) {
+                                    Icon(if (isPlaying) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+                                        "Прослушать", tint = cs.onSurface)
                                 }
-                                context.startActivity(Intent.createChooser(share, "Экспорт заметки"))
-                            } catch (e: Exception) { status = "Ошибка экспорта: ${e.message}" }
-                        },
-                        enabled = original.isNotBlank(),
-                        shape = RoundedCornerShape(12.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        val exportLabel = if (note.recordMode == "google")
-                            "⤓ Экспорт (текст, zip)" else "⤓ Экспорт (текст + аудио, zip)"
-                        Text(exportLabel, fontSize = 13.sp)
-                    }
-
-                    // Экспорт в Word (.docx) — стенограмма с форматированием (для лекции).
-                    if (note.isLecture) {
-                        Spacer(Modifier.height(8.dp))
-                        OutlinedButton(
-                            onClick = {
-                                try {
-                                    val file = DocxExporter.export(context, note)
-                                    val uri = androidx.core.content.FileProvider.getUriForFile(
-                                        context, "${context.packageName}.fileprovider", file)
-                                    val share = Intent(Intent.ACTION_SEND).apply {
-                                        type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                                        putExtra(Intent.EXTRA_STREAM, uri)
-                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                                    }
-                                    context.startActivity(Intent.createChooser(share, "Экспорт в Word"))
-                                } catch (e: Exception) { status = "Ошибка Word: ${e.message}" }
-                            },
-                            enabled = original.isNotBlank(),
-                            shape = RoundedCornerShape(12.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) { Text("⤓ Экспорт Word (.docx)", fontSize = 13.sp) }
+                            }
+                            IconButton(onClick = {
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE)
+                                        as android.content.ClipboardManager
+                                cm.setPrimaryClip(android.content.ClipData.newPlainText("Заметка", shown))
+                                status = "Скопировано"
+                            }, enabled = shown.isNotBlank()) {
+                                Icon(Icons.Filled.ContentCopy, "Копировать", tint = cs.onSurface)
+                            }
+                            IconButton(onClick = {
+                                context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/plain"; putExtra(Intent.EXTRA_TEXT, shown)
+                                }, "Поделиться"))
+                            }, enabled = shown.isNotBlank()) {
+                                Icon(Icons.Filled.Share, "Поделиться", tint = cs.onSurface)
+                            }
+                        }
                     }
                 }
             }
