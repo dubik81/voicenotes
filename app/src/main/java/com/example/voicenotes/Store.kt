@@ -63,6 +63,11 @@ class Settings(context: Context) {
         get() = prefs.getString("whisper_model", "base") ?: "base"
         set(v) = prefs.edit().putString("whisper_model", v).apply()
 
+    /** Запускать обработку ИИ автоматически после записи (иначе — по кнопке «Отправить в ИИ»). */
+    var autoAi: Boolean
+        get() = prefs.getBoolean("auto_ai", true)
+        set(v) = prefs.edit().putBoolean("auto_ai", v).apply()
+
     val useAI get() = apiKey.isNotBlank()
 }
 

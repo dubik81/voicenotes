@@ -41,6 +41,7 @@ fun SettingsScreen(
     var pause by remember { mutableStateOf(settings.pauseSeconds) }
     var saveAudio by remember { mutableStateOf(settings.saveAudio) }
     var useWhisper by remember { mutableStateOf(settings.useWhisper) }
+    var autoAi by remember { mutableStateOf(settings.autoAi) }
     var whisperModel by remember { mutableStateOf(settings.whisperModel) }
     var precompute by remember { mutableStateOf(settings.precomputeAll) }
     var fontSize by remember { mutableStateOf(settings.fontSize) }
@@ -55,6 +56,7 @@ fun SettingsScreen(
         settings.pauseSeconds = pause
         settings.saveAudio = saveAudio
         settings.useWhisper = useWhisper
+        settings.autoAi = autoAi
         settings.whisperModel = whisperModel
         settings.precomputeAll = precompute
         settings.fontSize = fontSize
@@ -255,6 +257,11 @@ fun SettingsScreen(
 
                     SectionTitle("Обработка текста")
                     SettingCard {
+                        ToggleRow("ИИ запускается автоматически после записи", autoAi) { autoAi = it }
+                        Text("Если выключено — обработка ИИ (Vosk+Whisper→ансамбль) запускается " +
+                             "вручную кнопкой ✨ рядом с записью.",
+                            fontSize = 11.sp, color = cs.onSurfaceVariant)
+                        HorizontalDivider(Modifier.padding(vertical = 10.dp))
                         ToggleRow("Досчитывать все варианты в фоне", precompute) { precompute = it }
                     }
 

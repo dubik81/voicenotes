@@ -117,6 +117,30 @@ object AiClient {
         if (result.isEmpty()) throw RuntimeException("ИИ не вернул стенограмму")
         return result
     }
+
+    /**
+     * АНСАМБЛЬ РАСПОЗНАВАНИЯ: два текста от разных движков (Vosk и Whisper) →
+     * ИИ собирает наиболее правильный, выбирая по контексту там, где они расходятся.
+     */
+    suspend fun assembleFromTwo(voskText: String, whisperText: String, apiKey: String): String =
+        withContext(Dispatchers.IO) {
+            val sys = buildString {
+                append("Тебе даны ДВА варианта распознавания ОДНОЙ аудиозаписи разными системами. ")
+                append("Они ошибаются в разных местах (заменяют слова на похожие по звучанию). ")
+                append("Собери ОДИН правильный текст: там, где варианты расходятся, выбирай слово, ")
+                append("которое вернее по смыслу и контексту; если оба явно ошибочны, но созвучны — ")
+                append("подбери правильное по звучанию слово. Сохрани все факты и смысл. ")
+                append("Расставь пунктуацию и заглавные. Верни ТОЛЬКО собранный текст, без пояснений.")
+            }
+            val user = "Вариант 1 (Vosk):\n$voskText\n\nВариант 2 (Whisper):\n$whisperText"
+            val messages = JSONArray().apply {
+                put(JSONObject().put("role", "system").put("content", sys))
+                put(JSONObject().put("role", "user").put("content", user))
+            }
+            val (text, _) = request(messages, apiKey, temperature = 0.3)
+            text.trim()
+        }
+
     suspend fun processAll(rawText: String, apiKey: String): Map<String, String> =
         withContext(Dispatchers.IO) {
             val messages = JSONArray().apply {
@@ -165,7 +189,8 @@ object AiClient {
         sb.append("ЖЁСТКО: связный грамотный текст с пунктуацией; BRIEF и GIST строго короче оригинала; ")
         sb.append("CLEAN примерно равен оригиналу (не сжимать!); тон FORMAL может быть чуть длиннее ")
         sb.append("из-за деловых оборотов — это допустимо; не выдумывай факты; ")
-        sb.append("отвечай на языке оригинала; верни ТОЛЬКО валидный JSON.")
+        sb.append("отвечай на языке оригинала. ОБЯЗАТЕЛЬНО заполни ВСЕ 10 полей JSON (VERBATIM и 9 комбинаций) — ")
+        sb.append("не пропускай ни одного. Верни ТОЛЬКО валидный JSON.")
         return sb.toString()
     }
 

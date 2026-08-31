@@ -22,6 +22,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
@@ -223,6 +224,7 @@ fun EditorScreen(
     // ── Whisper (точное уточнение) ──
     var whisperRunning by remember { mutableStateOf(false) }
     var whisperDownload by remember { mutableStateOf(-1) }
+    var aiRunning by remember { mutableStateOf(false) }
 
     LaunchedEffect(isListening, settings.pauseSeconds) {
         val pauseMs = settings.pauseSeconds * 1000L
@@ -269,12 +271,23 @@ fun EditorScreen(
     fun stopVosk() {
         voskEngine?.stop(); voskEngine = null
         isListening = false; liveText = ""; persist()
+        // Vosk-черновик сохранён. Дальше — ансамбль+ИИ: авто или по кнопке.
+        if (settings.autoAi) sendToAi()
+    }
+
+    // Ансамбль Vosk+Whisper → ИИ собирает лучший текст → обработка вариантов.
+    // Запускается автоматически (если autoAi) или кнопкой «Отправить в ИИ».
+    fun sendToAi() {
+        if (original.isBlank()) return
         val path = note.audioPath
-        if (settings.useWhisper && path != null && File(path).exists()) {
-            // Уточнение через Whisper, пока мигает пиктограмма. Обработка ИИ — после него.
-            whisperRunning = true
-            scope.launch {
-                try {
+        aiRunning = true
+        scope.launch {
+            try {
+                val voskText = original
+                var assembled = voskText
+                // 1) Whisper по аудио (если включён и есть файл) → второй вариант
+                if (settings.useWhisper && path != null && File(path).exists()) {
+                    whisperRunning = true
                     val modelId = settings.whisperModel
                     if (!WhisperModelManager.isReady(context, modelId)) {
                         status = "Скачиваю модель Whisper…"
@@ -282,26 +295,35 @@ fun EditorScreen(
                         WhisperModelManager.download(context, modelId) { p -> whisperDownload = p }
                         whisperDownload = -1
                     }
-                    status = "Уточняю через Whisper…"
-                    val precise = WhisperEngine.transcribe(context, path, modelId)
-                    if (!precise.isNullOrBlank()) {
-                        original = precise
-                        note.original = Punctuator.punctuate(precise)
-                        status = "Текст уточнён (Whisper)"
-                    } else {
-                        status = "Whisper не смог уточнить"
-                    }
-                } catch (e: Exception) {
-                    status = "Whisper: ${e.message}"
-                    whisperDownload = -1
-                } finally {
+                    status = "Распознаю через Whisper…"
+                    val whisperText = WhisperEngine.transcribe(context, path, modelId)
                     whisperRunning = false
-                    processAfterRecording()  // обработка ИИ после уточнения
+                    // 2) Ансамбль: два текста → ИИ собирает лучший
+                    if (!whisperText.isNullOrBlank() && settings.useAI) {
+                        status = "Собираю точный текст (ансамбль)…"
+                        try {
+                            assembled = AiClient.assembleFromTwo(voskText, whisperText, settings.apiKey)
+                        } catch (_: Exception) {
+                            assembled = whisperText  // если сборка не удалась — берём Whisper
+                        }
+                    } else if (!whisperText.isNullOrBlank()) {
+                        assembled = whisperText
+                    }
                 }
+                // применяем собранный текст
+                if (assembled.isNotBlank()) {
+                    original = assembled
+                    note.original = Punctuator.punctuate(assembled)
+                }
+                // 3) обработка вариантов (ступени/тон или стенограмма)
+                processAfterRecording()
+                status = "Готово"
+            } catch (e: Exception) {
+                status = "Ошибка: ${e.message}"
+            } finally {
+                whisperRunning = false
+                aiRunning = false
             }
-        } else {
-            // Whisper выключен — сразу обработка ИИ.
-            processAfterRecording()
         }
     }
 
@@ -501,6 +523,41 @@ fun EditorScreen(
                 }
             }
 
+            // «Другой вариант» со стрелками истории — в верхней зоне (не для Дословно).
+            if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI && !isListening) {
+                var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedButton(
+                        onClick = { note.goBack(level, tone); onChanged(); refreshTick++ },
+                        enabled = note.canGoBack(level, tone) && !regenerating,
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.size(width = 44.dp, height = 40.dp)
+                    ) { Text("‹", fontSize = 18.sp) }
+                    OutlinedButton(
+                        onClick = {
+                            regenerating = true
+                            processor.regenerateOne(note, level, tone) {
+                                onChanged(); refreshTick++; regenerating = false
+                            }
+                        },
+                        enabled = !regenerating,
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(vertical = 8.dp),
+                        modifier = Modifier.weight(1f).height(40.dp)
+                    ) { Text(if (regenerating) "Генерирую…" else "↻ Другой вариант",
+                        fontSize = 13.sp, maxLines = 1) }
+                    OutlinedButton(
+                        onClick = { note.goForward(level, tone); onChanged(); refreshTick++ },
+                        enabled = note.canGoForward(level, tone) && !regenerating,
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(0.dp),
+                        modifier = Modifier.size(width = 44.dp, height = 40.dp)
+                    ) { Text("›", fontSize = 18.sp) }
+                }
+            }
+
             Box(Modifier.weight(1f).fillMaxWidth().padding(16.dp)) {
                     Surface(color = cs.surface, shape = RoundedCornerShape(16.dp),
                         modifier = Modifier.fillMaxSize()) {
@@ -527,7 +584,8 @@ fun EditorScreen(
                             fontSize = 15.sp, modifier = Modifier.padding(20.dp))
                         else -> SelectionContainer {
                             Text(shown, color = cs.onSurface, fontSize = settings.fontSize.sp,
-                                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp))
+                                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                                    .padding(start = 20.dp, top = 20.dp, end = 20.dp, bottom = 80.dp))
                         }
                     }
                     }
@@ -549,21 +607,38 @@ fun EditorScreen(
                             )
                         }
                     }
-                    // Кнопка записи — в правом нижнем углу поля (текст заезжает под неё).
-                    FloatingActionButton(
-                        onClick = {
-                            if (!hasPermission) permLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                            else if (isListening) stopRecording()
-                            else startRecording()
-                        },
-                        containerColor = if (isListening) Palette.Red else Palette.Ink,
-                        contentColor = Color.White,
-                        modifier = Modifier.align(Alignment.BottomEnd).padding(12.dp)
+                    // Кнопки в правом нижнем углу поля: [✨ ИИ] [🎤 запись]
+                    Row(
+                        Modifier.align(Alignment.BottomEnd).padding(12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            if (isListening) Icons.Filled.Stop else Icons.Filled.Mic,
-                            if (isListening) "Остановить" else "Запись"
-                        )
+                        // «Отправить в ИИ» — акцентная, главная фишка (искра)
+                        if (original.isNotBlank() && settings.useAI) {
+                            FloatingActionButton(
+                                onClick = { if (!aiRunning) sendToAi() },
+                                containerColor = Palette.Amber,
+                                contentColor = Color.White
+                            ) {
+                                Icon(Icons.Filled.AutoAwesome,
+                                    if (aiRunning) "Обработка…" else "Отправить в ИИ")
+                            }
+                        }
+                        // Запись
+                        FloatingActionButton(
+                            onClick = {
+                                if (!hasPermission) permLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                else if (isListening) stopRecording()
+                                else startRecording()
+                            },
+                            containerColor = if (isListening) Palette.Red else Palette.Ink,
+                            contentColor = Color.White
+                        ) {
+                            Icon(
+                                if (isListening) Icons.Filled.Stop else Icons.Filled.Mic,
+                                if (isListening) "Остановить" else "Запись"
+                            )
+                        }
                     }
             }
 
@@ -623,39 +698,6 @@ fun EditorScreen(
                         Text("Загрузка модели: $downloadProgress%", color = cs.onSurfaceVariant, fontSize = 10.sp)
                     }
                     Spacer(Modifier.height(10.dp))
-
-                    // «Другой вариант» из трёх частей: ‹ назад · генерация · вперёд ›
-                    if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
-                        var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            OutlinedButton(
-                                onClick = { note.goBack(level, tone); onChanged(); refreshTick++ },
-                                enabled = note.canGoBack(level, tone) && !regenerating,
-                                shape = RoundedCornerShape(12.dp),
-                                contentPadding = PaddingValues(0.dp),
-                                modifier = Modifier.size(48.dp)
-                            ) { Text("‹", fontSize = 20.sp) }
-                            OutlinedButton(
-                                onClick = {
-                                    regenerating = true
-                                    processor.regenerateOne(note, level, tone) {
-                                        onChanged(); refreshTick++; regenerating = false
-                                    }
-                                },
-                                enabled = !isListening && !regenerating,
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier.weight(1f)
-                            ) { Text(if (regenerating) "Генерирую…" else "↻ Другой вариант", fontSize = 13.sp) }
-                            OutlinedButton(
-                                onClick = { note.goForward(level, tone); onChanged(); refreshTick++ },
-                                enabled = note.canGoForward(level, tone) && !regenerating,
-                                shape = RoundedCornerShape(12.dp),
-                                contentPadding = PaddingValues(0.dp),
-                                modifier = Modifier.size(48.dp)
-                            ) { Text("›", fontSize = 20.sp) }
-                        }
-                        Spacer(Modifier.height(10.dp))
-                    }
 
                     // Компактный ряд действий: Прослушать (если есть аудио), Копировать, Поделиться.
                     val audioPath = note.audioPath

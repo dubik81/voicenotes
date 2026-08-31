@@ -128,13 +128,14 @@ private fun CreateButton(label: String, icon: androidx.compose.ui.graphics.vecto
         color = bg,
         shape = RoundedCornerShape(16.dp),
         shadowElevation = 6.dp,
-        modifier = Modifier.width(128.dp).height(60.dp).clip(RoundedCornerShape(16.dp)).clickable(onClick = onClick)
+        modifier = Modifier.width(148.dp).height(56.dp).clip(RoundedCornerShape(16.dp)).clickable(onClick = onClick)
     ) {
-        Row(Modifier.fillMaxSize().padding(horizontal = 16.dp),
+        Row(Modifier.fillMaxSize().padding(horizontal = 14.dp),
             verticalAlignment = Alignment.CenterVertically) {
             Icon(icon, null, tint = Color.White)
-            Spacer(Modifier.width(10.dp))
-            Text(label, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.width(8.dp))
+            Text(label, color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold,
+                maxLines = 1, softWrap = false)
         }
     }
 }

@@ -76,6 +76,8 @@ class VariantProcessor(
                 // Лекция: отдельный запрос стенограммы; иначе умный запрос всех вариантов.
                 var attempt = 0
                 while (attempt < maxRetries) {
+                    // Помечаем недостающие: первый проход — RUNNING (идёт запрос),
+                    // последующие — тоже RUNNING только на время запроса.
                     for ((l, t) in combos) {
                         if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.RUNNING
                     }
@@ -96,6 +98,11 @@ class VariantProcessor(
                         persist()
                         val allDone = combos.all { (l, t) -> note.getVariant(l, t) != null }
                         if (allDone) break
+                        // Пришло частично: недостающие ставим «в очередь» (не висящие часы),
+                        // добор пойдёт следующим проходом.
+                        for ((l, t) in combos) {
+                            if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.QUEUED
+                        }
                     } catch (e: Exception) {
                         for ((l, t) in combos) {
                             if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.FAILED
@@ -105,7 +112,7 @@ class VariantProcessor(
                     attempt++
                     if (attempt < maxRetries &&
                         combos.any { (l, t) -> note.getVariant(l, t) == null }) {
-                        delay(10000)
+                        delay(6000)
                     }
                 }
             } else {
