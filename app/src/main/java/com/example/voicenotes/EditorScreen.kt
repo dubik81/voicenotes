@@ -268,13 +268,6 @@ fun EditorScreen(
         }
     }
 
-    fun stopVosk() {
-        voskEngine?.stop(); voskEngine = null
-        isListening = false; liveText = ""; persist()
-        // Vosk-черновик сохранён. Дальше — ансамбль+ИИ: авто или по кнопке.
-        if (settings.autoAi) sendToAi()
-    }
-
     // Ансамбль Vosk+Whisper → ИИ собирает лучший текст → обработка вариантов.
     // Запускается автоматически (если autoAi) или кнопкой «Отправить в ИИ».
     fun sendToAi() {
@@ -325,6 +318,13 @@ fun EditorScreen(
                 aiRunning = false
             }
         }
+    }
+
+    fun stopVosk() {
+        voskEngine?.stop(); voskEngine = null
+        isListening = false; liveText = ""; persist()
+        // Vosk-черновик сохранён. Дальше — ансамбль+ИИ: авто или по кнопке.
+        if (settings.autoAi) sendToAi()
     }
 
     fun startRecording() {
