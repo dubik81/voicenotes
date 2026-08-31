@@ -284,7 +284,15 @@ fun EditorScreen(
                 if (!wt.isNullOrBlank() && settings.useAI) {
                     status = "Собираю точный текст (ансамбль)…"
                     try {
-                        val result = AiClient.assembleFromTwo(voskText, wt, settings.apiKey)
+                        val result = if (settings.localAi) {
+                            // Локальный ИИ на устройстве (офлайн). При сбое — откат на облако.
+                            LocalAiEngine.generate(context, AiClient.assembleSystemPrompt(),
+                                "Вариант 1 (Vosk):\n$voskText\n\nВариант 2 (Whisper):\n$wt",
+                                settings.localAiModel)
+                                ?: AiClient.assembleFromTwo(voskText, wt, settings.apiKey)
+                        } else {
+                            AiClient.assembleFromTwo(voskText, wt, settings.apiKey)
+                        }
                         assembled = if (result.isNotBlank() && result.length >= voskText.length / 2)
                             result else wt
                     } catch (_: Exception) { assembled = wt }
@@ -506,79 +514,33 @@ fun EditorScreen(
                 }
             }
 
-            // Верхняя строка: слева «Режим» + сегмент, справа компактный «Другой вариант» ‹ ↻ ›
+            // Две строки настроек: «Речь в текст» (движок распознавания) и
+            // «Работа со смыслом» (движок ИИ). Каждая — переключатель Офл/Онл.
             if (!isListening) {
-                var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Режим", fontSize = 12.sp, color = cs.onSurfaceVariant)
-                    Spacer(Modifier.width(8.dp))
-                    // сегмент офлайн/онлайн
-                    Surface(shape = RoundedCornerShape(18.dp), color = cs.surface,
-                        border = androidx.compose.foundation.BorderStroke(1.dp, cs.outlineVariant)) {
-                        Row {
-                            val offSel = !isOnline
-                            Surface(
-                                color = if (offSel) Palette.Ink else Color.Transparent,
-                                shape = RoundedCornerShape(18.dp),
-                                modifier = Modifier.clip(RoundedCornerShape(18.dp))
-                                    .clickable { isOnline = false; note.recordMode = if (note.isLecture) "lecture" else "vosk" }
-                            ) {
-                                Text("Офл", fontSize = 12.sp,
-                                    color = if (offSel) Color.White else cs.onSurfaceVariant,
-                                    fontWeight = if (offSel) FontWeight.Bold else FontWeight.Normal,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
-                            }
-                            Surface(
-                                color = if (isOnline) Palette.Ink else Color.Transparent,
-                                shape = RoundedCornerShape(18.dp),
-                                modifier = Modifier.clip(RoundedCornerShape(18.dp))
-                                    .clickable { isOnline = true; note.recordMode = "google" }
-                            ) {
-                                Text("Онл", fontSize = 12.sp,
-                                    color = if (isOnline) Color.White else cs.onSurfaceVariant,
-                                    fontWeight = if (isOnline) FontWeight.Bold else FontWeight.Normal,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
-                            }
-                        }
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
+                    // Речь в текст: Офлайн (Vosk+Whisper) / Онлайн (Google)
+                    Row(verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(vertical = 3.dp)) {
+                        Text("Речь в текст", fontSize = 12.sp, color = cs.onSurfaceVariant,
+                            modifier = Modifier.width(120.dp))
+                        Spacer(Modifier.width(8.dp))
+                        SegOffOn(
+                            offSelected = !isOnline,
+                            onOff = { isOnline = false; note.recordMode = if (note.isLecture) "lecture" else "vosk" },
+                            onOn = { isOnline = true; note.recordMode = "google" }
+                        )
                     }
-
-                    Spacer(Modifier.weight(1f))
-
-                    // Компактный «Другой вариант» ‹ ↻ › — не для Дословно
-                    if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
-                        Surface(shape = RoundedCornerShape(18.dp), color = cs.surface,
-                            border = androidx.compose.foundation.BorderStroke(1.dp, cs.outlineVariant)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                IconButton(
-                                    onClick = { note.goBack(level, tone); onChanged(); refreshTick++ },
-                                    enabled = note.canGoBack(level, tone) && !regenerating,
-                                    modifier = Modifier.size(36.dp)
-                                ) { Text("‹", fontSize = 18.sp, color = cs.onSurface) }
-                                Surface(
-                                    color = Color.Transparent,
-                                    modifier = Modifier.clip(RoundedCornerShape(12.dp))
-                                        .clickable(enabled = !regenerating) {
-                                            regenerating = true
-                                            processor.regenerateOne(note, level, tone) {
-                                                onChanged(); refreshTick++; regenerating = false
-                                            }
-                                        }
-                                ) {
-                                    Text(if (regenerating) "…" else "↻ вариант",
-                                        fontSize = 12.sp, fontWeight = FontWeight.Bold,
-                                        color = cs.onSurface, maxLines = 1,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp))
-                                }
-                                IconButton(
-                                    onClick = { note.goForward(level, tone); onChanged(); refreshTick++ },
-                                    enabled = note.canGoForward(level, tone) && !regenerating,
-                                    modifier = Modifier.size(36.dp)
-                                ) { Text("›", fontSize = 18.sp, color = cs.onSurface) }
-                            }
-                        }
+                    // Работа со смыслом: Офлайн (локальный ИИ) / Онлайн (облачный)
+                    Row(verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(vertical = 3.dp)) {
+                        Text("Работа со смыслом", fontSize = 12.sp, color = cs.onSurfaceVariant,
+                            modifier = Modifier.width(120.dp))
+                        Spacer(Modifier.width(8.dp))
+                        SegOffOn(
+                            offSelected = settings.localAi,
+                            onOff = { settings.localAi = true; refreshTick++ },
+                            onOn = { settings.localAi = false; refreshTick++ }
+                        )
                     }
                 }
             }
@@ -690,6 +652,40 @@ fun EditorScreen(
                         ) { toneIdx = it }
                         Spacer(Modifier.height(6.dp))
                     }
+
+                    // «Другой вариант» со стрелками истории — под кнопками тона (не для Дословно).
+                    if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
+                        var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(
+                                onClick = { note.goBack(level, tone); onChanged(); refreshTick++ },
+                                enabled = note.canGoBack(level, tone) && !regenerating,
+                                shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(0.dp),
+                                modifier = Modifier.size(width = 44.dp, height = 40.dp)
+                            ) { Text("‹", fontSize = 18.sp) }
+                            OutlinedButton(
+                                onClick = {
+                                    regenerating = true
+                                    processor.regenerateOne(note, level, tone) {
+                                        onChanged(); refreshTick++; regenerating = false
+                                    }
+                                },
+                                enabled = !regenerating,
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.weight(1f).height(40.dp)
+                            ) { Text(if (regenerating) "Генерирую…" else "↻ Другой вариант",
+                                fontSize = 13.sp, maxLines = 1) }
+                            OutlinedButton(
+                                onClick = { note.goForward(level, tone); onChanged(); refreshTick++ },
+                                enabled = note.canGoForward(level, tone) && !regenerating,
+                                shape = RoundedCornerShape(12.dp),
+                                contentPadding = PaddingValues(0.dp),
+                                modifier = Modifier.size(width = 44.dp, height = 40.dp)
+                            ) { Text("›", fontSize = 18.sp) }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                    }
                     // Легенда индикации готовности вариантов.
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("✓ готово", color = Palette.Green, fontSize = 9.sp)
@@ -788,4 +784,34 @@ private fun RenameDialog(current: String, onSave: (String) -> Unit, onDismiss: (
         confirmButton = { TextButton(onClick = { onSave(v) }) { Text("Сохранить") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Отмена") } }
     )
+}
+
+@Composable
+private fun SegOffOn(offSelected: Boolean, onOff: () -> Unit, onOn: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    Surface(shape = RoundedCornerShape(18.dp), color = cs.surface,
+        border = androidx.compose.foundation.BorderStroke(1.dp, cs.outlineVariant)) {
+        Row {
+            Surface(
+                color = if (offSelected) Palette.Ink else Color.Transparent,
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier.clip(RoundedCornerShape(18.dp)).clickable(onClick = onOff)
+            ) {
+                Text("Офл", fontSize = 12.sp,
+                    color = if (offSelected) Color.White else cs.onSurfaceVariant,
+                    fontWeight = if (offSelected) FontWeight.Bold else FontWeight.Normal,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 7.dp))
+            }
+            Surface(
+                color = if (!offSelected) Palette.Ink else Color.Transparent,
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier.clip(RoundedCornerShape(18.dp)).clickable(onClick = onOn)
+            ) {
+                Text("Онл", fontSize = 12.sp,
+                    color = if (!offSelected) Color.White else cs.onSurfaceVariant,
+                    fontWeight = if (!offSelected) FontWeight.Bold else FontWeight.Normal,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 7.dp))
+            }
+        }
+    }
 }

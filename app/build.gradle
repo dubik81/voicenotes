@@ -11,8 +11,8 @@ android {
         applicationId "com.example.voicenotes"
         minSdk 24
         targetSdk 34
-        versionCode 34
-        versionName "34.0"
+        versionCode 35
+        versionName "35.0"
         ndk {
             // Whisper работает только на arm64-v8a (покрывает все современные телефоны,
             // включая Samsung S25). Ограничение упрощает и ускоряет сборку.
@@ -69,4 +69,6 @@ dependencies {
     implementation 'com.alphacephei:vosk-android:0.3.47@aar'
     // Офлайн-распознавание Whisper (точное, по записанному файлу, arm64)
     implementation 'dev.ffmpegkit-maintained:whisper-android:1.0.0'
+    // Локальный ИИ на устройстве (ExecuTorch, LLaMA/Gemma, arm64)
+    implementation 'org.pytorch:executorch-android:1.0.0'
 }

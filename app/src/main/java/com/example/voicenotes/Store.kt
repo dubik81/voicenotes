@@ -68,6 +68,16 @@ class Settings(context: Context) {
         get() = prefs.getBoolean("auto_ai", true)
         set(v) = prefs.edit().putBoolean("auto_ai", v).apply()
 
+    /** Движок ИИ для работы со смыслом: true = локальный (на устройстве), false = облачный. */
+    var localAi: Boolean
+        get() = prefs.getBoolean("local_ai", false)
+        set(v) = prefs.edit().putBoolean("local_ai", v).apply()
+
+    /** Модель локального ИИ: "small"/"medium"/"gemma". */
+    var localAiModel: String
+        get() = prefs.getString("local_ai_model", "small") ?: "small"
+        set(v) = prefs.edit().putString("local_ai_model", v).apply()
+
     val useAI get() = apiKey.isNotBlank()
 }
 

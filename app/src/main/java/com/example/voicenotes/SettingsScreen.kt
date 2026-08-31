@@ -36,6 +36,9 @@ fun SettingsScreen(
     var whisperDl by remember { mutableStateOf(-1) }
     var whisperDlError by remember { mutableStateOf<String?>(null) }
     var modelsTick by remember { mutableStateOf(0) }  // обновить статусы
+    var localAiModel by remember { mutableStateOf(settings.localAiModel) }
+    var localAiDl by remember { mutableStateOf(-1) }
+    var localAiErr by remember { mutableStateOf<String?>(null) }
 
     var key by remember { mutableStateOf(settings.apiKey) }
     var pause by remember { mutableStateOf(settings.pauseSeconds) }
@@ -251,6 +254,71 @@ fun SettingsScreen(
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Text(if (whReady) "Модель Whisper скачана" else "Скачать модель Whisper",
+                                color = Color.White, fontSize = 13.sp)
+                        }
+                    }
+
+                    // ── Локальный ИИ (работа со смыслом офлайн) ──
+                    SectionTitle("Локальный ИИ (офлайн-обработка)")
+                    SettingCard {
+                        modelsTick
+                        Text("Обрабатывает текст на устройстве без интернета. Выбери и скачай модель. " +
+                             "Если модель не скачана — используется облачный ИИ.",
+                            fontSize = 11.sp, color = cs.onSurfaceVariant)
+                        Spacer(Modifier.height(8.dp))
+                        Text("Модель:", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = cs.onSurface)
+                        Spacer(Modifier.height(4.dp))
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            LocalAiModelManager.MODELS.forEach { (id, info) ->
+                                val sel = localAiModel == id
+                                Surface(
+                                    color = if (sel) Palette.Ink.copy(alpha = 0.1f) else cs.surface,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = androidx.compose.foundation.BorderStroke(1.dp,
+                                        if (sel) Palette.Ink else cs.outlineVariant),
+                                    modifier = Modifier.fillMaxWidth()
+                                        .clickable { localAiModel = id; settings.localAiModel = id }
+                                ) {
+                                    Row(Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Text(info.label, fontSize = 12.sp,
+                                            fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
+                                            color = cs.onSurface, modifier = Modifier.weight(1f))
+                                        if (LocalAiModelManager.isReady(context, id))
+                                            Text("✓", color = Palette.Green, fontSize = 14.sp)
+                                    }
+                                }
+                            }
+                        }
+                        if (localAiDl in 0..100) {
+                            Spacer(Modifier.height(6.dp))
+                            LinearProgressIndicator(progress = { localAiDl / 100f },
+                                modifier = Modifier.fillMaxWidth(), color = Palette.Amber)
+                            Text("Загрузка: $localAiDl%", fontSize = 10.sp, color = cs.onSurfaceVariant)
+                        }
+                        localAiErr?.let { Text("✗ $it", color = Palette.Red, fontSize = 11.sp) }
+                        Spacer(Modifier.height(8.dp))
+                        val localReady = LocalAiModelManager.isReady(context, localAiModel)
+                        Button(
+                            onClick = {
+                                localAiErr = null
+                                scope.launch {
+                                    try {
+                                        localAiDl = 0
+                                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                            LocalAiModelManager.download(context, localAiModel) { p -> localAiDl = p }
+                                        }
+                                        localAiDl = -1; modelsTick++
+                                    } catch (e: Exception) {
+                                        localAiDl = -1; localAiErr = e.message ?: "Ошибка загрузки"
+                                    }
+                                }
+                            },
+                            enabled = localAiDl < 0 && !localReady,
+                            colors = ButtonDefaults.buttonColors(containerColor = Palette.Ink),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(if (localReady) "Модель ИИ скачана" else "Скачать модель ИИ",
                                 color = Color.White, fontSize = 13.sp)
                         }
                     }
