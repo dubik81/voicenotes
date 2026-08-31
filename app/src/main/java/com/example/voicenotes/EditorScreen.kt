@@ -225,6 +225,7 @@ fun EditorScreen(
     var whisperRunning by remember { mutableStateOf(false) }
     var whisperDownload by remember { mutableStateOf(-1) }
     var aiRunning by remember { mutableStateOf(false) }
+    var whisperText by remember { mutableStateOf<String?>(null) }  // второй текст от Whisper
 
     LaunchedEffect(isListening, settings.pauseSeconds) {
         val pauseMs = settings.pauseSeconds * 1000L
@@ -270,52 +271,69 @@ fun EditorScreen(
 
     // Ансамбль Vosk+Whisper → ИИ собирает лучший текст → обработка вариантов.
     // Запускается автоматически (если autoAi) или кнопкой «Отправить в ИИ».
+    // Отправка ансамбля (Vosk + Whisper) в ИИ: сборка лучшего текста + варианты.
+    // Whisper-текст уже получен функцией runWhisper. По кнопке ✨ или авто.
     fun sendToAi() {
         if (original.isBlank()) return
-        val path = note.audioPath
+        val voskText = original
         aiRunning = true
         scope.launch {
             try {
-                val voskText = original
                 var assembled = voskText
-                // 1) Whisper по аудио (если включён и есть файл) → второй вариант
-                if (settings.useWhisper && path != null && File(path).exists()) {
-                    whisperRunning = true
-                    val modelId = settings.whisperModel
-                    if (!WhisperModelManager.isReady(context, modelId)) {
-                        status = "Скачиваю модель Whisper…"
-                        whisperDownload = 0
-                        WhisperModelManager.download(context, modelId) { p -> whisperDownload = p }
-                        whisperDownload = -1
-                    }
-                    status = "Распознаю через Whisper…"
-                    val whisperText = WhisperEngine.transcribe(context, path, modelId)
-                    whisperRunning = false
-                    // 2) Ансамбль: два текста → ИИ собирает лучший
-                    if (!whisperText.isNullOrBlank() && settings.useAI) {
-                        status = "Собираю точный текст (ансамбль)…"
-                        try {
-                            assembled = AiClient.assembleFromTwo(voskText, whisperText, settings.apiKey)
-                        } catch (_: Exception) {
-                            assembled = whisperText  // если сборка не удалась — берём Whisper
-                        }
-                    } else if (!whisperText.isNullOrBlank()) {
-                        assembled = whisperText
-                    }
+                val wt = whisperText
+                if (!wt.isNullOrBlank() && settings.useAI) {
+                    status = "Собираю точный текст (ансамбль)…"
+                    try {
+                        val result = AiClient.assembleFromTwo(voskText, wt, settings.apiKey)
+                        assembled = if (result.isNotBlank() && result.length >= voskText.length / 2)
+                            result else wt
+                    } catch (_: Exception) { assembled = wt }
+                } else if (!wt.isNullOrBlank()) {
+                    assembled = wt
                 }
-                // применяем собранный текст
                 if (assembled.isNotBlank()) {
                     original = assembled
                     note.original = Punctuator.punctuate(assembled)
                 }
-                // 3) обработка вариантов (ступени/тон или стенограмма)
                 processAfterRecording()
                 status = "Готово"
             } catch (e: Exception) {
                 status = "Ошибка: ${e.message}"
+            } finally { aiRunning = false }
+        }
+    }
+
+    // Whisper по записанному аудио — запускается САМ после записи (не зависит от ИИ).
+    // Даёт второй текст. Если автозапуск ИИ включён — сразу шлём ансамбль в ИИ.
+    fun runWhisper(thenAi: Boolean) {
+        val path = note.audioPath
+        if (!settings.useWhisper || path == null || !File(path).exists()) {
+            // Whisper недоступен — если нужен авто-ИИ, шлём только Vosk-текст
+            if (thenAi) sendToAi()
+            return
+        }
+        whisperRunning = true
+        scope.launch {
+            try {
+                val modelId = settings.whisperModel
+                if (!WhisperModelManager.isReady(context, modelId)) {
+                    status = "Скачиваю модель Whisper…"
+                    whisperDownload = 0
+                    WhisperModelManager.download(context, modelId) { p -> whisperDownload = p }
+                    whisperDownload = -1
+                }
+                status = "Уточняю через Whisper…"
+                val wt = WhisperEngine.transcribe(context, path, modelId)
+                if (!wt.isNullOrBlank()) {
+                    whisperText = wt
+                    status = "Whisper готов"
+                } else status = "Whisper не распознал"
+            } catch (e: Exception) {
+                status = "Whisper: ${e.message}"
+                whisperDownload = -1
             } finally {
                 whisperRunning = false
-                aiRunning = false
+                if (thenAi) sendToAi()  // авто-режим: сразу в ИИ
             }
         }
     }
@@ -323,8 +341,8 @@ fun EditorScreen(
     fun stopVosk() {
         voskEngine?.stop(); voskEngine = null
         isListening = false; liveText = ""; persist()
-        // Vosk-черновик сохранён. Дальше — ансамбль+ИИ: авто или по кнопке.
-        if (settings.autoAi) sendToAi()
+        // Whisper запускается САМ после записи. Если автозапуск ИИ — следом идёт ансамбль→ИИ.
+        runWhisper(thenAi = settings.autoAi)
     }
 
     fun startRecording() {
@@ -361,15 +379,20 @@ fun EditorScreen(
     fun doUpdateText() {
         val path = note.audioPath ?: return
         if (!File(path).exists()) return
-        status = "Перераспознаю аудио…"
+        status = "Перераспознаю аудио (Vosk)…"
         scope.launch {
             try {
+                // 1) Vosk заново (дотошный ансамбль с усилением)
                 val model = VoskHolder.getModel(context)
                 val better = RecognitionEnsemble.refine(model, File(path), thorough = true)
                 if (!better.isNullOrBlank()) {
-                    original = better; note.original = Punctuator.punctuate(better)
-                    startProcessingAll(); status = "Текст обновлён из аудио"
-                } else status = "Не удалось улучшить"
+                    original = better
+                    note.original = Punctuator.punctuate(better)
+                }
+                // 2) Whisper заново (и если авто-ИИ — следом ансамбль→ИИ)
+                whisperText = null
+                runWhisper(thenAi = settings.autoAi)
+                status = "Текст обновлён из аудио"
             } catch (e: Exception) { status = "Ошибка: ${e.message}" }
         }
     }
@@ -615,8 +638,8 @@ fun EditorScreen(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // «Отправить в ИИ» — акцентная, главная фишка (искра)
-                        if (original.isNotBlank() && settings.useAI) {
+                        // «Отправить в ИИ» — только в ручном режиме (если авто — кнопки нет)
+                        if (original.isNotBlank() && settings.useAI && !settings.autoAi) {
                             FloatingActionButton(
                                 onClick = { if (!aiRunning) sendToAi() },
                                 containerColor = Palette.Amber,
