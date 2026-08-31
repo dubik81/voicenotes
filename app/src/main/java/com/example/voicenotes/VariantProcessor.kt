@@ -170,6 +170,7 @@ class VariantProcessor(
 
     /** Продолжить обработку ВСЕХ заметок, где есть недосчитанное (вызывать периодически). */
     fun resumeAll() {
+        if (!settings.autoAi) return  // при ручном режиме фон не досчитывает сам
         for (note in notesProvider()) {
             if (note.original.isBlank()) continue
             val hasGaps = allCombos(note.isLecture).any { (l, t) -> note.getVariant(l, t) == null }

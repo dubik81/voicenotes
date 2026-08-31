@@ -43,6 +43,15 @@ object NoteExporter {
                 variants.put(l.name, byTone)
             }
             put("variants", variants)
+
+            // История редакций (все сохранённые версии каждого варианта).
+            val hist = JSONObject()
+            note.history.forEach { (key, list) ->
+                val arr = org.json.JSONArray()
+                list.forEach { arr.put(it) }
+                hist.put(key, arr)
+            }
+            put("history", hist)
         }
 
         val dir = File(context.cacheDir, "exports").apply { mkdirs() }

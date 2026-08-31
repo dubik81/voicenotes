@@ -139,9 +139,9 @@ fun EditorScreen(
         startProcessingAll()
     }
 
-    // При открытии заметки: продолжаем недосчитанное (готовое НЕ трогаем).
+    // При открытии заметки: продолжаем недосчитанное (только если автозапуск ИИ включён).
     LaunchedEffect(note.id) {
-        if (note.original.isNotBlank()) {
+        if (note.original.isNotBlank() && settings.autoAi) {
             processor.ensureAll(note, level, tone)
         }
     }
@@ -213,8 +213,8 @@ fun EditorScreen(
         keepListening = false
         recognizer?.stopListening()
         isListening = false
-        // Запускаем обработку ИИ один раз после остановки.
-        processAfterRecording()
+        // Обработка ИИ — только если включён автозапуск (иначе по кнопке ✨).
+        if (settings.autoAi) processAfterRecording()
     }
 
     // ── Vosk ──
@@ -483,14 +483,15 @@ fun EditorScreen(
                 }
             }
 
-            // Верхняя панель: переключатель Онлайн/Офлайн (для всех заметок, меняется между кусками).
+            // Верхняя строка: слева «Режим» + сегмент, справа компактный «Другой вариант» ‹ ↻ ›
             if (!isListening) {
+                var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text("Режим", fontSize = 12.sp, color = cs.onSurfaceVariant)
-                    Spacer(Modifier.width(10.dp))
+                    Spacer(Modifier.width(8.dp))
                     // сегмент офлайн/онлайн
                     Surface(shape = RoundedCornerShape(18.dp), color = cs.surface,
                         border = androidx.compose.foundation.BorderStroke(1.dp, cs.outlineVariant)) {
@@ -502,10 +503,10 @@ fun EditorScreen(
                                 modifier = Modifier.clip(RoundedCornerShape(18.dp))
                                     .clickable { isOnline = false; note.recordMode = if (note.isLecture) "lecture" else "vosk" }
                             ) {
-                                Text("Офлайн", fontSize = 13.sp,
+                                Text("Офл", fontSize = 12.sp,
                                     color = if (offSel) Color.White else cs.onSurfaceVariant,
                                     fontWeight = if (offSel) FontWeight.Bold else FontWeight.Normal,
-                                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp))
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
                             }
                             Surface(
                                 color = if (isOnline) Palette.Ink else Color.Transparent,
@@ -513,48 +514,49 @@ fun EditorScreen(
                                 modifier = Modifier.clip(RoundedCornerShape(18.dp))
                                     .clickable { isOnline = true; note.recordMode = "google" }
                             ) {
-                                Text("Онлайн", fontSize = 13.sp,
+                                Text("Онл", fontSize = 12.sp,
                                     color = if (isOnline) Color.White else cs.onSurfaceVariant,
                                     fontWeight = if (isOnline) FontWeight.Bold else FontWeight.Normal,
-                                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 8.dp))
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp))
                             }
                         }
                     }
-                }
-            }
 
-            // «Другой вариант» со стрелками истории — в верхней зоне (не для Дословно).
-            if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI && !isListening) {
-                var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
-                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    OutlinedButton(
-                        onClick = { note.goBack(level, tone); onChanged(); refreshTick++ },
-                        enabled = note.canGoBack(level, tone) && !regenerating,
-                        shape = RoundedCornerShape(12.dp),
-                        contentPadding = PaddingValues(0.dp),
-                        modifier = Modifier.size(width = 44.dp, height = 40.dp)
-                    ) { Text("‹", fontSize = 18.sp) }
-                    OutlinedButton(
-                        onClick = {
-                            regenerating = true
-                            processor.regenerateOne(note, level, tone) {
-                                onChanged(); refreshTick++; regenerating = false
+                    Spacer(Modifier.weight(1f))
+
+                    // Компактный «Другой вариант» ‹ ↻ › — не для Дословно
+                    if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
+                        Surface(shape = RoundedCornerShape(18.dp), color = cs.surface,
+                            border = androidx.compose.foundation.BorderStroke(1.dp, cs.outlineVariant)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(
+                                    onClick = { note.goBack(level, tone); onChanged(); refreshTick++ },
+                                    enabled = note.canGoBack(level, tone) && !regenerating,
+                                    modifier = Modifier.size(36.dp)
+                                ) { Text("‹", fontSize = 18.sp, color = cs.onSurface) }
+                                Surface(
+                                    color = Color.Transparent,
+                                    modifier = Modifier.clip(RoundedCornerShape(12.dp))
+                                        .clickable(enabled = !regenerating) {
+                                            regenerating = true
+                                            processor.regenerateOne(note, level, tone) {
+                                                onChanged(); refreshTick++; regenerating = false
+                                            }
+                                        }
+                                ) {
+                                    Text(if (regenerating) "…" else "↻ вариант",
+                                        fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                                        color = cs.onSurface, maxLines = 1,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp))
+                                }
+                                IconButton(
+                                    onClick = { note.goForward(level, tone); onChanged(); refreshTick++ },
+                                    enabled = note.canGoForward(level, tone) && !regenerating,
+                                    modifier = Modifier.size(36.dp)
+                                ) { Text("›", fontSize = 18.sp, color = cs.onSurface) }
                             }
-                        },
-                        enabled = !regenerating,
-                        shape = RoundedCornerShape(12.dp),
-                        contentPadding = PaddingValues(vertical = 8.dp),
-                        modifier = Modifier.weight(1f).height(40.dp)
-                    ) { Text(if (regenerating) "Генерирую…" else "↻ Другой вариант",
-                        fontSize = 13.sp, maxLines = 1) }
-                    OutlinedButton(
-                        onClick = { note.goForward(level, tone); onChanged(); refreshTick++ },
-                        enabled = note.canGoForward(level, tone) && !regenerating,
-                        shape = RoundedCornerShape(12.dp),
-                        contentPadding = PaddingValues(0.dp),
-                        modifier = Modifier.size(width = 44.dp, height = 40.dp)
-                    ) { Text("›", fontSize = 18.sp) }
+                        }
+                    }
                 }
             }
 
