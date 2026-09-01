@@ -58,22 +58,34 @@ class VariantProcessor(
 
     // Роутинг: локальный ИИ (если выбран и модель готова) или облачный.
     private suspend fun processAllRouted(text: String): Map<String, String> {
-        if (settings.localAi && LocalAiModelManager.isReady(context, settings.localAiModel)) {
-            Diagnostics.engine("Обработка вариантов: пробую ЛОКАЛЬНЫЙ ИИ")
+        if (settings.localAi) {
+            // Офлайн-режим: работаем ТОЛЬКО локально. Откат на облако запрещён —
+            // сбой облака штатен, а неработа офлайна недопустима и должна быть видна.
+            if (!LocalAiModelManager.isReady(context, settings.localAiModel)) {
+                Diagnostics.error("Локальный ИИ: модель не скачана")
+                throw RuntimeException("Локальный ИИ: модель не скачана")
+            }
+            Diagnostics.engine("Обработка вариантов: ЛОКАЛЬНЫЙ ИИ")
             val res = localProcessAll(text)
             if (res.isNotEmpty()) { Diagnostics.engine("Локальный ИИ вернул ${res.size} вариантов"); return res }
-            Diagnostics.engine("Локальный ИИ не смог (${LocalAiEngine.lastStatus}) → откат на облако")
+            Diagnostics.error("Локальный ИИ не дал результат (${LocalAiEngine.lastStatus})")
+            throw RuntimeException("Локальный ИИ не дал результат (${LocalAiEngine.lastStatus})")
         }
         Diagnostics.engine("Обработка вариантов: ОБЛАЧНЫЙ ИИ")
         return AiClient.processAll(text, settings.apiKey)
     }
 
     private suspend fun processLectureRouted(text: String): Map<String, String> {
-        if (settings.localAi && LocalAiModelManager.isReady(context, settings.localAiModel)) {
-            Diagnostics.engine("Стенограмма: пробую ЛОКАЛЬНЫЙ ИИ")
+        if (settings.localAi) {
+            if (!LocalAiModelManager.isReady(context, settings.localAiModel)) {
+                Diagnostics.error("Локальный ИИ (лекция): модель не скачана")
+                throw RuntimeException("Локальный ИИ: модель не скачана")
+            }
+            Diagnostics.engine("Стенограмма: ЛОКАЛЬНЫЙ ИИ")
             val res = localProcessLecture(text)
             if (res.isNotEmpty()) { Diagnostics.engine("Локальный ИИ (лекция) вернул ${res.size}"); return res }
-            Diagnostics.engine("Локальный ИИ (лекция) не смог (${LocalAiEngine.lastStatus}) → облако")
+            Diagnostics.error("Локальный ИИ (лекция) не дал результат (${LocalAiEngine.lastStatus})")
+            throw RuntimeException("Локальный ИИ не дал результат (${LocalAiEngine.lastStatus})")
         }
         Diagnostics.engine("Стенограмма: ОБЛАЧНЫЙ ИИ")
         return AiClient.processLecture(text, settings.apiKey)

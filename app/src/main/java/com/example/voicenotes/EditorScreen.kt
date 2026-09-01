@@ -299,12 +299,17 @@ fun EditorScreen(
                     val model = VoskHolder.getModel(context)
                     val better = RecognitionEnsemble.refine(model, File(path), thorough = true)
                     if (!better.isNullOrBlank()) {
-                        original = better; note.original = Punctuator.punctuate(better)
+                        original = better
+                        val punct = Punctuator.punctuate(better)
+                        note.original = punct
+                        note.putVariant(Level.VERBATIM, tone, punct)  // версия в историю → стрелки ‹ ›
                     }
                     cornerIndicator = "whisper"
                     val wt = WhisperEngine.transcribe(context, path, settings.whisperModel)
-                    if (!wt.isNullOrBlank()) whisperText = wt
-                    note.variants.clear(); processor.reset(note.id)
+                    if (!wt.isNullOrBlank()) {
+                        whisperText = wt
+                        note.putVariant(Level.VERBATIM, tone, Punctuator.punctuate(wt))  // ещё версия
+                    }
                     status = "Дословный текст обновлён"
                 } catch (e: Exception) {
                     status = "Ошибка: ${e.message}"
@@ -338,11 +343,11 @@ fun EditorScreen(
                     status = "Собираю точный текст (ансамбль)…"
                     try {
                         val result = if (settings.localAi) {
-                            // Локальный ИИ на устройстве (офлайн). При сбое — откат на облако.
+                            // Офлайн: только локальный ИИ. Если не смог — берём текст Whisper
+                            // (НЕ облако — сбой офлайна не маскируем).
                             LocalAiEngine.generate(context, AiClient.assembleSystemPrompt(),
                                 "Вариант 1 (Vosk):\n$voskText\n\nВариант 2 (Whisper):\n$wt",
-                                settings.localAiModel)
-                                ?: AiClient.assembleFromTwo(voskText, wt, settings.apiKey)
+                                settings.localAiModel) ?: wt
                         } else {
                             AiClient.assembleFromTwo(voskText, wt, settings.apiKey)
                         }
@@ -682,22 +687,22 @@ fun EditorScreen(
                     val smyslyReady = Level.entries.any { l ->
                         l != Level.VERBATIM && note.getVariant(l, tone) != null
                     }
-                    // Показывать ли «Обновить» в текущем контексте.
-                    val showUpdate = when {
-                        level == Level.VERBATIM -> note.recordMode != "google" &&
-                                note.audioPath != null && File(note.audioPath!!).exists()
-                        else -> smyslyReady && settings.useAI
-                    }
-                    val showAiBtn = !showUpdate && original.isNotBlank() && settings.useAI &&
-                            !settings.autoAi && !smyslyReady
+                    // «Обновить» показывается:
+                    //  - в Дословно (офлайн, есть аудио) — перераспознать;
+                    //  - в смыслах, когда смыслы готовы — переосмыслить.
+                    val canReupdate = level == Level.VERBATIM && note.recordMode != "google" &&
+                            note.audioPath != null && File(note.audioPath!!).exists()
+                    val showUpdate = canReupdate || (level != Level.VERBATIM && smyslyReady && settings.useAI)
+                    // «ИИ» показывается, пока смыслы не получены (в т.ч. в Дословно — вместе с Обновить).
+                    val showAiBtn = original.isNotBlank() && settings.useAI && !settings.autoAi && !smyslyReady
 
                     Row(
                         Modifier.align(Alignment.BottomEnd).padding(12.dp),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Стрелки истории версий (в смыслах, если есть история)
-                        if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI &&
+                        // Стрелки истории версий (если есть история назад/вперёд)
+                        if (shown.isNotBlank() &&
                             (note.canGoBack(level, tone) || note.canGoForward(level, tone))) {
                             Surface(color = Palette.Ink, shape = RoundedCornerShape(16.dp),
                                 shadowElevation = 6.dp, modifier = Modifier.height(56.dp)) {
