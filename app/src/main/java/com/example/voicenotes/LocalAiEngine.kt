@@ -163,6 +163,8 @@ object LocalAiEngine {
         lastStatus = if (genOk) "работает" else "генерация пустая"
         sb.toString()
     }
+
+    private fun buildPrompt(system: String, user: String): String =
         "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n$system<|eot_id|>" +
         "<|start_header_id|>user<|end_header_id|>\n$user<|eot_id|>" +
         "<|start_header_id|>assistant<|end_header_id|>\n"
