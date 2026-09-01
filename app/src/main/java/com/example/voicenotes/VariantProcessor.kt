@@ -17,6 +17,7 @@ import kotlinx.coroutines.launch
 class VariantProcessor(
     private val scope: CoroutineScope,
     private val settings: Settings,
+    private val context: android.content.Context,   // для локального ИИ
     private val notesProvider: () -> List<Note>,   // доступ к актуальным заметкам
     private val persist: () -> Unit                 // сохранить всё на диск
 ) {
@@ -55,6 +56,65 @@ class VariantProcessor(
         }
     }
 
+    // Роутинг: локальный ИИ (если выбран и модель готова) или облачный.
+    private suspend fun processAllRouted(text: String): Map<String, String> {
+        if (settings.localAi && LocalAiModelManager.isReady(context, settings.localAiModel)) {
+            val res = localProcessAll(text)
+            if (res.isNotEmpty()) return res
+            // локальный не смог — откат на облако
+        }
+        return AiClient.processAll(text, settings.apiKey)
+    }
+
+    private suspend fun processLectureRouted(text: String): Map<String, String> {
+        if (settings.localAi && LocalAiModelManager.isReady(context, settings.localAiModel)) {
+            val res = localProcessLecture(text)
+            if (res.isNotEmpty()) return res
+        }
+        return AiClient.processLecture(text, settings.apiKey)
+    }
+
+    // Локальная обработка: маленькой модели проще делать по одному варианту,
+    // чем большой JSON. Генерируем ключевые варианты по отдельности.
+    private suspend fun localProcessAll(text: String): Map<String, String> {
+        val model = settings.localAiModel
+        val result = mutableMapOf<String, String>()
+        val t = Tone.NEUTRAL.ordinal
+        // Дословный с умной пунктуацией
+        LocalAiEngine.generate(context,
+            "Расставь пунктуацию и заглавные буквы по смыслу, сохрани ВСЕ слова. Верни только текст.",
+            text, model)?.let { for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = it }
+        // Чисто
+        LocalAiEngine.generate(context,
+            "Исправь ошибки распознавания, расставь пунктуацию, сохрани все мысли и слова. Не сокращай. Верни только текст.",
+            text, model)?.let { result["${Level.CLEAN.ordinal}:$t"] = it }
+        // Кратко
+        LocalAiEngine.generate(context,
+            "Перескажи кратко, вдвое короче, сохрани главное. Верни только текст.",
+            text, model)?.let { result["${Level.BRIEF.ordinal}:$t"] = it }
+        // Суть
+        LocalAiEngine.generate(context,
+            "Изложи суть в 1-2 предложениях. Верни только текст.",
+            text, model)?.let { result["${Level.GIST.ordinal}:$t"] = it }
+        return result
+    }
+
+    private suspend fun localProcessLecture(text: String): Map<String, String> {
+        val model = settings.localAiModel
+        val result = mutableMapOf<String, String>()
+        val t = Tone.NEUTRAL.ordinal
+        LocalAiEngine.generate(context,
+            "Это лекция. Оформи как стенограмму: исправь ошибки распознавания, расставь пунктуацию, абзацы. Сохрани всё содержание и слова. Верни только текст.",
+            text, model)?.let { result["${Level.CLEAN.ordinal}:$t"] = it }
+        LocalAiEngine.generate(context,
+            "Это лекция. Изложи ЕЁ СОДЕРЖАНИЕ кратко (не рассказывай о лекции, а сожми саму лекцию). Верни только текст.",
+            text, model)?.let { result["${Level.BRIEF.ordinal}:$t"] = it }
+        LocalAiEngine.generate(context,
+            "Это лекция. Изложи её содержание максимально коротко, самую суть. Верни только текст.",
+            text, model)?.let { result["${Level.GIST.ordinal}:$t"] = it }
+        return result
+    }
+
     /** Запускает/продолжает расчёт недостающих вариантов заметки. */
     fun ensureAll(note: Note, priorityLevel: Level, priorityTone: Tone) {
         if (note.original.isBlank()) return
@@ -83,9 +143,9 @@ class VariantProcessor(
                     }
                     try {
                         val all = if (note.isLecture)
-                            AiClient.processLecture(note.original, settings.apiKey)
+                            processLectureRouted(note.original)
                         else
-                            AiClient.processAll(note.original, settings.apiKey)
+                            processAllRouted(note.original)
                         for ((l, t) in combos) {
                             val key = "${l.ordinal}:${t.ordinal}"
                             val text = all[key]

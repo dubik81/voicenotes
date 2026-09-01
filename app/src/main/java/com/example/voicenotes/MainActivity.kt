@@ -33,6 +33,7 @@ fun App() {
         VariantProcessor(
             scope = appScope,
             settings = settings,
+            context = context,
             notesProvider = { notes },
             persist = {
                 store.save(notes)
