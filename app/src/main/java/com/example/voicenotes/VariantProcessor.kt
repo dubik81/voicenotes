@@ -197,6 +197,8 @@ class VariantProcessor(
                         }
                         lastAiError = e.message ?: "Ошибка ИИ"
                         Diagnostics.error("ИИ обработка: ${e.message?.take(60)}")
+                        // Локальный ИИ детерминирован: повтор даст тот же результат — не повторяем.
+                        if (settings.localAi) { Diagnostics.info("Локальный ИИ: повторы отключены"); break }
                     }
                     attempt++
                     if (attempt < maxRetries &&

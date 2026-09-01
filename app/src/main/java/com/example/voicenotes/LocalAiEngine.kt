@@ -114,8 +114,8 @@ object LocalAiEngine {
                 it.parameterTypes[0] == String::class.java
             } ?: cls.methods.firstOrNull { it.name == "generate" }
             when (gen?.parameterTypes?.size) {
-                3 -> gen.invoke(mod, prompt, 512, handler)
-                4 -> gen.invoke(mod, prompt, 512, handler, false)
+                3 -> gen.invoke(mod, prompt, 256, handler)
+                4 -> gen.invoke(mod, prompt, 256, handler, false)
                 2 -> gen.invoke(mod, prompt, handler)
                 else -> return null
             }
@@ -161,13 +161,14 @@ object LocalAiEngine {
         }
         sb.append("\nИтог: ").append(if (genOk) "OK Локальный ИИ работает!" else "Модель грузится, но не генерирует.")
         lastStatus = if (genOk) "работает" else "генерация пустая"
+        Diagnostics.info("САМОПРОВЕРКА локального ИИ:\n${sb}")
         sb.toString()
     }
 
+    // Простой промпт БЕЗ спецтокенов — токенизатор Llama сам добавит служебное.
+    // Спецтокены в тексте могут ломать генерацию (пустой результат).
     private fun buildPrompt(system: String, user: String): String =
-        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n$system<|eot_id|>" +
-        "<|start_header_id|>user<|end_header_id|>\n$user<|eot_id|>" +
-        "<|start_header_id|>assistant<|end_header_id|>\n"
+        "$system\n\n$user"
 
     private fun releaseCurrent() {
         try { module?.let { m -> m.javaClass.getMethod("resetNative").invoke(m) } } catch (_: Throwable) {}
