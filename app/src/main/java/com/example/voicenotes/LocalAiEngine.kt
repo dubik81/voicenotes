@@ -131,38 +131,42 @@ object LocalAiEngine {
                     method.returnType == java.lang.Boolean.TYPE) false else null
             }
 
-            val gen3config = genMethods.firstOrNull {
-                it.parameterTypes.size == 3 &&
-                it.parameterTypes[0] == String::class.java &&
-                it.parameterTypes[1].simpleName == "LlmGenerationConfig"
-            }
             Diagnostics.event("Вызываю generate, длина промпта=${prompt.length}")
-            val ret: Any? = try {
-                if (gen3config != null) {
-                    // Правильный современный вызов: generate(prompt, config, callback).
-                    val cfgCls = gen3config.parameterTypes[1]
-                    val cfg = buildGenConfig(cfgCls)
-                    Diagnostics.info("Использую generate(String, LlmGenerationConfig, LlmCallback), config=${if (cfg!=null) "создан" else "null"}")
-                    gen3config.invoke(mod, prompt, cfg, handler)
-                } else {
-                    // запасные сигнатуры
-                    val gen = genMethods.firstOrNull {
-                        it.parameterTypes.size == 3 && it.parameterTypes[0] == String::class.java &&
-                        it.parameterTypes[1] == Int::class.javaPrimitiveType
-                    } ?: genMethods.firstOrNull()
-                    if (gen == null) { Diagnostics.error("generate не найден"); return null }
-                    when (gen.parameterTypes.size) {
-                        3 -> gen.invoke(mod, prompt, 256, handler)
-                        4 -> gen.invoke(mod, prompt, 256, handler, false)
-                        2 -> gen.invoke(mod, prompt, handler)
-                        else -> return null
-                    }
+            // Пробуем сигнатуры по очереди, пока callback не начнёт отдавать текст.
+            // Порядок: сначала простые (без config), потом с config.
+            val attempts = listOf<Pair<String, () -> Any?>>(
+                "(String, LlmCallback)" to {
+                    genMethods.firstOrNull { it.parameterTypes.size == 2 &&
+                        it.parameterTypes[0] == String::class.java }
+                        ?.invoke(mod, prompt, handler)
+                },
+                "(String, int, LlmCallback, boolean)" to {
+                    genMethods.firstOrNull { it.parameterTypes.size == 4 &&
+                        it.parameterTypes[1] == Int::class.javaPrimitiveType }
+                        ?.invoke(mod, prompt, 256, handler, false)
+                },
+                "(String, LlmGenerationConfig, LlmCallback)" to {
+                    val gm = genMethods.firstOrNull { it.parameterTypes.size == 3 &&
+                        it.parameterTypes[1].simpleName == "LlmGenerationConfig" }
+                    val cfg = gm?.let { buildGenConfig(it.parameterTypes[1]) }
+                    if (gm != null && cfg != null) gm.invoke(mod, prompt, cfg, handler) else null
                 }
-            } catch (e: java.lang.reflect.InvocationTargetException) {
-                Diagnostics.error("generate нативная ошибка: ${e.targetException?.javaClass?.simpleName}: ${e.targetException?.message?.take(80)}")
-                return null
+            )
+            var ret: Any? = null
+            for ((sig, call) in attempts) {
+                if (sb.isNotEmpty()) break  // уже получили текст
+                sb.clear(); callbackCalls = 0; calledMethods.clear()
+                try {
+                    Diagnostics.info("Пробую generate $sig")
+                    ret = call()
+                    Diagnostics.event("$sig → вернул=$ret, callback=$callbackCalls, собрано=${sb.length}")
+                    if (sb.isNotEmpty()) { Diagnostics.event("РАБОТАЕТ: $sig"); break }
+                } catch (e: java.lang.reflect.InvocationTargetException) {
+                    Diagnostics.error("$sig нативная ошибка: ${e.targetException?.javaClass?.simpleName}: ${e.targetException?.message?.take(120)}")
+                } catch (e: Throwable) {
+                    Diagnostics.error("$sig ошибка: ${e.javaClass.simpleName}: ${e.message?.take(120)}")
+                }
             }
-            Diagnostics.event("generate вернул: $ret; callback вызван $callbackCalls раз; методы=[${calledMethods.joinToString()}]; собрано=${sb.length}")
 
             sb.toString().trim().ifBlank {
                 Diagnostics.error("Генерация пуста: callback=$callbackCalls, методы=[${calledMethods.joinToString()}]")
