@@ -97,7 +97,8 @@ fun App() {
                 settings = settings,
                 dark = dark,
                 onDarkChange = { dark = it; settings.darkTheme = it },
-                onClose = { showSettings = false }
+                onClose = { showSettings = false },
+                appScope = appScope
             )
         }
     }

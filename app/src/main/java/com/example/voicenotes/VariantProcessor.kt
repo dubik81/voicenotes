@@ -94,6 +94,15 @@ class VariantProcessor(
                                 states[k(note.id, l, t)] = State.DONE
                             }
                         }
+                        // Дословный вариант от ИИ (умная пунктуация) — сохраняем отдельно.
+                        if (!note.isLecture) {
+                            val vKey = "${Level.VERBATIM.ordinal}:${Tone.NEUTRAL.ordinal}"
+                            all[vKey]?.takeIf { it.isNotBlank() }?.let {
+                                note.putVariant(Level.VERBATIM, Tone.NEUTRAL, it)
+                                // для всех тонов дословный одинаковый
+                                for (t in Tone.entries) note.putVariant(Level.VERBATIM, t, it)
+                            }
+                        }
                         progressDone[note.id] = combos.count { (l, t) -> note.getVariant(l, t) != null }
                         persist()
                         val allDone = combos.all { (l, t) -> note.getVariant(l, t) != null }

@@ -23,9 +23,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Autorenew
+import androidx.compose.material.icons.filled.ChevronLeft
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Help
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
@@ -87,7 +91,11 @@ fun EditorScreen(
     val shown: String = when {
         isListening -> liveText.ifBlank { "…" }
         original.isBlank() -> ""
-        level == Level.VERBATIM -> Punctuator.punctuate(original)
+        level == Level.VERBATIM -> {
+            refreshTick
+            // Вариант ИИ с умной пунктуацией (из variants) или офлайн-пунктуатор.
+            note.variants[note.variantKey(Level.VERBATIM, tone)] ?: Punctuator.punctuate(original)
+        }
         else -> { refreshTick; note.getVariant(level, tone) ?: "" }
     }
     val currentReady = level == Level.VERBATIM || note.getVariant(level, tone) != null
@@ -157,8 +165,12 @@ fun EditorScreen(
     var keepListening by remember { mutableStateOf(false) }
     // Лекция: переключатель онлайн(Google)/офлайн(Vosk+Whisper), меняется между кусками.
     var isOnline by remember { mutableStateOf(note.recordMode == "google") }
+    // Работа со смыслом: локальный ИИ (офл) или облачный (онл). Состояние экрана
+    // (иначе переключатель не перерисовывается сразу при нажатии).
+    var localAi by remember { mutableStateOf(settings.localAi) }
     var showMenu by remember { mutableStateOf(false) }
     var showInfo by remember { mutableStateOf(false) }
+    var showLegend by remember { mutableStateOf(false) }
 
     fun buildIntent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -427,6 +439,37 @@ fun EditorScreen(
         )
     }
 
+    if (showLegend) {
+        AlertDialog(
+            onDismissRequest = { showLegend = false },
+            title = { Text("Что означают значки") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Готовность вариантов:", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text("✓ готово — вариант посчитан", color = Palette.Green, fontSize = 12.sp)
+                    Text("⏳ считается — идёт обработка", color = Palette.Amber, fontSize = 12.sp)
+                    Text("• в очереди — ждёт обработки", color = cs.onSurfaceVariant, fontSize = 12.sp)
+                    Text("⚠ ошибка — не удалось посчитать", color = Palette.Red, fontSize = 12.sp)
+                    HorizontalDivider()
+                    Text("Режим заметки:", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text("🎤 офлайн — распознавание на телефоне (с аудио)", fontSize = 12.sp)
+                    Text("🌐 онлайн — распознавание через Google (без аудио)", fontSize = 12.sp)
+                    Text("🎓 лекция — режим стенограммы", fontSize = 12.sp)
+                    HorizontalDivider()
+                    Text("Кнопки в поле:", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text("🎤 запись / ⏹ стоп", fontSize = 12.sp)
+                    Text("✦ ИИ — отправить текст в обработку", color = Palette.Amber, fontSize = 12.sp)
+                    Text("‹ ↻ › — другой вариант и история версий", fontSize = 12.sp)
+                    HorizontalDivider()
+                    Text("Переключатели:", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
+                    Text("Речь — движок распознавания (Офл/Онл)", fontSize = 12.sp)
+                    Text("Смысл — движок обработки текста (Офл/Онл)", fontSize = 12.sp)
+                }
+            },
+            confirmButton = { TextButton(onClick = { showLegend = false }) { Text("Закрыть") } }
+        )
+    }
+
     if (showInfo) {
         val dateFmt = remember { java.text.SimpleDateFormat("d MMMM yyyy, HH:mm", java.util.Locale.getDefault()) }
         val words = note.original.split(Regex("\\s+")).filter { it.isNotBlank() }.size
@@ -458,7 +501,7 @@ fun EditorScreen(
 
             Row(
                 Modifier.fillMaxWidth().background(Palette.Ink)
-                    .padding(horizontal = 8.dp, vertical = 12.dp),
+                    .padding(horizontal = 8.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(onClick = { persist(); onBack() }) {
@@ -504,6 +547,10 @@ fun EditorScreen(
                             text = { Text("Информация") },
                             leadingIcon = { Icon(Icons.Filled.Info, null) },
                             onClick = { showMenu = false; showInfo = true })
+                        DropdownMenuItem(
+                            text = { Text("Что означают значки") },
+                            leadingIcon = { Icon(Icons.Filled.Help, null) },
+                            onClick = { showMenu = false; showLegend = true })
                         HorizontalDivider()
                         DropdownMenuItem(
                             text = { Text("Удалить", color = Palette.Red) },
@@ -514,34 +561,26 @@ fun EditorScreen(
                 }
             }
 
-            // Две строки настроек: «Речь в текст» (движок распознавания) и
-            // «Работа со смыслом» (движок ИИ). Каждая — переключатель Офл/Онл.
+            // Одна строка: «Речь» (движок распознавания) и «Смысл» (движок ИИ).
             if (!isListening) {
-                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     // Речь в текст: Офлайн (Vosk+Whisper) / Онлайн (Google)
-                    Row(verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(vertical = 3.dp)) {
-                        Text("Речь в текст", fontSize = 12.sp, color = cs.onSurfaceVariant,
-                            modifier = Modifier.width(120.dp))
-                        Spacer(Modifier.width(8.dp))
-                        SegOffOn(
-                            offSelected = !isOnline,
-                            onOff = { isOnline = false; note.recordMode = if (note.isLecture) "lecture" else "vosk" },
-                            onOn = { isOnline = true; note.recordMode = "google" }
-                        )
-                    }
+                    Text("Речь", fontSize = 11.sp, color = cs.onSurfaceVariant)
+                    SegOffOn(
+                        offSelected = !isOnline,
+                        onOff = { isOnline = false; note.recordMode = if (note.isLecture) "lecture" else "vosk" },
+                        onOn = { isOnline = true; note.recordMode = "google" }
+                    )
+                    Spacer(Modifier.width(4.dp))
                     // Работа со смыслом: Офлайн (локальный ИИ) / Онлайн (облачный)
-                    Row(verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(vertical = 3.dp)) {
-                        Text("Работа со смыслом", fontSize = 12.sp, color = cs.onSurfaceVariant,
-                            modifier = Modifier.width(120.dp))
-                        Spacer(Modifier.width(8.dp))
-                        SegOffOn(
-                            offSelected = settings.localAi,
-                            onOff = { settings.localAi = true; refreshTick++ },
-                            onOn = { settings.localAi = false; refreshTick++ }
-                        )
-                    }
+                    Text("Смысл", fontSize = 11.sp, color = cs.onSurfaceVariant)
+                    SegOffOn(
+                        offSelected = localAi,
+                        onOff = { localAi = true; settings.localAi = true },
+                        onOn = { localAi = false; settings.localAi = false }
+                    )
                 }
             }
 
@@ -594,12 +633,52 @@ fun EditorScreen(
                             )
                         }
                     }
-                    // Кнопки в правом нижнем углу поля: [✨ ИИ] [🎤 запись]
+                    // Кнопки в правом нижнем углу поля: [‹↻›] [✨ ИИ] [🎤 запись]
                     Row(
                         Modifier.align(Alignment.BottomEnd).padding(12.dp),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        // «Другой вариант» — три части: ‹ назад · ↻ генерация · вперёд ›
+                        if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
+                            var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
+                            Surface(
+                                color = Palette.Ink, shape = RoundedCornerShape(16.dp),
+                                shadowElevation = 6.dp,
+                                modifier = Modifier.height(56.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    // назад
+                                    Box(Modifier.size(width = 34.dp, height = 56.dp)
+                                        .clickable(enabled = note.canGoBack(level, tone) && !regenerating) {
+                                            note.goBack(level, tone); onChanged(); refreshTick++ },
+                                        contentAlignment = Alignment.Center) {
+                                        Icon(Icons.Filled.ChevronLeft, "Назад",
+                                            tint = if (note.canGoBack(level, tone)) Color.White else Color.White.copy(alpha = 0.3f))
+                                    }
+                                    // генерация (центр, чуть шире)
+                                    Box(Modifier.size(width = 48.dp, height = 56.dp)
+                                        .clickable(enabled = !regenerating) {
+                                            regenerating = true
+                                            processor.regenerateOne(note, level, tone) {
+                                                onChanged(); refreshTick++; regenerating = false
+                                            } },
+                                        contentAlignment = Alignment.Center) {
+                                        Icon(Icons.Filled.Autorenew,
+                                            if (regenerating) "Генерирую" else "Другой вариант",
+                                            tint = Color.White)
+                                    }
+                                    // вперёд
+                                    Box(Modifier.size(width = 34.dp, height = 56.dp)
+                                        .clickable(enabled = note.canGoForward(level, tone) && !regenerating) {
+                                            note.goForward(level, tone); onChanged(); refreshTick++ },
+                                        contentAlignment = Alignment.Center) {
+                                        Icon(Icons.Filled.ChevronRight, "Вперёд",
+                                            tint = if (note.canGoForward(level, tone)) Color.White else Color.White.copy(alpha = 0.3f))
+                                    }
+                                }
+                            }
+                        }
                         // «Отправить в ИИ» — только в ручном режиме (если авто — кнопки нет)
                         if (original.isNotBlank() && settings.useAI && !settings.autoAi) {
                             FloatingActionButton(
@@ -630,7 +709,7 @@ fun EditorScreen(
             }
 
             Surface(color = cs.surface, shadowElevation = 12.dp) {
-                Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
+                Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
 
                     // refreshTick заставляет бейджи готовности обновляться по мере расчёта
                     val tick = refreshTick
@@ -653,47 +732,6 @@ fun EditorScreen(
                         Spacer(Modifier.height(6.dp))
                     }
 
-                    // «Другой вариант» со стрелками истории — под кнопками тона (не для Дословно).
-                    if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
-                        var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
-                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                            OutlinedButton(
-                                onClick = { note.goBack(level, tone); onChanged(); refreshTick++ },
-                                enabled = note.canGoBack(level, tone) && !regenerating,
-                                shape = RoundedCornerShape(12.dp),
-                                contentPadding = PaddingValues(0.dp),
-                                modifier = Modifier.size(width = 44.dp, height = 40.dp)
-                            ) { Text("‹", fontSize = 18.sp) }
-                            OutlinedButton(
-                                onClick = {
-                                    regenerating = true
-                                    processor.regenerateOne(note, level, tone) {
-                                        onChanged(); refreshTick++; regenerating = false
-                                    }
-                                },
-                                enabled = !regenerating,
-                                shape = RoundedCornerShape(12.dp),
-                                modifier = Modifier.weight(1f).height(40.dp)
-                            ) { Text(if (regenerating) "Генерирую…" else "↻ Другой вариант",
-                                fontSize = 13.sp, maxLines = 1) }
-                            OutlinedButton(
-                                onClick = { note.goForward(level, tone); onChanged(); refreshTick++ },
-                                enabled = note.canGoForward(level, tone) && !regenerating,
-                                shape = RoundedCornerShape(12.dp),
-                                contentPadding = PaddingValues(0.dp),
-                                modifier = Modifier.size(width = 44.dp, height = 40.dp)
-                            ) { Text("›", fontSize = 18.sp) }
-                        }
-                        Spacer(Modifier.height(6.dp))
-                    }
-                    // Легенда индикации готовности вариантов.
-                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("✓ готово", color = Palette.Green, fontSize = 9.sp)
-                        Text("⏳ считается", color = Palette.Amber, fontSize = 9.sp)
-                        Text("• в очереди", color = cs.onSurfaceVariant, fontSize = 9.sp)
-                        Text("⚠ ошибка", color = Palette.Red, fontSize = 9.sp)
-                    }
-                    Spacer(Modifier.height(6.dp))
                     // Честный статус: реальный ход обработки из процессора.
                     val done = processor.doneCount(note.id)
                     val total = processor.totalCount(note.id)

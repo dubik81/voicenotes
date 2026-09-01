@@ -56,7 +56,8 @@ data class Note(
     fun variantKey(level: Level, tone: Tone) = "${level.ordinal}:${tone.ordinal}"
 
     fun getVariant(level: Level, tone: Tone): String? =
-        if (level == Level.VERBATIM) original else variants[variantKey(level, tone)]
+        if (level == Level.VERBATIM) (variants[variantKey(level, tone)] ?: original)
+        else variants[variantKey(level, tone)]
 
     fun putVariant(level: Level, tone: Tone, text: String) {
         val key = variantKey(level, tone)

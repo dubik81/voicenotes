@@ -27,19 +27,16 @@ fun SettingsScreen(
     settings: Settings,
     dark: Boolean,
     onDarkChange: (Boolean) -> Unit,
-    onClose: () -> Unit
+    onClose: () -> Unit,
+    appScope: kotlinx.coroutines.CoroutineScope
 ) {
     val cs = MaterialTheme.colorScheme
     val scope = rememberCoroutineScope()
     val context = androidx.compose.ui.platform.LocalContext.current
 
     // Состояния загрузки моделей (для индикаторов).
-    var whisperDl by remember { mutableStateOf(-1) }
-    var whisperDlError by remember { mutableStateOf<String?>(null) }
     var modelsTick by remember { mutableStateOf(0) }  // обновить статусы
     var localAiModel by remember { mutableStateOf(settings.localAiModel) }
-    var localAiDl by remember { mutableStateOf(-1) }
-    var localAiErr by remember { mutableStateOf<String?>(null) }
 
     var key by remember { mutableStateOf(settings.apiKey) }
     var pause by remember { mutableStateOf(settings.pauseSeconds) }
@@ -219,37 +216,25 @@ fun SettingsScreen(
                         Text("~${whInfo?.sizeMb ?: 142} МБ. Скачивается с huggingface.co (нужен интернет).",
                             fontSize = 10.sp, color = cs.onSurfaceVariant)
 
-                        if (whisperDl in 0..100) {
+                        val whKey = "whisper:$whModelId"
+                        val whDlP = DownloadManager.progress[whKey] ?: -1
+                        if (whDlP in 0..100) {
                             Spacer(Modifier.height(6.dp))
                             LinearProgressIndicator(
-                                progress = { whisperDl / 100f },
+                                progress = { whDlP / 100f },
                                 modifier = Modifier.fillMaxWidth(), color = Palette.Amber)
-                            Text("Загрузка: $whisperDl%", fontSize = 10.sp, color = cs.onSurfaceVariant)
+                            Text("Загрузка: $whDlP% (идёт в фоне, можно закрыть настройки)",
+                                fontSize = 10.sp, color = cs.onSurfaceVariant)
                         }
-                        whisperDlError?.let { err ->
+                        DownloadManager.errors[whKey]?.let { err ->
                             Spacer(Modifier.height(6.dp))
                             Text("✗ $err", color = Palette.Red, fontSize = 11.sp)
                         }
 
                         Spacer(Modifier.height(8.dp))
                         Button(
-                            onClick = {
-                                whisperDlError = null
-                                scope.launch {
-                                    try {
-                                        whisperDl = 0
-                                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                                            WhisperModelManager.download(context, whModelId) { p -> whisperDl = p }
-                                        }
-                                        whisperDl = -1
-                                        modelsTick++
-                                    } catch (e: Exception) {
-                                        whisperDl = -1
-                                        whisperDlError = e.message ?: "Ошибка загрузки"
-                                    }
-                                }
-                            },
-                            enabled = whisperDl < 0 && !whReady,
+                            onClick = { DownloadManager.downloadWhisper(appScope, context, whModelId) },
+                            enabled = whDlP < 0 && !whReady,
                             colors = ButtonDefaults.buttonColors(containerColor = Palette.Ink),
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
@@ -290,31 +275,21 @@ fun SettingsScreen(
                                 }
                             }
                         }
-                        if (localAiDl in 0..100) {
+                        val localKey = "localai:$localAiModel"
+                        val localDlP = DownloadManager.progress[localKey] ?: -1
+                        if (localDlP in 0..100) {
                             Spacer(Modifier.height(6.dp))
-                            LinearProgressIndicator(progress = { localAiDl / 100f },
+                            LinearProgressIndicator(progress = { localDlP / 100f },
                                 modifier = Modifier.fillMaxWidth(), color = Palette.Amber)
-                            Text("Загрузка: $localAiDl%", fontSize = 10.sp, color = cs.onSurfaceVariant)
+                            Text("Загрузка: $localDlP% (идёт в фоне, можно закрыть настройки)",
+                                fontSize = 10.sp, color = cs.onSurfaceVariant)
                         }
-                        localAiErr?.let { Text("✗ $it", color = Palette.Red, fontSize = 11.sp) }
+                        DownloadManager.errors[localKey]?.let { Text("✗ $it", color = Palette.Red, fontSize = 11.sp) }
                         Spacer(Modifier.height(8.dp))
                         val localReady = LocalAiModelManager.isReady(context, localAiModel)
                         Button(
-                            onClick = {
-                                localAiErr = null
-                                scope.launch {
-                                    try {
-                                        localAiDl = 0
-                                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                                            LocalAiModelManager.download(context, localAiModel) { p -> localAiDl = p }
-                                        }
-                                        localAiDl = -1; modelsTick++
-                                    } catch (e: Exception) {
-                                        localAiDl = -1; localAiErr = e.message ?: "Ошибка загрузки"
-                                    }
-                                }
-                            },
-                            enabled = localAiDl < 0 && !localReady,
+                            onClick = { DownloadManager.downloadLocalAi(appScope, context, localAiModel) },
+                            enabled = localDlP < 0 && !localReady,
                             colors = ButtonDefaults.buttonColors(containerColor = Palette.Ink),
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
