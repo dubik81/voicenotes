@@ -8,54 +8,87 @@ import kotlinx.coroutines.withContext
  * Локальный ИИ на устройстве через ExecuTorch (LLaMA/Gemma).
  * Обрабатывает ТЕКСТ офлайн: чистка, пунктуация, сжатие, сборка.
  *
- * ВАЖНО (стабильность эксплуатации): вся работа обёрнута в try/catch.
- * При любой ошибке возвращает null — вызывающий код откатывается на
- * запасной путь (правила/облако), приложение НЕ падает.
+ * API (проверено по документации ExecuTorch 1.x):
+ *   класс: org.pytorch.executorch.extension.llm.LlmModule
+ *   конструктор: LlmModule(modelPath, tokenizerPath, temperature)
+ *   методы: load(), generate(prompt, seqLen, callback)
+ *   callback: org.pytorch.executorch.extension.llm.LlmCallback { onResult(String); onStats(String) }
+ *
+ * Всё через рефлексию + try/catch: если API отличается — возвращаем null,
+ * вызывающий код откатывается на облако, приложение НЕ падает.
  */
 object LocalAiEngine {
+
+    // Последний статус для диагностики (виден пользователю).
+    @Volatile var lastStatus: String = "не запускался"
+        private set
+
+    // Возможные пути к классу (новый и старый) — пробуем по очереди.
+    private val MODULE_CLASSES = listOf(
+        "org.pytorch.executorch.extension.llm.LlmModule",
+        "org.pytorch.executorch.LlmModule"
+    )
+    private val CALLBACK_CLASSES = listOf(
+        "org.pytorch.executorch.extension.llm.LlmCallback",
+        "org.pytorch.executorch.LlmCallback"
+    )
 
     @Volatile private var module: Any? = null
     @Volatile private var loadedId: String? = null
 
-    /**
-     * Генерация ответа локальной моделью. Возвращает текст или null при любой проблеме.
-     * systemPrompt + userText объединяются в промпт для инструктивной модели.
-     */
     suspend fun generate(context: Context, systemPrompt: String, userText: String, modelId: String): String? =
         withContext(Dispatchers.IO) {
             try {
-                if (!LocalAiModelManager.isReady(context, modelId)) return@withContext null
-                val mod = loadModule(context, modelId) ?: return@withContext null
-                val prompt = buildPrompt(systemPrompt, userText)
-                runGenerate(mod, prompt)
+                if (!LocalAiModelManager.isReady(context, modelId)) {
+                    lastStatus = "модель не скачана"; return@withContext null
+                }
+                if (moduleClass() == null) {
+                    lastStatus = "класс ExecuTorch не найден"; return@withContext null
+                }
+                val mod = loadModule(context, modelId)
+                if (mod == null) { lastStatus = "модель не загрузилась"; return@withContext null }
+                val res = runGenerate(mod, buildPrompt(systemPrompt, userText))
+                lastStatus = if (res.isNullOrBlank()) "генерация пустая" else "работает"
+                res
             } catch (e: Throwable) {
-                null  // любая ошибка → откат на запасной путь
+                lastStatus = "ошибка: ${e.message?.take(40)}"; null
             }
         }
+
+    private fun moduleClass(): Class<*>? {
+        for (name in MODULE_CLASSES) {
+            try { return Class.forName(name) } catch (_: Throwable) {}
+        }
+        return null
+    }
+    private fun callbackClass(): Class<*>? {
+        for (name in CALLBACK_CLASSES) {
+            try { return Class.forName(name) } catch (_: Throwable) {}
+        }
+        return null
+    }
 
     private fun loadModule(context: Context, modelId: String): Any? {
         return try {
             if (module != null && loadedId == modelId) return module
             releaseCurrent()
+            val cls = moduleClass() ?: return null
             val path = LocalAiModelManager.modelFile(context, modelId).absolutePath
-            val tokenizer = LocalAiModelManager.tokenizerFile(context).absolutePath
-            // ExecuTorch LlmModule грузит .pte-модель + токенизатор. Через рефлексию,
-            // чтобы не падала сборка, если сигнатура иная — тогда вернём null.
-            val cls = Class.forName("org.pytorch.executorch.LlmModule")
+            val tok = LocalAiModelManager.tokenizerFile(context).absolutePath
+            // конструктор (modelPath, tokenizerPath, temperature)
             val m = try {
-                // вариант с (modelPath, tokenizerPath, temperature)
                 cls.getConstructor(String::class.java, String::class.java, Float::class.javaPrimitiveType)
-                    .newInstance(path, tokenizer, 0.3f)
+                    .newInstance(path, tok, 0.3f)
             } catch (_: Throwable) {
                 try {
-                    // вариант с (modelPath, tokenizerPath)
-                    cls.getConstructor(String::class.java, String::class.java).newInstance(path, tokenizer)
+                    // (modelType:Int, modelPath, tokenizerPath, temperature)
+                    cls.getConstructor(Int::class.javaPrimitiveType, String::class.java,
+                        String::class.java, Float::class.javaPrimitiveType)
+                        .newInstance(1, path, tok, 0.3f)
                 } catch (_: Throwable) {
-                    // вариант только (modelPath)
-                    cls.getConstructor(String::class.java).newInstance(path)
+                    cls.getConstructor(String::class.java, String::class.java).newInstance(path, tok)
                 }
             }
-            // load()
             try { cls.getMethod("load").invoke(m) } catch (_: Throwable) {}
             module = m; loadedId = modelId
             m
@@ -64,10 +97,8 @@ object LocalAiEngine {
 
     private fun runGenerate(mod: Any, prompt: String): String? {
         return try {
-            val cls = mod.javaClass
+            val cbCls = callbackClass() ?: return null
             val sb = StringBuilder()
-            // Callback-интерфейс LlmCallback: onResult(String), onStats(...)
-            val cbCls = Class.forName("org.pytorch.executorch.LlmCallback")
             val handler = java.lang.reflect.Proxy.newProxyInstance(
                 cbCls.classLoader, arrayOf(cbCls)
             ) { _, method, args ->
@@ -76,11 +107,15 @@ object LocalAiEngine {
                 }
                 null
             }
-            // generate(prompt, seqLen, callback, echo)
-            val gen = cls.methods.firstOrNull { it.name == "generate" }
+            val cls = mod.javaClass
+            // generate(prompt, seqLen, callback) — основной вариант
+            val gen = cls.methods.firstOrNull {
+                it.name == "generate" && it.parameterTypes.size == 3 &&
+                it.parameterTypes[0] == String::class.java
+            } ?: cls.methods.firstOrNull { it.name == "generate" }
             when (gen?.parameterTypes?.size) {
-                4 -> gen.invoke(mod, prompt, 512, handler, false)
                 3 -> gen.invoke(mod, prompt, 512, handler)
+                4 -> gen.invoke(mod, prompt, 512, handler, false)
                 2 -> gen.invoke(mod, prompt, handler)
                 else -> return null
             }
@@ -89,12 +124,12 @@ object LocalAiEngine {
     }
 
     private fun buildPrompt(system: String, user: String): String =
-        "<|system|>\n$system\n<|user|>\n$user\n<|assistant|>\n"
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n$system<|eot_id|>" +
+        "<|start_header_id|>user<|end_header_id|>\n$user<|eot_id|>" +
+        "<|start_header_id|>assistant<|end_header_id|>\n"
 
     private fun releaseCurrent() {
-        try {
-            module?.let { m -> m.javaClass.getMethod("resetNative").invoke(m) }
-        } catch (_: Throwable) {}
+        try { module?.let { m -> m.javaClass.getMethod("resetNative").invoke(m) } } catch (_: Throwable) {}
         module = null; loadedId = null
     }
 }

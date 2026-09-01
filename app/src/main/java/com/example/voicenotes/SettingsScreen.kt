@@ -297,6 +297,9 @@ fun SettingsScreen(
                             Text(if (localReady) "Модель ИИ скачана" else "Скачать модель ИИ",
                                 color = Color.White, fontSize = 13.sp)
                         }
+                        Spacer(Modifier.height(6.dp))
+                        Text("Состояние локального ИИ: ${LocalAiEngine.lastStatus}",
+                            fontSize = 10.sp, color = cs.onSurfaceVariant)
                     }
 
                     SectionTitle("Обработка текста")

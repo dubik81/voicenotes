@@ -238,6 +238,9 @@ fun EditorScreen(
     var whisperDownload by remember { mutableStateOf(-1) }
     var aiRunning by remember { mutableStateOf(false) }
     var whisperText by remember { mutableStateOf<String?>(null) }  // второй текст от Whisper
+    var voskRerunning by remember { mutableStateOf(false) }        // идёт перераспознавание Vosk
+    // Индикатор в углу: "vosk"/"whisper"/"ai-cloud"/"ai-local"/"" — что сейчас работает.
+    var cornerIndicator by remember { mutableStateOf("") }
 
     LaunchedEffect(isListening, settings.pauseSeconds) {
         val pauseMs = settings.pauseSeconds * 1000L
@@ -282,6 +285,41 @@ fun EditorScreen(
     }
 
     // Ансамбль Vosk+Whisper → ИИ собирает лучший текст → обработка вариантов.
+    // «Обновить» — работает по контексту текущей кнопки:
+    // Дословно+офлайн → перераспознать аудио (Vosk+Whisper).
+    // Смыслы → переосмыслить текущий текст (локальный или облачный ИИ).
+    fun updateCurrent() {
+        if (level == Level.VERBATIM) {
+            val path = note.audioPath ?: return
+            if (note.recordMode == "google" || !File(path).exists()) return
+            voskRerunning = true; cornerIndicator = "vosk"
+            scope.launch {
+                try {
+                    val model = VoskHolder.getModel(context)
+                    val better = RecognitionEnsemble.refine(model, File(path), thorough = true)
+                    if (!better.isNullOrBlank()) {
+                        original = better; note.original = Punctuator.punctuate(better)
+                    }
+                    cornerIndicator = "whisper"
+                    val wt = WhisperEngine.transcribe(context, path, settings.whisperModel)
+                    if (!wt.isNullOrBlank()) whisperText = wt
+                    note.variants.clear(); processor.reset(note.id)
+                    status = "Дословный текст обновлён"
+                } catch (e: Exception) {
+                    status = "Ошибка: ${e.message}"
+                } finally { voskRerunning = false; cornerIndicator = "" }
+            }
+        } else {
+            if (original.isBlank()) return
+            aiRunning = true
+            cornerIndicator = if (settings.localAi) "ai-local" else "ai-cloud"
+            processor.regenerateOne(note, level, tone) {
+                onChanged(); refreshTick++
+                aiRunning = false; cornerIndicator = ""; status = "Готово"
+            }
+        }
+    }
+
     // Запускается автоматически (если autoAi) или кнопкой «Отправить в ИИ».
     // Отправка ансамбля (Vosk + Whisper) в ИИ: сборка лучшего текста + варианты.
     // Whisper-текст уже получен функцией runWhisper. По кнопке ✨ или авто.
@@ -289,6 +327,7 @@ fun EditorScreen(
         if (original.isBlank()) return
         val voskText = original
         aiRunning = true
+        cornerIndicator = if (settings.localAi) "ai-local" else "ai-cloud"
         scope.launch {
             try {
                 var assembled = voskText
@@ -319,7 +358,7 @@ fun EditorScreen(
                 status = "Готово"
             } catch (e: Exception) {
                 status = "Ошибка: ${e.message}"
-            } finally { aiRunning = false }
+            } finally { aiRunning = false; cornerIndicator = "" }
         }
     }
 
@@ -537,12 +576,6 @@ fun EditorScreen(
                                 leadingIcon = { Icon(Icons.Filled.Description, null) },
                                 onClick = { showMenu = false; doExportWord() })
                         }
-                        if (note.recordMode != "google" && note.audioPath != null) {
-                            DropdownMenuItem(
-                                text = { Text("Обновить текст из аудио") },
-                                leadingIcon = { Icon(Icons.Filled.Refresh, null) },
-                                onClick = { showMenu = false; doUpdateText() })
-                        }
                         DropdownMenuItem(
                             text = { Text("Информация") },
                             leadingIcon = { Icon(Icons.Filled.Info, null) },
@@ -615,9 +648,17 @@ fun EditorScreen(
                         }
                     }
                     }
-                    // Мигающая пиктограмма Whisper — текст сейчас улучшится.
-                    if (whisperRunning) {
-                        val blink = rememberInfiniteTransition(label = "wh")
+                    // Индикатор в правом верхнем углу: что сейчас работает.
+                    val indText = when {
+                        cornerIndicator == "vosk" -> "✦ Vosk"
+                        cornerIndicator == "whisper" || whisperRunning ->
+                            if (whisperDownload in 0..99) "⬇ ${whisperDownload}%" else "✦ Whisper"
+                        cornerIndicator == "ai-cloud" -> "✦ ИИ (облако)"
+                        cornerIndicator == "ai-local" -> "✦ ИИ (на устройстве)"
+                        else -> ""
+                    }
+                    if (indText.isNotBlank()) {
+                        val blink = rememberInfiniteTransition(label = "ind")
                         val a by blink.animateFloat(
                             initialValue = 0.3f, targetValue = 1f,
                             animationSpec = infiniteRepeatable(
@@ -626,51 +667,43 @@ fun EditorScreen(
                             Modifier.align(Alignment.TopEnd).padding(12.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                if (whisperDownload in 0..99) "⬇ ${whisperDownload}%" else "✦ Whisper",
-                                color = Palette.Amber.copy(alpha = a),
-                                fontSize = 12.sp, fontWeight = FontWeight.Bold
-                            )
+                            Text(indText, color = Palette.Amber.copy(alpha = a),
+                                fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
                     }
-                    // Кнопки в правом нижнем углу поля: [‹↻›] [✨ ИИ] [🎤 запись]
+                    // Готовы ли смыслы (хоть один вариант CLEAN/BRIEF/GIST)?
+                    val smyslyReady = Level.entries.any { l ->
+                        l != Level.VERBATIM && note.getVariant(l, tone) != null
+                    }
+                    // Показывать ли «Обновить» в текущем контексте.
+                    val showUpdate = when {
+                        level == Level.VERBATIM -> note.recordMode != "google" &&
+                                note.audioPath != null && File(note.audioPath!!).exists()
+                        else -> smyslyReady && settings.useAI
+                    }
+                    val showAiBtn = !showUpdate && original.isNotBlank() && settings.useAI &&
+                            !settings.autoAi && !smyslyReady
+
                     Row(
                         Modifier.align(Alignment.BottomEnd).padding(12.dp),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // «Другой вариант» — три части: ‹ назад · ↻ генерация · вперёд ›
-                        if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI) {
-                            var regenerating by remember(note.id, levelIdx, toneIdx) { mutableStateOf(false) }
-                            Surface(
-                                color = Palette.Ink, shape = RoundedCornerShape(16.dp),
-                                shadowElevation = 6.dp,
-                                modifier = Modifier.height(56.dp)
-                            ) {
+                        // Стрелки истории версий (в смыслах, если есть история)
+                        if (level != Level.VERBATIM && shown.isNotBlank() && settings.useAI &&
+                            (note.canGoBack(level, tone) || note.canGoForward(level, tone))) {
+                            Surface(color = Palette.Ink, shape = RoundedCornerShape(16.dp),
+                                shadowElevation = 6.dp, modifier = Modifier.height(56.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    // назад
-                                    Box(Modifier.size(width = 34.dp, height = 56.dp)
-                                        .clickable(enabled = note.canGoBack(level, tone) && !regenerating) {
+                                    Box(Modifier.size(width = 40.dp, height = 56.dp)
+                                        .clickable(enabled = note.canGoBack(level, tone)) {
                                             note.goBack(level, tone); onChanged(); refreshTick++ },
                                         contentAlignment = Alignment.Center) {
                                         Icon(Icons.Filled.ChevronLeft, "Назад",
                                             tint = if (note.canGoBack(level, tone)) Color.White else Color.White.copy(alpha = 0.3f))
                                     }
-                                    // генерация (центр, чуть шире)
-                                    Box(Modifier.size(width = 48.dp, height = 56.dp)
-                                        .clickable(enabled = !regenerating) {
-                                            regenerating = true
-                                            processor.regenerateOne(note, level, tone) {
-                                                onChanged(); refreshTick++; regenerating = false
-                                            } },
-                                        contentAlignment = Alignment.Center) {
-                                        Icon(Icons.Filled.Autorenew,
-                                            if (regenerating) "Генерирую" else "Другой вариант",
-                                            tint = Color.White)
-                                    }
-                                    // вперёд
-                                    Box(Modifier.size(width = 34.dp, height = 56.dp)
-                                        .clickable(enabled = note.canGoForward(level, tone) && !regenerating) {
+                                    Box(Modifier.size(width = 40.dp, height = 56.dp)
+                                        .clickable(enabled = note.canGoForward(level, tone)) {
                                             note.goForward(level, tone); onChanged(); refreshTick++ },
                                         contentAlignment = Alignment.Center) {
                                         Icon(Icons.Filled.ChevronRight, "Вперёд",
@@ -679,8 +712,17 @@ fun EditorScreen(
                                 }
                             }
                         }
-                        // «Отправить в ИИ» — только в ручном режиме (если авто — кнопки нет)
-                        if (original.isNotBlank() && settings.useAI && !settings.autoAi) {
+                        // «Обновить» — переосмыслить/перераспознать текущее (переливается при работе)
+                        if (showUpdate) {
+                            val busy = aiRunning || voskRerunning
+                            FloatingActionButton(
+                                onClick = { if (!busy) updateCurrent() },
+                                containerColor = if (busy) Palette.Amber else Palette.Ink,
+                                contentColor = Color.White
+                            ) { Icon(Icons.Filled.Autorenew, "Обновить") }
+                        }
+                        // «ИИ» — запустить первичную обработку (только если смыслов ещё нет)
+                        if (showAiBtn) {
                             FloatingActionButton(
                                 onClick = { if (!aiRunning) sendToAi() },
                                 containerColor = Palette.Amber,

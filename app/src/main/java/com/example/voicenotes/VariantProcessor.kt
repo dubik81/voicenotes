@@ -146,6 +146,8 @@ class VariantProcessor(
                             processLectureRouted(note.original)
                         else
                             processAllRouted(note.original)
+                        // Умный заголовок стенограммы от ИИ.
+                        all["TITLE"]?.takeIf { it.isNotBlank() }?.let { note.title = it }
                         for ((l, t) in combos) {
                             val key = "${l.ordinal}:${t.ordinal}"
                             val text = all[key]
