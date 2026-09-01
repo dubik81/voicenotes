@@ -73,54 +73,87 @@ object LocalAiEngine {
             if (module != null && loadedId == modelId) return module
             releaseCurrent()
             val cls = moduleClass() ?: return null
+            // Логируем доступные конструкторы.
+            Diagnostics.info("Конструкторы LlmModule: ${cls.constructors.joinToString { c -> "(${c.parameterTypes.joinToString{p->p.simpleName}})" }}")
             val path = LocalAiModelManager.modelFile(context, modelId).absolutePath
             val tok = LocalAiModelManager.tokenizerFile(context).absolutePath
-            // конструктор (modelPath, tokenizerPath, temperature)
             val m = try {
                 cls.getConstructor(String::class.java, String::class.java, Float::class.javaPrimitiveType)
-                    .newInstance(path, tok, 0.3f)
+                    .newInstance(path, tok, 0.3f).also { Diagnostics.info("Конструктор: (model,tok,temp)") }
             } catch (_: Throwable) {
                 try {
-                    // (modelType:Int, modelPath, tokenizerPath, temperature)
                     cls.getConstructor(Int::class.javaPrimitiveType, String::class.java,
                         String::class.java, Float::class.javaPrimitiveType)
-                        .newInstance(1, path, tok, 0.3f)
+                        .newInstance(1, path, tok, 0.3f).also { Diagnostics.info("Конструктор: (int,model,tok,temp)") }
                 } catch (_: Throwable) {
                     cls.getConstructor(String::class.java, String::class.java).newInstance(path, tok)
+                        .also { Diagnostics.info("Конструктор: (model,tok)") }
                 }
             }
-            try { cls.getMethod("load").invoke(m) } catch (_: Throwable) {}
+            val loadRet = try {
+                val r = cls.getMethod("load").invoke(m)
+                Diagnostics.event("load() вернул: $r")
+                r
+            } catch (e: Throwable) { Diagnostics.error("load() исключение: ${e.message?.take(60)}"); null }
             module = m; loadedId = modelId
             m
-        } catch (e: Throwable) { null }
+        } catch (e: Throwable) {
+            Diagnostics.error("loadModule исключение: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+            null
+        }
     }
 
     private fun runGenerate(mod: Any, prompt: String): String? {
         return try {
-            val cbCls = callbackClass() ?: return null
+            val cls = mod.javaClass
+            // Логируем ВСЕ методы generate с сигнатурами.
+            val genMethods = cls.methods.filter { it.name == "generate" }
+            Diagnostics.info("Методы generate (${genMethods.size}):")
+            genMethods.forEach { m ->
+                Diagnostics.info("  generate(${m.parameterTypes.joinToString { it.simpleName }}) → ${m.returnType.simpleName}")
+            }
+            val cbCls = callbackClass()
+            if (cbCls == null) { Diagnostics.error("Callback-класс не найден"); return null }
+            // Логируем методы callback-интерфейса.
+            Diagnostics.info("Методы Callback: ${cbCls.methods.joinToString { "${it.name}(${it.parameterTypes.joinToString{p->p.simpleName}})" }}")
+
             val sb = StringBuilder()
+            var callbackCalls = 0
+            val calledMethods = mutableSetOf<String>()
             val handler = java.lang.reflect.Proxy.newProxyInstance(
                 cbCls.classLoader, arrayOf(cbCls)
             ) { _, method, args ->
-                if (method.name == "onResult" && args != null && args.isNotEmpty()) {
-                    sb.append(args[0] as? String ?: "")
-                }
-                null
+                callbackCalls++
+                calledMethods.add(method.name)
+                // собираем текст из любого строкового аргумента (не только onResult)
+                if (args != null) for (a in args) if (a is String) sb.append(a)
+                if (method.returnType == Boolean::class.javaPrimitiveType ||
+                    method.returnType == java.lang.Boolean.TYPE) false else null
             }
-            val cls = mod.javaClass
-            // generate(prompt, seqLen, callback) — основной вариант
-            val gen = cls.methods.firstOrNull {
-                it.name == "generate" && it.parameterTypes.size == 3 &&
-                it.parameterTypes[0] == String::class.java
-            } ?: cls.methods.firstOrNull { it.name == "generate" }
-            when (gen?.parameterTypes?.size) {
+
+            val gen = genMethods.firstOrNull {
+                it.parameterTypes.size == 3 && it.parameterTypes[0] == String::class.java
+            } ?: genMethods.firstOrNull()
+            if (gen == null) { Diagnostics.error("Метод generate не найден"); return null }
+
+            Diagnostics.event("Вызываю generate (${gen.parameterTypes.size} параметров), длина промпта=${prompt.length}")
+            val ret = when (gen.parameterTypes.size) {
                 3 -> gen.invoke(mod, prompt, 256, handler)
                 4 -> gen.invoke(mod, prompt, 256, handler, false)
                 2 -> gen.invoke(mod, prompt, handler)
-                else -> return null
+                else -> { Diagnostics.error("generate: неожиданное число параметров ${gen.parameterTypes.size}"); return null }
             }
-            sb.toString().trim().ifBlank { null }
-        } catch (e: Throwable) { null }
+            Diagnostics.event("generate вернул: $ret; callback вызван $callbackCalls раз; методы=[${calledMethods.joinToString()}]; собрано символов=${sb.length}")
+
+            sb.toString().trim().ifBlank {
+                Diagnostics.error("Генерация пуста: callback=$callbackCalls, методы=[${calledMethods.joinToString()}]")
+                null
+            }
+        } catch (e: Throwable) {
+            Diagnostics.error("runGenerate исключение: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+            lastStatus = "ошибка генерации: ${e.message?.take(40)}"
+            null
+        }
     }
 
     /**
