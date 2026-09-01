@@ -131,19 +131,38 @@ object LocalAiEngine {
                     method.returnType == java.lang.Boolean.TYPE) false else null
             }
 
-            val gen = genMethods.firstOrNull {
-                it.parameterTypes.size == 3 && it.parameterTypes[0] == String::class.java
-            } ?: genMethods.firstOrNull()
-            if (gen == null) { Diagnostics.error("Метод generate не найден"); return null }
-
-            Diagnostics.event("Вызываю generate (${gen.parameterTypes.size} параметров), длина промпта=${prompt.length}")
-            val ret = when (gen.parameterTypes.size) {
-                3 -> gen.invoke(mod, prompt, 256, handler)
-                4 -> gen.invoke(mod, prompt, 256, handler, false)
-                2 -> gen.invoke(mod, prompt, handler)
-                else -> { Diagnostics.error("generate: неожиданное число параметров ${gen.parameterTypes.size}"); return null }
+            val gen3config = genMethods.firstOrNull {
+                it.parameterTypes.size == 3 &&
+                it.parameterTypes[0] == String::class.java &&
+                it.parameterTypes[1].simpleName == "LlmGenerationConfig"
             }
-            Diagnostics.event("generate вернул: $ret; callback вызван $callbackCalls раз; методы=[${calledMethods.joinToString()}]; собрано символов=${sb.length}")
+            Diagnostics.event("Вызываю generate, длина промпта=${prompt.length}")
+            val ret: Any? = try {
+                if (gen3config != null) {
+                    // Правильный современный вызов: generate(prompt, config, callback).
+                    val cfgCls = gen3config.parameterTypes[1]
+                    val cfg = buildGenConfig(cfgCls)
+                    Diagnostics.info("Использую generate(String, LlmGenerationConfig, LlmCallback), config=${if (cfg!=null) "создан" else "null"}")
+                    gen3config.invoke(mod, prompt, cfg, handler)
+                } else {
+                    // запасные сигнатуры
+                    val gen = genMethods.firstOrNull {
+                        it.parameterTypes.size == 3 && it.parameterTypes[0] == String::class.java &&
+                        it.parameterTypes[1] == Int::class.javaPrimitiveType
+                    } ?: genMethods.firstOrNull()
+                    if (gen == null) { Diagnostics.error("generate не найден"); return null }
+                    when (gen.parameterTypes.size) {
+                        3 -> gen.invoke(mod, prompt, 256, handler)
+                        4 -> gen.invoke(mod, prompt, 256, handler, false)
+                        2 -> gen.invoke(mod, prompt, handler)
+                        else -> return null
+                    }
+                }
+            } catch (e: java.lang.reflect.InvocationTargetException) {
+                Diagnostics.error("generate нативная ошибка: ${e.targetException?.javaClass?.simpleName}: ${e.targetException?.message?.take(80)}")
+                return null
+            }
+            Diagnostics.event("generate вернул: $ret; callback вызван $callbackCalls раз; методы=[${calledMethods.joinToString()}]; собрано=${sb.length}")
 
             sb.toString().trim().ifBlank {
                 Diagnostics.error("Генерация пуста: callback=$callbackCalls, методы=[${calledMethods.joinToString()}]")
@@ -196,6 +215,37 @@ object LocalAiEngine {
         lastStatus = if (genOk) "работает" else "генерация пустая"
         Diagnostics.info("САМОПРОВЕРКА локального ИИ:\n${sb}")
         sb.toString()
+    }
+
+    // Создаёт LlmGenerationConfig. У ExecuTorch обычно Builder-паттерн.
+    private fun buildGenConfig(cfgCls: Class<*>): Any? {
+        return try {
+            // Логируем конструкторы и вложенные классы конфига.
+            Diagnostics.info("Config конструкторы: ${cfgCls.constructors.joinToString { c -> "(${c.parameterTypes.joinToString{p->p.simpleName}})" }}")
+            val builderCls = cfgCls.classes.firstOrNull { it.simpleName == "Builder" }
+            if (builderCls != null) {
+                Diagnostics.info("Config.Builder найден")
+                val builder = builderCls.getConstructor().newInstance()
+                // пробуем задать seqLen и temperature, если есть сеттеры
+                builderCls.methods.forEach { m ->
+                    try {
+                        when {
+                            m.name.contains("eqLen", true) && m.parameterTypes.size == 1 ->
+                                m.invoke(builder, 256)
+                            m.name.contains("emperature", true) && m.parameterTypes.size == 1 ->
+                                m.invoke(builder, 0.3f)
+                        }
+                    } catch (_: Throwable) {}
+                }
+                val build = builderCls.getMethod("build")
+                return build.invoke(builder)
+            }
+            // без Builder — пробуем пустой конструктор
+            cfgCls.getConstructor().newInstance()
+        } catch (e: Throwable) {
+            Diagnostics.error("buildGenConfig: ${e.message?.take(60)}")
+            null
+        }
     }
 
     // Простой промпт БЕЗ спецтокенов — токенизатор Llama сам добавит служебное.
