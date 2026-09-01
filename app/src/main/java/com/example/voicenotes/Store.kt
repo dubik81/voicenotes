@@ -73,7 +73,7 @@ class Settings(context: Context) {
         get() = prefs.getBoolean("local_ai", false)
         set(v) = prefs.edit().putBoolean("local_ai", v).apply()
 
-    /** Модель локального ИИ: "small"/"medium"/"gemma". */
+    /** Модель локального ИИ: "small"/"qlora"/"bf16". */
     var localAiModel: String
         get() = prefs.getString("local_ai_model", "small") ?: "small"
         set(v) = prefs.edit().putString("local_ai_model", v).apply()

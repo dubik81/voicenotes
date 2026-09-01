@@ -38,11 +38,23 @@ object LocalAiEngine {
             if (module != null && loadedId == modelId) return module
             releaseCurrent()
             val path = LocalAiModelManager.modelFile(context, modelId).absolutePath
-            // ExecuTorch LlmModule грузит .pte-модель. Через рефлексию, чтобы не падала
-            // сборка, если точное имя класса иное — тогда просто вернём null.
+            val tokenizer = LocalAiModelManager.tokenizerFile(context).absolutePath
+            // ExecuTorch LlmModule грузит .pte-модель + токенизатор. Через рефлексию,
+            // чтобы не падала сборка, если сигнатура иная — тогда вернём null.
             val cls = Class.forName("org.pytorch.executorch.LlmModule")
-            val ctor = cls.getConstructor(String::class.java)
-            val m = ctor.newInstance(path)
+            val m = try {
+                // вариант с (modelPath, tokenizerPath, temperature)
+                cls.getConstructor(String::class.java, String::class.java, Float::class.javaPrimitiveType)
+                    .newInstance(path, tokenizer, 0.3f)
+            } catch (_: Throwable) {
+                try {
+                    // вариант с (modelPath, tokenizerPath)
+                    cls.getConstructor(String::class.java, String::class.java).newInstance(path, tokenizer)
+                } catch (_: Throwable) {
+                    // вариант только (modelPath)
+                    cls.getConstructor(String::class.java).newInstance(path)
+                }
+            }
             // load()
             try { cls.getMethod("load").invoke(m) } catch (_: Throwable) {}
             module = m; loadedId = modelId

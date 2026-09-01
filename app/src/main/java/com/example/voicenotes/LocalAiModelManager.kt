@@ -14,19 +14,28 @@ object LocalAiModelManager {
 
     data class ModelInfo(val id: String, val fileName: String, val url: String, val sizeMb: Int, val label: String)
 
-    // Компактные модели, дружелюбные к русскому, в формате ExecuTorch (.pte).
-    // Ссылки указывают на community-сборки ExecuTorch на Hugging Face.
+    // Реальные модели ExecuTorch (.pte) из officiального executorch-community.
+    // Квантованные INT4 — компактные, подходят для телефона.
     val MODELS = mapOf(
-        "small" to ModelInfo("small", "llama32-1b.pte",
-            "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-ET/resolve/main/llama3_2-1B.pte",
-            1200, "Малая 1B (~1.2 ГБ, быстрая)"),
-        "medium" to ModelInfo("medium", "llama32-3b.pte",
-            "https://huggingface.co/executorch-community/Llama-3.2-3B-Instruct-ET/resolve/main/llama3_2-3B.pte",
-            3200, "Средняя 3B (~3.2 ГБ, умнее)"),
-        "gemma" to ModelInfo("gemma", "gemma2-2b.pte",
-            "https://huggingface.co/executorch-community/gemma-2-2b-ET/resolve/main/gemma2-2B.pte",
-            2500, "Gemma 2B (~2.5 ГБ, баланс)")
+        "small" to ModelInfo("small", "llama-1b-int4.pte",
+            "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8-ET/resolve/main/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8.pte",
+            1100, "Малая 1B (~1.1 ГБ, быстрая)"),
+        "qlora" to ModelInfo("qlora", "llama-1b-qlora.pte",
+            "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-QLORA_INT4_EO8-ET/resolve/main/Llama-3.2-1B-Instruct-QLORA_INT4_EO8.pte",
+            1100, "Малая 1B QLoRA (~1.1 ГБ, точнее)"),
+        "bf16" to ModelInfo("bf16", "llama-1b-bf16.pte",
+            "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-ET/resolve/main/Llama-3.2-1B-Instruct.pte",
+            2500, "Полная 1B (~2.5 ГБ, качество)")
     )
+
+    // Токенизатор (нужен вместе с моделью для работы).
+    const val TOKENIZER_URL =
+        "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8-ET/resolve/main/tokenizer.model"
+
+    fun tokenizerFile(context: Context): File {
+        val dir = File(context.filesDir, "localai").apply { mkdirs() }
+        return File(dir, "tokenizer.model")
+    }
 
     fun modelFile(context: Context, modelId: String): File {
         val info = MODELS[modelId] ?: MODELS["small"]!!
@@ -64,6 +73,19 @@ object LocalAiModelManager {
         conn.disconnect()
         if (tmp.length() < 100_000_000) { tmp.delete(); throw RuntimeException("Модель скачалась не полностью") }
         tmp.renameTo(target)
+        // Скачиваем токенизатор (нужен для работы модели), если ещё нет.
+        val tok = tokenizerFile(context)
+        if (!tok.exists() || tok.length() < 1000) {
+            try {
+                val tc = (URL(TOKENIZER_URL).openConnection() as HttpURLConnection).apply {
+                    connectTimeout = 20000; readTimeout = 60000; instanceFollowRedirects = true
+                }
+                if (tc.responseCode in 200..299) {
+                    tc.inputStream.use { inp -> tok.outputStream().use { it.write(inp.readBytes()) } }
+                }
+                tc.disconnect()
+            } catch (_: Exception) { /* токенизатор опционален для скачивания, проверим при запуске */ }
+        }
         onProgress(100)
     }
 }
