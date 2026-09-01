@@ -123,7 +123,46 @@ object LocalAiEngine {
         } catch (e: Throwable) { null }
     }
 
-    private fun buildPrompt(system: String, user: String): String =
+    /**
+     * Самопроверка: прогоняет простой тест и возвращает подробный отчёт,
+     * что именно работает или где сломалось. Для диагностики на устройстве.
+     */
+    suspend fun selfTest(context: Context, modelId: String): String = withContext(Dispatchers.IO) {
+        val sb = StringBuilder()
+        sb.append("Проверка локального ИИ:\n")
+        // 1. модель скачана?
+        val ready = LocalAiModelManager.isReady(context, modelId)
+        sb.append("1. Модель скачана: ${if (ready) "да" else "НЕТ"}\n")
+        if (!ready) { sb.append("→ Скачайте модель."); return@withContext sb.toString() }
+        // 2. токенизатор есть?
+        val tok = LocalAiModelManager.tokenizerFile(context)
+        sb.append("2. Токенизатор: ${if (tok.exists() && tok.length() > 1000) "есть (${tok.length()} б)" else "НЕТ или пустой"}\n")
+        // 3. класс движка найден?
+        val cls = moduleClass()
+        sb.append("3. Класс ExecuTorch: ${if (cls != null) "найден (${cls.name})" else "НЕ НАЙДЕН"}\n")
+        if (cls == null) { sb.append("→ Библиотека ExecuTorch не подключилась."); return@withContext sb.toString() }
+        val cb = callbackClass()
+        sb.append("4. Класс Callback: ${if (cb != null) "найден" else "НЕ НАЙДЕН"}\n")
+        // 5. модель грузится?
+        val t0 = System.currentTimeMillis()
+        val mod = loadModule(context, modelId)
+        sb.append("5. Загрузка модели: ${if (mod != null) "успех (${System.currentTimeMillis()-t0} мс)" else "ПРОВАЛ"}\n")
+        if (mod == null) { sb.append("→ Модель не загрузилась (проверьте формат .pte и нативные библиотеки)."); return@withContext sb.toString() }
+        // 6. генерация?
+        val t1 = System.currentTimeMillis()
+        val out = runGenerate(mod, buildPrompt("Ответь одним словом.", "Скажи: привет"))
+        val genOk = !out.isNullOrBlank()
+        val genTime = System.currentTimeMillis() - t1
+        if (genOk) {
+            sb.append("6. Генерация: РАБОТАЕТ ($genTime мс)\n")
+            sb.append("   ответ: ").append(out!!.take(60)).append("\n")
+        } else {
+            sb.append("6. Генерация: пустой результат\n")
+        }
+        sb.append("\nИтог: ").append(if (genOk) "OK Локальный ИИ работает!" else "Модель грузится, но не генерирует.")
+        lastStatus = if (genOk) "работает" else "генерация пустая"
+        sb.toString()
+    }
         "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n$system<|eot_id|>" +
         "<|start_header_id|>user<|end_header_id|>\n$user<|eot_id|>" +
         "<|start_header_id|>assistant<|end_header_id|>\n"

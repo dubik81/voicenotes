@@ -84,6 +84,10 @@ object NoteExporter {
                     }
                 }
             }
+            // Диагностический лог («чёрный ящик») — для отладки.
+            zos.putNextEntry(ZipEntry("diagnostics.txt"))
+            zos.write(Diagnostics.dump().toByteArray(Charsets.UTF_8))
+            zos.closeEntry()
         }
         return zipFile
     }

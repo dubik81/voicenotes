@@ -300,6 +300,28 @@ fun SettingsScreen(
                         Spacer(Modifier.height(6.dp))
                         Text("Состояние локального ИИ: ${LocalAiEngine.lastStatus}",
                             fontSize = 10.sp, color = cs.onSurfaceVariant)
+                        Spacer(Modifier.height(6.dp))
+                        var testReport by remember { mutableStateOf("") }
+                        var testing by remember { mutableStateOf(false) }
+                        OutlinedButton(
+                            onClick = {
+                                testing = true; testReport = "Проверяю…"
+                                appScope.launch {
+                                    testReport = LocalAiEngine.selfTest(context, localAiModel)
+                                    testing = false
+                                }
+                            },
+                            enabled = !testing && localReady,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("🔍 Проверить локальный ИИ", fontSize = 13.sp) }
+                        if (testReport.isNotBlank()) {
+                            Spacer(Modifier.height(6.dp))
+                            Text(testReport, fontSize = 10.sp, color = cs.onSurface,
+                                modifier = Modifier.fillMaxWidth()
+                                    .background(cs.surfaceVariant.copy(alpha = 0.4f), RoundedCornerShape(8.dp))
+                                    .padding(8.dp))
+                        }
                     }
 
                     SectionTitle("Обработка текста")

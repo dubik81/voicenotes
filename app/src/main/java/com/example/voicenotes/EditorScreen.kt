@@ -289,6 +289,7 @@ fun EditorScreen(
     // Дословно+офлайн → перераспознать аудио (Vosk+Whisper).
     // Смыслы → переосмыслить текущий текст (локальный или облачный ИИ).
     fun updateCurrent() {
+        Diagnostics.action("Кнопка Обновить (уровень=${level.name})")
         if (level == Level.VERBATIM) {
             val path = note.audioPath ?: return
             if (note.recordMode == "google" || !File(path).exists()) return
@@ -325,6 +326,7 @@ fun EditorScreen(
     // Whisper-текст уже получен функцией runWhisper. По кнопке ✨ или авто.
     fun sendToAi() {
         if (original.isBlank()) return
+        Diagnostics.action("Кнопка ИИ / автозапуск (движок смысла=${if (settings.localAi) "локальный" else "облачный"})")
         val voskText = original
         aiRunning = true
         cornerIndicator = if (settings.localAi) "ai-local" else "ai-cloud"
@@ -386,7 +388,8 @@ fun EditorScreen(
                 if (!wt.isNullOrBlank()) {
                     whisperText = wt
                     status = "Whisper готов"
-                } else status = "Whisper не распознал"
+                    Diagnostics.event("Whisper распознал: ${wt.length} символов")
+                } else { status = "Whisper не распознал"; Diagnostics.event("Whisper: пусто") }
             } catch (e: Exception) {
                 status = "Whisper: ${e.message}"
                 whisperDownload = -1
@@ -405,16 +408,20 @@ fun EditorScreen(
     }
 
     fun startRecording() {
+        Diagnostics.action("Запись СТАРТ (режим=${if (isOnline) "онлайн/Google" else "офлайн/Vosk"})")
         val useOffline = !isOnline
         if (useOffline) startVosk() else startListening()
     }
     fun stopRecording() {
+        Diagnostics.action("Запись СТОП (символов=${original.length})")
         val useOffline = !isOnline
         if (useOffline) stopVosk() else stopListening()
     }
 
     fun doExportZip() {
         try {
+            Diagnostics.snapshot(context, settings)
+            Diagnostics.action("Экспорт заметки (zip)")
             val file = NoteExporter.exportFull(context, note)
             val uri = androidx.core.content.FileProvider.getUriForFile(
                 context, "${context.packageName}.fileprovider", file)
@@ -603,16 +610,16 @@ fun EditorScreen(
                     Text("Речь", fontSize = 11.sp, color = cs.onSurfaceVariant)
                     SegOffOn(
                         offSelected = !isOnline,
-                        onOff = { isOnline = false; note.recordMode = if (note.isLecture) "lecture" else "vosk" },
-                        onOn = { isOnline = true; note.recordMode = "google" }
+                        onOff = { isOnline = false; note.recordMode = if (note.isLecture) "lecture" else "vosk"; Diagnostics.action("Речь → Офлайн") },
+                        onOn = { isOnline = true; note.recordMode = "google"; Diagnostics.action("Речь → Онлайн") }
                     )
                     Spacer(Modifier.width(4.dp))
                     // Работа со смыслом: Офлайн (локальный ИИ) / Онлайн (облачный)
                     Text("Смысл", fontSize = 11.sp, color = cs.onSurfaceVariant)
                     SegOffOn(
                         offSelected = localAi,
-                        onOff = { localAi = true; settings.localAi = true },
-                        onOn = { localAi = false; settings.localAi = false }
+                        onOff = { localAi = true; settings.localAi = true; Diagnostics.action("Смысл → Офлайн (локальный ИИ)") },
+                        onOn = { localAi = false; settings.localAi = false; Diagnostics.action("Смысл → Онлайн (облачный ИИ)") }
                     )
                 }
             }

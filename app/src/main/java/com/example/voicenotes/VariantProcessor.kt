@@ -59,18 +59,23 @@ class VariantProcessor(
     // Роутинг: локальный ИИ (если выбран и модель готова) или облачный.
     private suspend fun processAllRouted(text: String): Map<String, String> {
         if (settings.localAi && LocalAiModelManager.isReady(context, settings.localAiModel)) {
+            Diagnostics.engine("Обработка вариантов: пробую ЛОКАЛЬНЫЙ ИИ")
             val res = localProcessAll(text)
-            if (res.isNotEmpty()) return res
-            // локальный не смог — откат на облако
+            if (res.isNotEmpty()) { Diagnostics.engine("Локальный ИИ вернул ${res.size} вариантов"); return res }
+            Diagnostics.engine("Локальный ИИ не смог (${LocalAiEngine.lastStatus}) → откат на облако")
         }
+        Diagnostics.engine("Обработка вариантов: ОБЛАЧНЫЙ ИИ")
         return AiClient.processAll(text, settings.apiKey)
     }
 
     private suspend fun processLectureRouted(text: String): Map<String, String> {
         if (settings.localAi && LocalAiModelManager.isReady(context, settings.localAiModel)) {
+            Diagnostics.engine("Стенограмма: пробую ЛОКАЛЬНЫЙ ИИ")
             val res = localProcessLecture(text)
-            if (res.isNotEmpty()) return res
+            if (res.isNotEmpty()) { Diagnostics.engine("Локальный ИИ (лекция) вернул ${res.size}"); return res }
+            Diagnostics.engine("Локальный ИИ (лекция) не смог (${LocalAiEngine.lastStatus}) → облако")
         }
+        Diagnostics.engine("Стенограмма: ОБЛАЧНЫЙ ИИ")
         return AiClient.processLecture(text, settings.apiKey)
     }
 
@@ -179,6 +184,7 @@ class VariantProcessor(
                             if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.FAILED
                         }
                         lastAiError = e.message ?: "Ошибка ИИ"
+                        Diagnostics.error("ИИ обработка: ${e.message?.take(60)}")
                     }
                     attempt++
                     if (attempt < maxRetries &&
