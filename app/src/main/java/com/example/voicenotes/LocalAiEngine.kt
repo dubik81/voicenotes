@@ -58,7 +58,7 @@ object LocalAiEngine {
             }
         }
 
-    /** Чистит ответ модели: убирает эхо промпта и хвост со статистикой (JSON). */
+    /** Чистит ответ модели: убирает эхо промпта, спецтокены и хвост со статистикой. */
     private fun cleanResponse(raw: String?, fullPrompt: String, system: String, user: String): String? {
         if (raw.isNullOrBlank()) return null
         var t: String = raw
@@ -68,17 +68,19 @@ object LocalAiEngine {
             val idx = t.indexOf(p)
             if (p.isNotBlank() && idx in 0..50) t = t.substring(idx + p.length)
         }
-        // Отрезать ЛЮБОЙ JSON-объект статистики модели. Он содержит "_ms" и токены,
-        // регистр может быть разный (Prompt_tokens / prompt_tokens). Ищем '{"' + признаки.
+        // убрать служебные токены Llama (<|eot_id|>, <|end_of_text|>, заголовки)
+        for (tok in listOf("<|eot_id|>", "<|end_of_text|>", "<|begin_of_text|>",
+                "<|start_header_id|>", "<|end_header_id|>", "assistant", "<|python_tag|>")) {
+            t = t.replace(tok, " ")
+        }
+        // отрезать JSON-статистику (в любом регистре)
         var searchFrom = 0
         while (true) {
             val brace = t.indexOf("{\"", searchFrom)
             if (brace < 0) break
-            val tail = t.substring(brace)
-            val low = tail.lowercase()
-            if (low.contains("_ms\"") || low.contains("_tokens\"") || low.contains("token_ms")) {
-                t = t.substring(0, brace)
-                break
+            val tail = t.substring(brace).lowercase()
+            if (tail.contains("_ms\"") || tail.contains("_tokens\"") || tail.contains("token_ms")) {
+                t = t.substring(0, brace); break
             }
             searchFrom = brace + 2
         }

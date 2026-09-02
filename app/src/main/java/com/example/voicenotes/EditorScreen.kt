@@ -327,11 +327,14 @@ fun EditorScreen(
             }
         } else {
             if (original.isBlank()) return
+            if (aiRunning) return  // уже идёт — не запускаем повторно
             aiRunning = true
             cornerIndicator = if (settings.localAi) "ai-local" else "ai-cloud"
-            processor.regenerateOne(note, level, tone) {
+            Diagnostics.action("Обновить смысл ($level), движок=${if (settings.localAi) "локальный" else "облачный"}")
+            processor.regenerateOne(note, level, tone) { ok ->
                 onChanged(); refreshTick++
-                aiRunning = false; cornerIndicator = ""; status = "Готово"
+                aiRunning = false; cornerIndicator = ""
+                status = if (ok) "Готово" else "ИИ не смог обработать (${processor.lastAiError ?: "?"})"
             }
         }
     }

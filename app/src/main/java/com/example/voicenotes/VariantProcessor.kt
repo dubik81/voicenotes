@@ -223,19 +223,24 @@ class VariantProcessor(
     }
 
     /** Пересчитать ОДИН вариант заново («другой вариант» / не понравился). */
-    fun regenerateOne(note: Note, l: Level, t: Tone, onDone: () -> Unit) {
+    fun regenerateOne(note: Note, l: Level, t: Tone, onDone: (Boolean) -> Unit) {
         if (note.original.isBlank() || l == Level.VERBATIM) return
         scope.launch {
             states[k(note.id, l, t)] = State.RUNNING
+            var ok = false
             try {
                 val text = computeOne(note, l, t, vary = true)
                 note.putVariant(l, t, text)
                 states[k(note.id, l, t)] = State.DONE
                 persist()
+                ok = true
+                Diagnostics.engine("Обновлён вариант ($l): ${text.length} симв")
             } catch (e: Exception) {
                 states[k(note.id, l, t)] = State.FAILED
+                lastAiError = e.message?.take(50)
+                Diagnostics.error("Обновление варианта ($l) не удалось: ${e.message?.take(50)}")
             }
-            onDone()
+            onDone(ok)
         }
     }
 
