@@ -165,24 +165,24 @@ object LocalAiEngine {
             }
 
             Diagnostics.event("Вызываю generate, длина промпта=${prompt.length}")
-            // Пробуем сигнатуры по очереди, пока callback не начнёт отдавать текст.
-            // Порядок: сначала простые (без config), потом с config.
+            // Приоритет: config-вариант (с repetition_penalty против зацикливания),
+            // потом простые сигнатуры как запас.
             val attempts = listOf<Pair<String, () -> Any?>>(
-                "(String, LlmCallback)" to {
-                    genMethods.firstOrNull { it.parameterTypes.size == 2 &&
-                        it.parameterTypes[0] == String::class.java }
-                        ?.invoke(mod, prompt, handler)
-                },
-                "(String, int, LlmCallback, boolean)" to {
-                    genMethods.firstOrNull { it.parameterTypes.size == 4 &&
-                        it.parameterTypes[1] == Int::class.javaPrimitiveType }
-                        ?.invoke(mod, prompt, 256, handler, false)
-                },
                 "(String, LlmGenerationConfig, LlmCallback)" to {
                     val gm = genMethods.firstOrNull { it.parameterTypes.size == 3 &&
                         it.parameterTypes[1].simpleName == "LlmGenerationConfig" }
                     val cfg = gm?.let { buildGenConfig(it.parameterTypes[1]) }
                     if (gm != null && cfg != null) gm.invoke(mod, prompt, cfg, handler) else null
+                },
+                "(String, int, LlmCallback, boolean)" to {
+                    genMethods.firstOrNull { it.parameterTypes.size == 4 &&
+                        it.parameterTypes[1] == Int::class.javaPrimitiveType }
+                        ?.invoke(mod, prompt, 300, handler, false)
+                },
+                "(String, LlmCallback)" to {
+                    genMethods.firstOrNull { it.parameterTypes.size == 2 &&
+                        it.parameterTypes[0] == String::class.java }
+                        ?.invoke(mod, prompt, handler)
                 }
             )
             var ret: Any? = null
@@ -254,41 +254,47 @@ object LocalAiEngine {
         sb.toString()
     }
 
-    // Создаёт LlmGenerationConfig. У ExecuTorch обычно Builder-паттерн.
+    // Создаёт LlmGenerationConfig с параметрами ПРОТИВ зацикливания:
+    // repetition_penalty > 1, temperature ~0.7, ограничение длины.
     private fun buildGenConfig(cfgCls: Class<*>): Any? {
         return try {
-            // Логируем конструкторы и вложенные классы конфига.
-            Diagnostics.info("Config конструкторы: ${cfgCls.constructors.joinToString { c -> "(${c.parameterTypes.joinToString{p->p.simpleName}})" }}")
             val builderCls = cfgCls.classes.firstOrNull { it.simpleName == "Builder" }
-            if (builderCls != null) {
-                Diagnostics.info("Config.Builder найден")
-                val builder = builderCls.getConstructor().newInstance()
-                // пробуем задать seqLen и temperature, если есть сеттеры
-                builderCls.methods.forEach { m ->
-                    try {
-                        when {
-                            m.name.contains("eqLen", true) && m.parameterTypes.size == 1 ->
-                                m.invoke(builder, 256)
-                            m.name.contains("emperature", true) && m.parameterTypes.size == 1 ->
-                                m.invoke(builder, 0.3f)
-                        }
-                    } catch (_: Throwable) {}
-                }
-                val build = builderCls.getMethod("build")
-                return build.invoke(builder)
+                ?: return cfgCls.getConstructor().newInstance()
+            val builder = builderCls.getConstructor().newInstance()
+            // Перебираем сеттеры и задаём нужные параметры по имени.
+            builderCls.methods.forEach { m ->
+                if (m.parameterTypes.size != 1) return@forEach
+                val pt = m.parameterTypes[0]
+                try {
+                    when {
+                        m.name.contains("epetition", true) && (pt == Float::class.javaPrimitiveType || pt == Double::class.javaPrimitiveType) ->
+                            m.invoke(builder, if (pt == Float::class.javaPrimitiveType) 1.3f else 1.3)
+                        m.name.contains("emperature", true) && (pt == Float::class.javaPrimitiveType || pt == Double::class.javaPrimitiveType) ->
+                            m.invoke(builder, if (pt == Float::class.javaPrimitiveType) 0.7f else 0.7)
+                        (m.name.contains("eqLen", true) || m.name.contains("axTokens", true) || m.name.contains("axNewTokens", true)) && pt == Int::class.javaPrimitiveType ->
+                            m.invoke(builder, 300)
+                        m.name.contains("opP", true) && (pt == Float::class.javaPrimitiveType || pt == Double::class.javaPrimitiveType) ->
+                            m.invoke(builder, if (pt == Float::class.javaPrimitiveType) 0.9f else 0.9)
+                        m.name.equals("setEcho", true) && pt == Boolean::class.javaPrimitiveType ->
+                            m.invoke(builder, false)  // не повторять промпт в ответе
+                    }
+                } catch (_: Throwable) {}
             }
-            // без Builder — пробуем пустой конструктор
-            cfgCls.getConstructor().newInstance()
+            val cfg = builderCls.getMethod("build").invoke(builder)
+            Diagnostics.info("Config создан с repetition_penalty=1.3, temp=0.7")
+            cfg
         } catch (e: Throwable) {
-            Diagnostics.error("buildGenConfig: ${e.message?.take(60)}")
+            Diagnostics.error("buildGenConfig: ${e.message?.take(80)}")
             null
         }
     }
 
-    // Простой промпт БЕЗ спецтокенов — токенизатор Llama сам добавит служебное.
-    // Спецтокены в тексте могут ломать генерацию (пустой результат).
+    // Правильный chat-формат Llama 3.2 (instruct). Без этих токенов модель
+    // не понимает структуру диалога и зацикливается.
     private fun buildPrompt(system: String, user: String): String =
-        "$system\n\n$user"
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n" +
+        "$system<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n" +
+        "$user<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
 
     private fun releaseCurrent() {
         try { module?.let { m -> m.javaClass.getMethod("resetNative").invoke(m) } } catch (_: Throwable) {}
