@@ -61,7 +61,7 @@ object LocalAiEngine {
     /** Чистит ответ модели: убирает эхо промпта и хвост со статистикой (JSON). */
     private fun cleanResponse(raw: String?, fullPrompt: String, system: String, user: String): String? {
         if (raw.isNullOrBlank()) return null
-        var t = raw
+        var t: String = raw  // после isNullOrBlank raw гарантированно не null
         // убрать эхо полного промпта / системного / пользовательского текста в начале
         for (p in listOf(fullPrompt, system, user)) {
             if (p.isNotBlank() && t.startsWith(p)) t = t.substring(p.length)
