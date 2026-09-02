@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Help
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Mic
@@ -181,6 +182,7 @@ fun EditorScreen(
     var showMenu by remember { mutableStateOf(false) }
     var showInfo by remember { mutableStateOf(false) }
     var showLegend by remember { mutableStateOf(false) }
+    var showImport by remember { mutableStateOf(false) }
 
     fun buildIntent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -341,13 +343,18 @@ fun EditorScreen(
 
     // Детект галлюцинации локальной модели: зацикливание (повтор фразы 3+ раз).
     fun looksHallucinated(text: String): Boolean {
-        val words = text.split(Regex("\\s+")).filter { it.length > 2 }
-        if (words.size < 8) return false
+        val words = text.split(Regex("\\s+")).filter { it.length > 1 }
+        if (words.size < 6) return false
         val triples = HashMap<String, Int>()
         for (i in 0..words.size - 3) {
             val key = "${words[i]} ${words[i+1]} ${words[i+2]}".lowercase()
-            val c = (triples[key] ?: 0) + 1
-            triples[key] = c
+            val c = (triples[key] ?: 0) + 1; triples[key] = c
+            if (c >= 2) return true
+        }
+        val pairs = HashMap<String, Int>()
+        for (i in 0..words.size - 2) {
+            val key = "${words[i]} ${words[i+1]}".lowercase()
+            val c = (pairs[key] ?: 0) + 1; pairs[key] = c
             if (c >= 3) return true
         }
         return false
@@ -519,6 +526,40 @@ fun EditorScreen(
         )
     }
 
+    if (showImport) {
+        var importText by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showImport = false },
+            title = { Text("Вставить текст") },
+            text = {
+                Column {
+                    Text("Вставьте текст — он попадёт в «Дословно» для обработки ИИ (для отладки промптов).",
+                        fontSize = 12.sp, color = cs.onSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = importText, onValueChange = { importText = it },
+                        modifier = Modifier.fillMaxWidth().height(200.dp),
+                        placeholder = { Text("Текст для теста…") }
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    if (importText.isNotBlank()) {
+                        original = importText.trim()
+                        note.original = importText.trim()
+                        note.variants.clear(); note.history.clear(); note.historyIndex.clear()
+                        processor.reset(note.id)
+                        Diagnostics.action("Импорт текста (${importText.length} симв) для теста")
+                        onChanged()
+                    }
+                    showImport = false
+                }) { Text("Вставить") }
+            },
+            dismissButton = { TextButton(onClick = { showImport = false }) { Text("Отмена") } }
+        )
+    }
+
     if (showLegend) {
         AlertDialog(
             onDismissRequest = { showLegend = false },
@@ -607,6 +648,10 @@ fun EditorScreen(
                         Icon(Icons.Filled.MoreVert, "Меню", tint = Color.White)
                     }
                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                        DropdownMenuItem(
+                            text = { Text("Вставить текст (для теста ИИ)") },
+                            leadingIcon = { Icon(Icons.Filled.Edit, null) },
+                            onClick = { showMenu = false; showImport = true })
                         DropdownMenuItem(
                             text = { Text("Экспорт (текст + аудио)") },
                             leadingIcon = { Icon(Icons.Filled.Archive, null) },

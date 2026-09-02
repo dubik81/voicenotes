@@ -241,7 +241,9 @@ object LocalAiEngine {
         if (mod == null) { sb.append("→ Модель не загрузилась (проверьте формат .pte и нативные библиотеки)."); return@withContext sb.toString() }
         // 6. генерация?
         val t1 = System.currentTimeMillis()
-        val out = runGenerate(mod, buildPrompt("Ответь одним словом.", "Скажи: привет"))
+        val sys = "Ответь одним словом."; val usr = "Скажи: привет"
+        val fp = buildPrompt(sys, usr)
+        val out = cleanResponse(runGenerate(mod, fp), fp, sys, usr)
         val genOk = !out.isNullOrBlank()
         val genTime = System.currentTimeMillis() - t1
         if (genOk) {

@@ -277,13 +277,20 @@ class VariantProcessor(
 
     // Детект зацикливания (галлюцинация локальной модели).
     private fun isLoopy(text: String): Boolean {
-        val words = text.split(Regex("\\s+")).filter { it.length > 2 }
-        if (words.size < 8) return false
+        val words = text.split(Regex("\\s+")).filter { it.length > 1 }
+        if (words.size < 6) return false
+        // повтор 3-словных сочетаний 2+ раза
         val triples = HashMap<String, Int>()
         for (i in 0..words.size - 3) {
             val key = "${words[i]} ${words[i+1]} ${words[i+2]}".lowercase()
-            val c = (triples[key] ?: 0) + 1
-            triples[key] = c
+            val c = (triples[key] ?: 0) + 1; triples[key] = c
+            if (c >= 2) return true
+        }
+        // повтор 2-словных сочетаний 3+ раза
+        val pairs = HashMap<String, Int>()
+        for (i in 0..words.size - 2) {
+            val key = "${words[i]} ${words[i+1]}".lowercase()
+            val c = (pairs[key] ?: 0) + 1; pairs[key] = c
             if (c >= 3) return true
         }
         return false
