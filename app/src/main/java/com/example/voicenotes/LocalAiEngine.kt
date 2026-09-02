@@ -47,13 +47,36 @@ object LocalAiEngine {
                 }
                 val mod = loadModule(context, modelId)
                 if (mod == null) { lastStatus = "модель не загрузилась"; return@withContext null }
-                val res = runGenerate(mod, buildPrompt(systemPrompt, userText))
-                lastStatus = if (res.isNullOrBlank()) "генерация пустая" else "работает"
-                res
+                val fullPrompt = buildPrompt(systemPrompt, userText)
+                val raw = runGenerate(mod, fullPrompt)
+                // Очищаем ответ от эха промпта и JSON-статистики.
+                val cleaned = cleanResponse(raw, fullPrompt, systemPrompt, userText)
+                lastStatus = if (cleaned.isNullOrBlank()) "генерация пустая" else "работает"
+                cleaned
             } catch (e: Throwable) {
                 lastStatus = "ошибка: ${e.message?.take(40)}"; null
             }
         }
+
+    /** Чистит ответ модели: убирает эхо промпта и хвост со статистикой (JSON). */
+    private fun cleanResponse(raw: String?, fullPrompt: String, system: String, user: String): String? {
+        if (raw.isNullOrBlank()) return null
+        var t = raw
+        // убрать эхо полного промпта / системного / пользовательского текста в начале
+        for (p in listOf(fullPrompt, system, user)) {
+            if (p.isNotBlank() && t.startsWith(p)) t = t.substring(p.length)
+            // либо промпт встречается внутри — берём то, что после него
+            val idx = t.indexOf(p)
+            if (p.isNotBlank() && idx in 0..50) t = t.substring(idx + p.length)
+        }
+        // отрезать JSON-статистику (начинается с { "prompt_tokens" ...)
+        val jsonIdx = t.indexOf("{\"prompt_tokens")
+        if (jsonIdx >= 0) t = t.substring(0, jsonIdx)
+        // отрезать любой хвостовой JSON-объект статистики
+        val braceIdx = t.indexOf("{\"")
+        if (braceIdx >= 0 && t.substring(braceIdx).contains("_ms\"")) t = t.substring(0, braceIdx)
+        return t.trim().ifBlank { null }
+    }
 
     private fun moduleClass(): Class<*>? {
         for (name in MODULE_CLASSES) {
@@ -125,8 +148,11 @@ object LocalAiEngine {
             ) { _, method, args ->
                 callbackCalls++
                 calledMethods.add(method.name)
-                // собираем текст из любого строкового аргумента (не только onResult)
-                if (args != null) for (a in args) if (a is String) sb.append(a)
+                // ТОЛЬКО onResult даёт текст ответа. onStats — это JSON-статистика,
+                // её в текст брать нельзя (иначе prompt_tokens... попадёт в заметку).
+                if (method.name == "onResult" && args != null && args.isNotEmpty()) {
+                    (args[0] as? String)?.let { sb.append(it) }
+                }
                 if (method.returnType == Boolean::class.javaPrimitiveType ||
                     method.returnType == java.lang.Boolean.TYPE) false else null
             }

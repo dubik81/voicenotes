@@ -744,20 +744,22 @@ fun EditorScreen(
                                     if (aiRunning) "Обработка…" else "Отправить в ИИ")
                             }
                         }
-                        // Запись
-                        FloatingActionButton(
-                            onClick = {
-                                if (!hasPermission) permLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                                else if (isListening) stopRecording()
-                                else startRecording()
-                            },
-                            containerColor = if (isListening) Palette.Red else Palette.Ink,
-                            contentColor = Color.White
-                        ) {
-                            Icon(
-                                if (isListening) Icons.Filled.Stop else Icons.Filled.Mic,
-                                if (isListening) "Остановить" else "Запись"
-                            )
+                        // Запись — только в «Дословно» (записывать смысл нельзя)
+                        if (level == Level.VERBATIM) {
+                            FloatingActionButton(
+                                onClick = {
+                                    if (!hasPermission) permLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    else if (isListening) stopRecording()
+                                    else startRecording()
+                                },
+                                containerColor = if (isListening) Palette.Red else Palette.Ink,
+                                contentColor = Color.White
+                            ) {
+                                Icon(
+                                    if (isListening) Icons.Filled.Stop else Icons.Filled.Mic,
+                                    if (isListening) "Остановить" else "Запись"
+                                )
+                            }
                         }
                     }
             }

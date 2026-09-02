@@ -163,6 +163,7 @@ class VariantProcessor(
                             processLectureRouted(note.original)
                         else
                             processAllRouted(note.original)
+                        Diagnostics.info("В обработку ушёл текст (${note.original.length} симв): \"${note.original.take(50)}...\"")
                         // Умный заголовок стенограммы от ИИ.
                         all["TITLE"]?.takeIf { it.isNotBlank() }?.let { note.title = it }
                         for ((l, t) in combos) {
@@ -241,15 +242,21 @@ class VariantProcessor(
     /** Вычисление одного варианта с проверкой длины. */
     private suspend fun computeOne(note: Note, l: Level, t: Tone, vary: Boolean = false): String {
         val orig = note.original
+        // Роутинг: локальный ИИ (если выбран офлайн) или облачный.
+        if (settings.useAI && settings.localAi &&
+            LocalAiModelManager.isReady(context, settings.localAiModel)) {
+            val sys = localPromptFor(l, note.isLecture)
+            val res = LocalAiEngine.generate(context, sys, orig, settings.localAiModel)
+            if (!res.isNullOrBlank()) { Diagnostics.engine("Один вариант ($l): локальный ИИ"); return res }
+            Diagnostics.error("Один вариант ($l): локальный не дал результат")
+            throw RuntimeException("Локальный ИИ не дал результат (${LocalAiEngine.lastStatus})")
+        }
         val result = if (settings.useAI)
             AiClient.process(orig, l, t, settings.apiKey, vary)
         else TextCondenser.condense(orig, l)
 
-        // Проверка длины: сжатый не должен быть длиннее оригинала.
         if (l != Level.VERBATIM && result.length > orig.length) {
-            // для правил просто обрежем логикой; для ИИ — вернём правило как запас
             return if (settings.useAI) {
-                // повторим с явным требованием короче — один раз
                 try {
                     val shorter = AiClient.process(orig, l, t, settings.apiKey, vary = true)
                     if (shorter.length <= orig.length) shorter else TextCondenser.condense(orig, l)
@@ -257,6 +264,15 @@ class VariantProcessor(
             } else TextCondenser.condense(orig, l)
         }
         return result
+    }
+
+    // Короткий промпт для одного варианта (локальный ИИ).
+    private fun localPromptFor(l: Level, lecture: Boolean): String = when (l) {
+        Level.VERBATIM -> "Расставь пунктуацию по смыслу, сохрани все слова. Верни только текст."
+        Level.CLEAN -> if (lecture) "Оформи как стенограмму, сохрани всё содержание. Верни только текст."
+            else "Исправь ошибки распознавания, расставь пунктуацию, сохрани все мысли. Верни только текст."
+        Level.BRIEF -> "Перескажи кратко, вдвое короче, сохрани главное. Верни только текст."
+        Level.GIST -> "Изложи суть в 1-2 предложениях. Верни только текст."
     }
 
     /** Продолжить обработку ВСЕХ заметок, где есть недосчитанное (вызывать периодически). */
