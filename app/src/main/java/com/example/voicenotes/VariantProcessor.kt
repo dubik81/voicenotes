@@ -247,8 +247,12 @@ class VariantProcessor(
             LocalAiModelManager.isReady(context, settings.localAiModel)) {
             val sys = localPromptFor(l, note.isLecture)
             val res = LocalAiEngine.generate(context, sys, orig, settings.localAiModel)
-            if (!res.isNullOrBlank()) { Diagnostics.engine("Один вариант ($l): локальный ИИ"); return res }
-            Diagnostics.error("Один вариант ($l): локальный не дал результат")
+            // Отсекаем галлюцинации (зацикливание) и мусор.
+            if (!res.isNullOrBlank() && !isLoopy(res)) {
+                Diagnostics.engine("Один вариант ($l): локальный ИИ, ${res.length} симв")
+                return res
+            }
+            Diagnostics.error("Один вариант ($l): локальный дал мусор/пусто")
             throw RuntimeException("Локальный ИИ не дал результат (${LocalAiEngine.lastStatus})")
         }
         val result = if (settings.useAI)
@@ -264,6 +268,20 @@ class VariantProcessor(
             } else TextCondenser.condense(orig, l)
         }
         return result
+    }
+
+    // Детект зацикливания (галлюцинация локальной модели).
+    private fun isLoopy(text: String): Boolean {
+        val words = text.split(Regex("\\s+")).filter { it.length > 2 }
+        if (words.size < 8) return false
+        val triples = HashMap<String, Int>()
+        for (i in 0..words.size - 3) {
+            val key = "${words[i]} ${words[i+1]} ${words[i+2]}".lowercase()
+            val c = (triples[key] ?: 0) + 1
+            triples[key] = c
+            if (c >= 3) return true
+        }
+        return false
     }
 
     // Короткий промпт для одного варианта (локальный ИИ).

@@ -123,9 +123,19 @@ fun EditorScreen(
 
     // После нового текста: сбрасываем варианты и запускаем полный фоновый расчёт.
     fun startProcessingAll() {
+        // Полный пересчёт: сбрасываем и считаем заново (новый исходный текст).
         processor.reset(note.id)
         note.variants.clear()
+        // Чистим и историю вариантов — иначе останутся версии от старого текста.
+        note.history.clear()
+        note.historyIndex.clear()
         persist()
+        processor.ensureAll(note, level, tone)
+    }
+
+    // Досчитать недостающее БЕЗ стирания готового (для фона/переоткрытия).
+    fun continueProcessing() {
+        if (original.isBlank()) return
         processor.ensureAll(note, level, tone)
     }
 
@@ -326,6 +336,20 @@ fun EditorScreen(
         }
     }
 
+    // Детект галлюцинации локальной модели: зацикливание (повтор фразы 3+ раз).
+    fun looksHallucinated(text: String): Boolean {
+        val words = text.split(Regex("\\s+")).filter { it.length > 2 }
+        if (words.size < 8) return false
+        val triples = HashMap<String, Int>()
+        for (i in 0..words.size - 3) {
+            val key = "${words[i]} ${words[i+1]} ${words[i+2]}".lowercase()
+            val c = (triples[key] ?: 0) + 1
+            triples[key] = c
+            if (c >= 3) return true
+        }
+        return false
+    }
+
     // Запускается автоматически (если autoAi) или кнопкой «Отправить в ИИ».
     // Отправка ансамбля (Vosk + Whisper) в ИИ: сборка лучшего текста + варианты.
     // Whisper-текст уже получен функцией runWhisper. По кнопке ✨ или авто.
@@ -351,7 +375,9 @@ fun EditorScreen(
                         } else {
                             AiClient.assembleFromTwo(voskText, wt, settings.apiKey)
                         }
-                        assembled = if (result.isNotBlank() && result.length >= voskText.length / 2)
+                        assembled = if (result.isNotBlank() &&
+                            result.length in (voskText.length / 2)..(voskText.length * 3) &&
+                            !looksHallucinated(result))
                             result else wt
                     } catch (_: Exception) { assembled = wt }
                 } else if (!wt.isNullOrBlank()) {
