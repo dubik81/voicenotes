@@ -3,7 +3,9 @@ package com.example.voicenotes
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.*
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.rememberCoroutineScope
 
@@ -11,6 +13,31 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent { App() }
+    }
+}
+
+/** Держит экран включённым: 2 мин полной яркости, затем 0.5 мин приглушённо, потом отпускает. */
+@Composable
+fun KeepScreenOn(activity: ComponentActivity, resetKey: Int) {
+    LaunchedEffect(resetKey) {
+        val window = activity.window
+        try {
+            // включаем удержание + полная (обычная) яркость
+            window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            window.attributes = window.attributes.apply {
+                screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            }
+            kotlinx.coroutines.delay(120_000)  // 2 минуты ярко
+            // приглушаем
+            window.attributes = window.attributes.apply { screenBrightness = 0.15f }
+            kotlinx.coroutines.delay(30_000)   // 0.5 минуты приглушённо
+        } finally {
+            // отпускаем — система гасит по своим настройкам, яркость возвращаем
+            window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            window.attributes = window.attributes.apply {
+                screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+            }
+        }
     }
 }
 
@@ -25,6 +52,11 @@ fun App() {
     var dark by remember { mutableStateOf(settings.darkTheme) }
     var openNoteId by remember { mutableStateOf<Long?>(null) }
     var showSettings by remember { mutableStateOf(false) }
+
+    // Экран не гаснет: 2 мин ярко, 0.5 мин приглушённо. Сброс по касанию.
+    var screenResetKey by remember { mutableStateOf(0) }
+    val activity = context as? ComponentActivity
+    if (activity != null) KeepScreenOn(activity, screenResetKey)
 
     fun persist() { store.save(notes) }
 
@@ -52,6 +84,16 @@ fun App() {
     }
 
     AppTheme(dark = dark) {
+      androidx.compose.foundation.layout.Box(
+        androidx.compose.ui.Modifier.fillMaxSize().pointerInput(Unit) {
+            awaitPointerEventScope {
+                while (true) {
+                    awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                    screenResetKey++  // любое касание продлевает подсветку
+                }
+            }
+        }
+      ) {
         val current = notes.find { it.id == openNoteId }
         if (current != null) {
             EditorScreen(
@@ -102,5 +144,6 @@ fun App() {
                 appScope = appScope
             )
         }
+      }
     }
 }

@@ -59,20 +59,27 @@ class VariantProcessor(
     // Роутинг: локальный ИИ (если выбран и модель готова) или облачный.
     private suspend fun processAllRouted(text: String): Map<String, String> {
         if (settings.localAi) {
-            // Офлайн-режим: работаем ТОЛЬКО локально. Откат на облако запрещён —
-            // сбой облака штатен, а неработа офлайна недопустима и должна быть видна.
             if (!LocalAiModelManager.isReady(context, settings.localAiModel)) {
-                Diagnostics.error("Локальный ИИ: модель не скачана")
-                throw RuntimeException("Локальный ИИ: модель не скачана")
+                // Модели нет — работаем на надёжных правилах (без ИИ, но всегда результат).
+                Diagnostics.engine("Офлайн без модели: обработка правилами")
+                return rulesBasedAll(text)
             }
-            Diagnostics.engine("Обработка вариантов: ЛОКАЛЬНЫЙ ИИ")
-            val res = localProcessAll(text)
-            if (res.isNotEmpty()) { Diagnostics.engine("Локальный ИИ вернул ${res.size} вариантов"); return res }
-            Diagnostics.error("Локальный ИИ не дал результат (${LocalAiEngine.lastStatus})")
-            throw RuntimeException("Локальный ИИ не дал результат (${LocalAiEngine.lastStatus})")
+            Diagnostics.engine("Обработка вариантов: ЛОКАЛЬНЫЙ ИИ (+ правила как запас)")
+            return localProcessAll(text)  // внутри есть fallback на правила
         }
         Diagnostics.engine("Обработка вариантов: ОБЛАЧНЫЙ ИИ")
         return AiClient.processAll(text, settings.apiKey)
+    }
+
+    // Полностью офлайн-обработка на правилах (без ИИ) — гарантированный результат.
+    private fun rulesBasedAll(text: String): Map<String, String> {
+        val result = mutableMapOf<String, String>()
+        for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = Punctuator.punctuate(text)
+        val t = Tone.NEUTRAL.ordinal
+        result["${Level.CLEAN.ordinal}:$t"] = CleanProcessor.clean(text)
+        result["${Level.BRIEF.ordinal}:$t"] = TextCondenser.condense(text, Level.BRIEF)
+        result["${Level.GIST.ordinal}:$t"] = TextCondenser.condense(text, Level.GIST)
+        return result
     }
 
     private suspend fun processLectureRouted(text: String): Map<String, String> {
@@ -97,22 +104,27 @@ class VariantProcessor(
         val model = settings.localAiModel
         val result = mutableMapOf<String, String>()
         val t = Tone.NEUTRAL.ordinal
-        // Дословный с умной пунктуацией
-        LocalAiEngine.generate(context,
+        // Дословный с умной пунктуацией (или надёжный пунктуатор).
+        val v = LocalAiEngine.generate(context,
             "Расставь пунктуацию и заглавные буквы по смыслу, сохрани ВСЕ слова. Верни только текст.",
-            text, model)?.let { for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = it }
-        // Чисто
-        LocalAiEngine.generate(context,
-            "Исправь ошибки распознавания, расставь пунктуацию, сохрани все мысли и слова. Не сокращай. Верни только текст.",
-            text, model)?.let { result["${Level.CLEAN.ordinal}:$t"] = it }
-        // Кратко
-        LocalAiEngine.generate(context,
-            "Перескажи кратко, вдвое короче, сохрани главное. Верни только текст.",
-            text, model)?.let { result["${Level.BRIEF.ordinal}:$t"] = it }
-        // Суть
-        LocalAiEngine.generate(context,
-            "Изложи суть в 1-2 предложениях. Верни только текст.",
-            text, model)?.let { result["${Level.GIST.ordinal}:$t"] = it }
+            text, model)
+        val vClean = if (!v.isNullOrBlank() && !isLoopy(v)) v else Punctuator.punctuate(text)
+        for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = vClean
+        // ЧИСТО — надёжно: пробуем локальный ИИ, при неудаче правила (всегда даёт результат).
+        val c = LocalAiEngine.generate(context,
+            "Исправь ошибки, убери слова-паразиты, расставь пунктуацию, сохрани все мысли. Верни только текст.",
+            text, model)
+        result["${Level.CLEAN.ordinal}:$t"] =
+            if (!c.isNullOrBlank() && !isLoopy(c)) c else CleanProcessor.clean(text)
+        // Кратко/Суть — пробуем локальный, при неудаче механическое сжатие.
+        val b = LocalAiEngine.generate(context,
+            "Перескажи кратко, вдвое короче, сохрани главное. Верни только текст.", text, model)
+        result["${Level.BRIEF.ordinal}:$t"] =
+            if (!b.isNullOrBlank() && !isLoopy(b)) b else TextCondenser.condense(text, Level.BRIEF)
+        val g = LocalAiEngine.generate(context,
+            "Изложи суть в 1-2 предложениях. Верни только текст.", text, model)
+        result["${Level.GIST.ordinal}:$t"] =
+            if (!g.isNullOrBlank() && !isLoopy(g)) g else TextCondenser.condense(text, Level.GIST)
         return result
     }
 
@@ -252,10 +264,14 @@ class VariantProcessor(
             LocalAiModelManager.isReady(context, settings.localAiModel)) {
             val sys = localPromptFor(l, note.isLecture)
             val res = LocalAiEngine.generate(context, sys, orig, settings.localAiModel)
-            // Отсекаем галлюцинации (зацикливание) и мусор.
             if (!res.isNullOrBlank() && !isLoopy(res)) {
                 Diagnostics.engine("Один вариант ($l): локальный ИИ, ${res.length} симв")
                 return res
+            }
+            // Локальный не смог. Для CLEAN есть надёжный офлайн-запас (правила).
+            if (l == Level.CLEAN) {
+                Diagnostics.engine("Чисто: локальный не смог → надёжные правила (CleanProcessor)")
+                return CleanProcessor.clean(orig)
             }
             Diagnostics.error("Один вариант ($l): локальный дал мусор/пусто")
             throw RuntimeException("Локальный ИИ не дал результат (${LocalAiEngine.lastStatus})")
