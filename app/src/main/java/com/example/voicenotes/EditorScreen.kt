@@ -329,14 +329,27 @@ fun EditorScreen(
             }
         } else {
             if (original.isBlank()) return
-            if (aiRunning) return  // уже идёт — не запускаем повторно
+            if (aiRunning) {
+                status = "Обработка уже идёт, подождите…"
+                return
+            }
             aiRunning = true
             cornerIndicator = if (settings.localAi) "ai-local" else "ai-cloud"
             Diagnostics.action("Обновить смысл ($level), движок=${if (settings.localAi) "локальный" else "облачный"}")
+            // Таймаут-страховка: если за 45 сек не завершилось — сбрасываем блокировку.
+            val watchdog = scope.launch {
+                kotlinx.coroutines.delay(45000)
+                if (aiRunning) {
+                    aiRunning = false; cornerIndicator = ""
+                    status = "Обработка прервана (слишком долго)"
+                    Diagnostics.error("Обновление $level: таймаут 45с")
+                }
+            }
             processor.regenerateOne(note, level, tone) { ok ->
+                watchdog.cancel()
                 onChanged(); refreshTick++
                 aiRunning = false; cornerIndicator = ""
-                status = if (ok) "Готово" else "ИИ не смог обработать (${processor.lastAiError ?: "?"})"
+                status = if (ok) "Готово" else "ИИ не смог обработать"
             }
         }
     }
@@ -766,9 +779,10 @@ fun EditorScreen(
                     //  - в смыслах, когда смыслы готовы — переосмыслить.
                     val canReupdate = level == Level.VERBATIM && note.recordMode != "google" &&
                             note.audioPath != null && File(note.audioPath!!).exists()
-                    val showUpdate = canReupdate || (level != Level.VERBATIM && smyslyReady && settings.useAI)
-                    // «ИИ» показывается, пока смыслы не получены (в т.ч. в Дословно — вместе с Обновить).
-                    val showAiBtn = original.isNotBlank() && settings.useAI && !settings.autoAi && !smyslyReady
+                    // Обработка смысла доступна всегда: облако / локальный ИИ / правила-запас.
+                    val aiAvailable = settings.useAI || settings.localAi
+                    val showUpdate = canReupdate || (level != Level.VERBATIM && smyslyReady && aiAvailable)
+                    val showAiBtn = original.isNotBlank() && aiAvailable && !settings.autoAi && !smyslyReady
 
                     Row(
                         Modifier.align(Alignment.BottomEnd).padding(12.dp),
@@ -802,7 +816,10 @@ fun EditorScreen(
                         if (showUpdate) {
                             val busy = aiRunning || voskRerunning
                             FloatingActionButton(
-                                onClick = { if (!busy) updateCurrent() },
+                                onClick = {
+                                    Diagnostics.action("Тап Обновить: busy=$busy (aiRunning=$aiRunning, vosk=$voskRerunning)")
+                                    if (!busy) updateCurrent()
+                                },
                                 containerColor = if (busy) Palette.Amber else Palette.Ink,
                                 contentColor = Color.White
                             ) { Icon(Icons.Filled.Autorenew, "Обновить") }

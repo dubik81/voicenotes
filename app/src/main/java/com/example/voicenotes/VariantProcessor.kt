@@ -268,13 +268,14 @@ class VariantProcessor(
                 Diagnostics.engine("Один вариант ($l): локальный ИИ, ${res.length} симв")
                 return res
             }
-            // Локальный не смог. Для CLEAN есть надёжный офлайн-запас (правила).
-            if (l == Level.CLEAN) {
-                Diagnostics.engine("Чисто: локальный не смог → надёжные правила (CleanProcessor)")
-                return CleanProcessor.clean(orig)
+            // Локальный не смог. Надёжный офлайн-запас по правилам (без ошибки).
+            Diagnostics.engine("$l: локальный не смог → надёжные правила")
+            return when (l) {
+                Level.CLEAN -> CleanProcessor.clean(orig)
+                Level.BRIEF -> TextCondenser.condense(orig, Level.BRIEF)
+                Level.GIST -> TextCondenser.condense(orig, Level.GIST)
+                else -> Punctuator.punctuate(orig)
             }
-            Diagnostics.error("Один вариант ($l): локальный дал мусор/пусто")
-            throw RuntimeException("Локальный ИИ не дал результат (${LocalAiEngine.lastStatus})")
         }
         val result = if (settings.useAI)
             AiClient.process(orig, l, t, settings.apiKey, vary)
