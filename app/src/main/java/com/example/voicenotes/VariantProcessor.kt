@@ -104,27 +104,21 @@ class VariantProcessor(
         val model = settings.localAiModel
         val result = mutableMapOf<String, String>()
         val t = Tone.NEUTRAL.ordinal
-        // Дословный с умной пунктуацией (или надёжный пунктуатор).
-        val v = LocalAiEngine.generate(context,
-            "Расставь пунктуацию и заглавные буквы по смыслу, сохрани ВСЕ слова. Верни только текст.",
-            text, model)
-        val vClean = if (!v.isNullOrBlank() && !isLoopy(v)) v else Punctuator.punctuate(text)
+        fun okRes(r: String?, minLen: Int) = !r.isNullOrBlank() && !isLoopy(r) && r.length >= minLen
+        // Дословно
+        val v = LocalAiEngine.generate(context, localPromptFor(Level.VERBATIM, false), text, model)
+        val vClean = if (okRes(v, text.length / 3)) v!! else Punctuator.punctuate(text)
         for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = vClean
-        // ЧИСТО — надёжно: пробуем локальный ИИ, при неудаче правила (всегда даёт результат).
-        val c = LocalAiEngine.generate(context,
-            "Исправь ошибки, убери слова-паразиты, расставь пунктуацию, сохрани все мысли. Верни только текст.",
-            text, model)
-        result["${Level.CLEAN.ordinal}:$t"] =
-            if (!c.isNullOrBlank() && !isLoopy(c)) c else CleanProcessor.clean(text)
-        // Кратко/Суть — пробуем локальный, при неудаче механическое сжатие.
-        val b = LocalAiEngine.generate(context,
-            "Перескажи кратко, вдвое короче, сохрани главное. Верни только текст.", text, model)
-        result["${Level.BRIEF.ordinal}:$t"] =
-            if (!b.isNullOrBlank() && !isLoopy(b)) b else TextCondenser.condense(text, Level.BRIEF)
-        val g = LocalAiEngine.generate(context,
-            "Изложи суть в 1-2 предложениях. Верни только текст.", text, model)
-        result["${Level.GIST.ordinal}:$t"] =
-            if (!g.isNullOrBlank() && !isLoopy(g)) g else TextCondenser.condense(text, Level.GIST)
+        // ЧИСТО — гибрид: правила чистят, ИИ полирует
+        val cInput = CleanProcessor.clean(text)
+        val c = LocalAiEngine.generate(context, localPromptFor(Level.CLEAN, false), cInput, model)
+        result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3)) c!! else cInput
+        // Кратко
+        val b = LocalAiEngine.generate(context, localPromptFor(Level.BRIEF, false), text, model)
+        result["${Level.BRIEF.ordinal}:$t"] = if (okRes(b, 10)) b!! else TextCondenser.condense(text, Level.BRIEF)
+        // Суть
+        val g = LocalAiEngine.generate(context, localPromptFor(Level.GIST, false), text, model)
+        result["${Level.GIST.ordinal}:$t"] = if (okRes(g, 5)) g!! else TextCondenser.condense(text, Level.GIST)
         return result
     }
 
@@ -262,14 +256,17 @@ class VariantProcessor(
         // Роутинг: локальный ИИ (если выбран офлайн) или облачный.
         if (settings.useAI && settings.localAi &&
             LocalAiModelManager.isReady(context, settings.localAiModel)) {
+            // Для CLEAN: сначала правила убирают паразитов (надёжно), затем локальный ИИ
+            // полирует уже ЧИСТЫЙ текст — слабой модели так проще, результат лучше.
+            val input = if (l == Level.CLEAN) CleanProcessor.clean(orig) else orig
             val sys = localPromptFor(l, note.isLecture)
-            val res = LocalAiEngine.generate(context, sys, orig, settings.localAiModel)
-            if (!res.isNullOrBlank() && !isLoopy(res)) {
+            val res = LocalAiEngine.generate(context, sys, input, settings.localAiModel)
+            if (!res.isNullOrBlank() && !isLoopy(res) && res.length >= input.length / 3) {
                 Diagnostics.engine("Один вариант ($l): локальный ИИ, ${res.length} симв")
                 return res
             }
-            // Локальный не смог. Надёжный офлайн-запас по правилам (без ошибки).
-            Diagnostics.engine("$l: локальный не смог → надёжные правила")
+            // Локальный слаб на этом тексте → надёжный результат по правилам.
+            Diagnostics.engine("$l: локальный слаб → правила")
             return when (l) {
                 Level.CLEAN -> CleanProcessor.clean(orig)
                 Level.BRIEF -> TextCondenser.condense(orig, Level.BRIEF)
@@ -292,34 +289,31 @@ class VariantProcessor(
         return result
     }
 
-    // Детект зацикливания (галлюцинация локальной модели).
+    // Детект ЯВНОГО зацикливания (одна фраза повторяется много раз подряд).
     private fun isLoopy(text: String): Boolean {
         val words = text.split(Regex("\\s+")).filter { it.length > 1 }
-        if (words.size < 6) return false
-        // повтор 3-словных сочетаний 2+ раза
+        if (words.size < 10) return false
+        // 3-словное сочетание повторяется 3+ раза — явная галлюцинация
         val triples = HashMap<String, Int>()
         for (i in 0..words.size - 3) {
             val key = "${words[i]} ${words[i+1]} ${words[i+2]}".lowercase()
             val c = (triples[key] ?: 0) + 1; triples[key] = c
-            if (c >= 2) return true
-        }
-        // повтор 2-словных сочетаний 3+ раза
-        val pairs = HashMap<String, Int>()
-        for (i in 0..words.size - 2) {
-            val key = "${words[i]} ${words[i+1]}".lowercase()
-            val c = (pairs[key] ?: 0) + 1; pairs[key] = c
             if (c >= 3) return true
+        }
+        // одно слово подряд 4+ раза
+        var run = 1
+        for (i in 1 until words.size) {
+            if (words[i].equals(words[i-1], true)) { run++; if (run >= 4) return true } else run = 1
         }
         return false
     }
 
     // Короткий промпт для одного варианта (локальный ИИ).
     private fun localPromptFor(l: Level, lecture: Boolean): String = when (l) {
-        Level.VERBATIM -> "Расставь пунктуацию по смыслу, сохрани все слова. Верни только текст."
-        Level.CLEAN -> if (lecture) "Оформи как стенограмму, сохрани всё содержание. Верни только текст."
-            else "Исправь ошибки распознавания, расставь пунктуацию, сохрани все мысли. Верни только текст."
-        Level.BRIEF -> "Перескажи кратко, вдвое короче, сохрани главное. Верни только текст."
-        Level.GIST -> "Изложи суть в 1-2 предложениях. Верни только текст."
+        Level.VERBATIM -> "Перепиши грамотно, добавь знаки препинания. Верни только текст."
+        Level.CLEAN -> "Перепиши этот текст грамотно и связно, теми же словами. Только текст."
+        Level.BRIEF -> "Перескажи это в 2-3 предложениях. Только текст."
+        Level.GIST -> "О чём это? Ответь одним предложением. Только текст."
     }
 
     /** Продолжить обработку ВСЕХ заметок, где есть недосчитанное (вызывать периодически). */
