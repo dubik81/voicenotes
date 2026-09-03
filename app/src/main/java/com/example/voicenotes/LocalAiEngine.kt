@@ -139,36 +139,42 @@ object LocalAiEngine {
         return try {
             val cls = mod.javaClass
             val genMethods = cls.methods.filter { it.name == "generate" }
-            // РЕАЛЬНЫЙ callback (не Proxy!) — нативный JNI умеет звать только реальный класс.
+            // КЛЮЧЕВОЕ: перед каждой генерацией сбрасываем контекст (KV-кэш).
+            // Без этого второй и последующие запросы падают (Prefill failed error 3).
+            try { cls.getMethod("resetContext").invoke(mod); Diagnostics.info("resetContext OK") }
+            catch (e: Throwable) { Diagnostics.info("resetContext нет: ${e.message?.take(40)}") }
+
             val cb = LocalAiCallback()
             Diagnostics.event("Вызываю generate, длина промпта=${prompt.length}")
-            // Официальная сигнатура generate(prompt, seqLen, callback).
-            var invoked = false
-            // 1) (String, int, LlmCallback)
-            genMethods.firstOrNull {
-                it.parameterTypes.size == 3 &&
-                it.parameterTypes[0] == String::class.java &&
-                it.parameterTypes[1] == Int::class.javaPrimitiveType
-            }?.let { m ->
-                try { m.invoke(mod, prompt, 512, cb); invoked = true
-                    Diagnostics.event("generate(String,int,cb): callback=${cb.calls}, собрано=${cb.sb.length}")
+            // Рабочая сигнатура (по логу): generate(String, LlmCallback). Трёхаргументная
+            // (String,int,cb) падает на префилле — не используем.
+            val m2 = genMethods.firstOrNull {
+                it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java
+            }
+            if (m2 != null) {
+                try {
+                    m2.invoke(mod, prompt, cb)
+                    Diagnostics.event("generate(String,cb): callback=${cb.calls}, собрано=${cb.sb.length}")
                 } catch (e: Throwable) {
-                    Diagnostics.error("generate(String,int,cb): ${(e as? java.lang.reflect.InvocationTargetException)?.targetException?.message?.take(80) ?: e.message?.take(80)}")
+                    val msg = (e as? java.lang.reflect.InvocationTargetException)?.targetException?.message ?: e.message
+                    Diagnostics.error("generate(String,cb): ${msg?.take(80)}")
                 }
             }
-            // 2) запас: (String, LlmCallback)
-            if (!invoked || cb.sb.isEmpty()) {
+            // запас: (String, int, LlmCallback) если двухаргументной нет
+            if (cb.sb.isEmpty()) {
                 genMethods.firstOrNull {
-                    it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java
+                    it.parameterTypes.size == 3 && it.parameterTypes[1] == Int::class.javaPrimitiveType &&
+                    it.parameterTypes[2].simpleName == "LlmCallback"
                 }?.let { m ->
-                    try { m.invoke(mod, prompt, cb)
-                        Diagnostics.event("generate(String,cb): callback=${cb.calls}, собрано=${cb.sb.length}")
+                    try { m.invoke(mod, prompt, 256, cb)
+                        Diagnostics.event("generate(String,int,cb): callback=${cb.calls}, собрано=${cb.sb.length}")
                     } catch (e: Throwable) {
-                        Diagnostics.error("generate(String,cb): ${(e as? java.lang.reflect.InvocationTargetException)?.targetException?.message?.take(80) ?: e.message?.take(80)}")
+                        val msg = (e as? java.lang.reflect.InvocationTargetException)?.targetException?.message ?: e.message
+                        Diagnostics.error("generate(String,int,cb): ${msg?.take(80)}")
                     }
                 }
             }
-            if (cb.sb.isEmpty()) { Diagnostics.error("Генерация пуста: callback=${cb.calls}") }
+            if (cb.sb.isEmpty()) Diagnostics.error("Генерация пуста: callback=${cb.calls}")
             cb.sb.toString().trim().ifBlank { null }
         } catch (e: Throwable) {
             Diagnostics.error("runGenerate: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
