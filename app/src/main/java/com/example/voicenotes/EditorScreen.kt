@@ -725,7 +725,10 @@ fun EditorScreen(
                     SegOffOn(
                         offSelected = localAi,
                         onOff = { localAi = true; settings.localAi = true; Diagnostics.action("Смысл → Офлайн (локальный ИИ)") },
-                        onOn = { localAi = false; settings.localAi = false; Diagnostics.action("Смысл → Онлайн (облачный ИИ)") }
+                        onOn = { localAi = false; settings.localAi = false
+                            Diagnostics.action("Смысл → Онлайн (облачный ИИ)")
+                            // Досчитать варианты, которых нет (после локального были только CLEAN).
+                            if (original.isNotBlank() && settings.useAI) processor.ensureAll(note, level, tone) }
                     )
                 }
             }

@@ -108,7 +108,7 @@ class VariantProcessor(
         // ЧИСТО — единственная задача локального ИИ. Гибрид: правила чистят → ИИ полирует.
         val cInput = CleanProcessor.clean(text)
         val c = LocalAiEngine.generate(context, localPromptFor(Level.CLEAN, false), cInput, model)
-        result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3)) c!! else cInput
+        result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3) && !tooDistorted(c!!, cInput)) c else cInput
         // Кратко/Суть при локальном ИИ НЕ считаем (модель 1B слаба для сжатия) —
         // кнопки неактивны в интерфейсе.
         return result
@@ -124,7 +124,7 @@ class VariantProcessor(
         val c = LocalAiEngine.generate(context,
             "Ты редактор лекции. Оформи текст пользователя как читаемую стенограмму: расставь пунктуацию, абзацы, убери оговорки, сохрани всё содержание. Выведи только результат.",
             cInput, model)
-        result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3)) c!! else cInput
+        result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3) && !tooDistorted(c!!, cInput)) c else cInput
         // Кратко/Суть при локальном не считаем (неактивны в интерфейсе).
         return result
     }
@@ -245,7 +245,8 @@ class VariantProcessor(
             val input = if (l == Level.CLEAN) CleanProcessor.clean(orig) else orig
             val sys = localPromptFor(l, note.isLecture)
             val res = LocalAiEngine.generate(context, sys, input, settings.localAiModel)
-            if (!res.isNullOrBlank() && !isLoopy(res) && res.length >= input.length / 3) {
+            if (!res.isNullOrBlank() && !isLoopy(res) && res.length >= input.length / 3 &&
+                !tooDistorted(res, input)) {
                 Diagnostics.engine("Один вариант ($l): локальный ИИ, ${res.length} симв")
                 return res
             }
@@ -271,6 +272,16 @@ class VariantProcessor(
             } else TextCondenser.condense(orig, l)
         }
         return result
+    }
+
+    // Детект ИСКАЖЕНИЯ: локальный ИИ выдумал слова не из исходника.
+    // >40% незнакомых слов = искажение («Мумом», «греха через реху») → берём правила.
+    private fun tooDistorted(result: String, source: String): Boolean {
+        val srcWords = source.lowercase().split(Regex("[^а-яёa-z0-9]+")).filter { it.length > 2 }.toHashSet()
+        val resWords = result.lowercase().split(Regex("[^а-яёa-z0-9]+")).filter { it.length > 2 }
+        if (resWords.isEmpty()) return true
+        val unknown = resWords.count { it !in srcWords }
+        return unknown.toDouble() / resWords.size > 0.4
     }
 
     // Детект ЯВНОГО зацикливания (одна фраза повторяется много раз подряд).
