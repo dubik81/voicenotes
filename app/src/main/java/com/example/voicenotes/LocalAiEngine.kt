@@ -167,19 +167,20 @@ object LocalAiEngine {
             }
 
             Diagnostics.event("Вызываю generate, длина промпта=${prompt.length}")
-            // Приоритет: config-вариант (с repetition_penalty против зацикливания),
-            // потом простые сигнатуры как запас.
+            // ОФИЦИАЛЬНАЯ сигнатура (из примера PyTorch): generate(prompt, seqLen, callback).
+            // seqLen=512 — достаточно для обработки абзаца текста.
             val attempts = listOf<Pair<String, () -> Any?>>(
-                "(String, LlmGenerationConfig, LlmCallback)" to {
-                    val gm = genMethods.firstOrNull { it.parameterTypes.size == 3 &&
-                        it.parameterTypes[1].simpleName == "LlmGenerationConfig" }
-                    val cfg = gm?.let { buildGenConfig(it.parameterTypes[1]) }
-                    if (gm != null && cfg != null) gm.invoke(mod, prompt, cfg, handler) else null
+                "(String, int, LlmCallback)" to {
+                    genMethods.firstOrNull { it.parameterTypes.size == 3 &&
+                        it.parameterTypes[0] == String::class.java &&
+                        it.parameterTypes[1] == Int::class.javaPrimitiveType &&
+                        it.parameterTypes[2].simpleName == "LlmCallback" }
+                        ?.invoke(mod, prompt, 512, handler)
                 },
                 "(String, int, LlmCallback, boolean)" to {
                     genMethods.firstOrNull { it.parameterTypes.size == 4 &&
                         it.parameterTypes[1] == Int::class.javaPrimitiveType }
-                        ?.invoke(mod, prompt, 300, handler, false)
+                        ?.invoke(mod, prompt, 512, handler, false)
                 },
                 "(String, LlmCallback)" to {
                     genMethods.firstOrNull { it.parameterTypes.size == 2 &&
