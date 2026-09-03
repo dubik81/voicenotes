@@ -222,4 +222,35 @@ object LocalAiEngine {
         try { module?.let { m -> m.javaClass.getMethod("resetNative").invoke(m) } } catch (_: Throwable) {}
         module = null; loadedId = null
     }
+
+    /** Самопроверка: прогоняет тест по шагам, возвращает отчёт. Результат — в общий лог. */
+    suspend fun selfTest(context: Context, modelId: String): String = withContext(Dispatchers.IO) {
+        val sb = StringBuilder()
+        sb.append("Проверка локального ИИ:\n")
+        val ready = LocalAiModelManager.isReady(context, modelId)
+        sb.append("1. Модель скачана: ${if (ready) "да" else "НЕТ"}\n")
+        if (!ready) { sb.append("→ Скачайте модель."); Diagnostics.info("САМОПРОВЕРКА:\n$sb"); return@withContext sb.toString() }
+        val tok = LocalAiModelManager.tokenizerFile(context)
+        sb.append("2. Токенизатор: ${if (tok.exists() && tok.length() > 1000) "есть (${tok.length()} б)" else "НЕТ"}\n")
+        val cls = moduleClass()
+        sb.append("3. Класс ExecuTorch: ${if (cls != null) "найден" else "НЕ НАЙДЕН"}\n")
+        if (cls == null) { sb.append("→ Библиотека не подключилась."); Diagnostics.info("САМОПРОВЕРКА:\n$sb"); return@withContext sb.toString() }
+        val t0 = System.currentTimeMillis()
+        val mod = loadModule(context, modelId)
+        sb.append("4. Загрузка модели: ${if (mod != null) "успех (${System.currentTimeMillis()-t0} мс)" else "ПРОВАЛ"}\n")
+        if (mod == null) { sb.append("→ Модель не загрузилась."); Diagnostics.info("САМОПРОВЕРКА:\n$sb"); return@withContext sb.toString() }
+        val t1 = System.currentTimeMillis()
+        val sys = "Ответь одним словом."; val usr = "Скажи: привет"
+        val fp = buildPrompt(sys, usr)
+        val out = cleanResponse(runGenerate(mod, fp), fp, sys, usr)
+        val genOk = !out.isNullOrBlank()
+        if (genOk) {
+            sb.append("5. Генерация: РАБОТАЕТ (${System.currentTimeMillis()-t1} мс)\n")
+            sb.append("   ответ: ").append(out!!.take(60)).append("\n")
+        } else sb.append("5. Генерация: пустой результат\n")
+        sb.append("\nИтог: ").append(if (genOk) "OK Локальный ИИ работает!" else "Модель грузится, но не генерирует.")
+        lastStatus = if (genOk) "работает" else "генерация пустая"
+        Diagnostics.info("САМОПРОВЕРКА:\n$sb")
+        sb.toString()
+    }
 }
