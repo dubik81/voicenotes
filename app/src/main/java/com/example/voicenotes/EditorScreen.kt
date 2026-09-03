@@ -351,11 +351,11 @@ fun EditorScreen(
             Diagnostics.action("Обновить смысл ($level), движок=${if (settings.localAi) "локальный" else "облачный"}")
             // Таймаут-страховка: если за 45 сек не завершилось — сбрасываем блокировку.
             val watchdog = scope.launch {
-                kotlinx.coroutines.delay(45000)
+                kotlinx.coroutines.delay(90000)
                 if (aiRunning) {
                     aiRunning = false; cornerIndicator = ""
                     status = "Обработка прервана (слишком долго)"
-                    Diagnostics.error("Обновление $level: таймаут 45с")
+                    Diagnostics.error("Обновление $level: таймаут 90с")
                 }
             }
             processor.regenerateOne(note, level, tone) { ok ->

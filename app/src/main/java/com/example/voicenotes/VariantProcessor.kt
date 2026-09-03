@@ -106,8 +106,9 @@ class VariantProcessor(
         fun okRes(r: String?, minLen: Int) = !r.isNullOrBlank() && !isLoopy(r) && r.length >= minLen
         // Дословно — пунктуатор (надёжно).
         // ЧИСТО — единственная задача локального ИИ. Гибрид: правила чистят → ИИ полирует.
+        // Через ЧАНКИНГ (по кускам) — иначе локальный падает на длинном тексте.
         val cInput = CleanProcessor.clean(text)
-        val c = LocalAiEngine.generate(context, localPromptFor(Level.CLEAN, false), cInput, model)
+        val c = LocalAiEngine.processLong(context, localPromptFor(Level.CLEAN, false), cInput, model)
         result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3) && !tooDistorted(c!!, cInput)) c else cInput
         // Кратко/Суть при локальном ИИ НЕ считаем (модель 1B слаба для сжатия) —
         // кнопки неактивны в интерфейсе.
@@ -121,7 +122,7 @@ class VariantProcessor(
         fun okRes(r: String?, minLen: Int) = !r.isNullOrBlank() && !isLoopy(r) && r.length >= minLen
         // Лекция + локальный ИИ: делаем только стенограмму (Чисто). Гибрид с правилами.
         val cInput = CleanProcessor.clean(text)
-        val c = LocalAiEngine.generate(context,
+        val c = LocalAiEngine.processLong(context,
             "Ты редактор лекции. Оформи текст пользователя как читаемую стенограмму: расставь пунктуацию, абзацы, убери оговорки, сохрани всё содержание. Выведи только результат.",
             cInput, model)
         result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3) && !tooDistorted(c!!, cInput)) c else cInput
@@ -244,7 +245,10 @@ class VariantProcessor(
             // полирует уже ЧИСТЫЙ текст — слабой модели так проще, результат лучше.
             val input = if (l == Level.CLEAN) CleanProcessor.clean(orig) else orig
             val sys = localPromptFor(l, note.isLecture)
-            val res = LocalAiEngine.generate(context, sys, input, settings.localAiModel)
+            // Чисто — через чанкинг (по кускам), иначе падает на длинном.
+            val res = if (l == Level.CLEAN)
+                LocalAiEngine.processLong(context, sys, input, settings.localAiModel)
+            else LocalAiEngine.generate(context, sys, input, settings.localAiModel)
             if (!res.isNullOrBlank() && !isLoopy(res) && res.length >= input.length / 3 &&
                 !tooDistorted(res, input)) {
                 Diagnostics.engine("Один вариант ($l): локальный ИИ, ${res.length} симв")

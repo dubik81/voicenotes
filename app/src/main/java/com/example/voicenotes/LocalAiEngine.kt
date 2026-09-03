@@ -231,6 +231,56 @@ object LocalAiEngine {
         }
     }
 
+    /**
+     * ЧАНКИНГ для «Чисто»: длинный текст режем на куски и обрабатываем по отдельности —
+     * локальная модель НЕ падает на префилле (Prefill failed на длинном). Лимит времени.
+     */
+    suspend fun processLong(context: Context, systemPrompt: String, text: String,
+                            modelId: String, deadlineMs: Long = 20000): String? =
+        withContext(Dispatchers.IO) {
+            val start = System.currentTimeMillis()
+            if (text.length <= 200) return@withContext generate(context, systemPrompt, text, modelId)
+            val chunks = splitIntoChunks(text, 150)
+            Diagnostics.info("Чанкинг: ${chunks.size} кусков")
+            val out = StringBuilder()
+            for ((i, chunk) in chunks.withIndex()) {
+                if (System.currentTimeMillis() - start > deadlineMs) {
+                    Diagnostics.info("Чанкинг: лимит времени, обработано $i из ${chunks.size}")
+                    for (j in i until chunks.size) out.append(chunks[j]).append(" ")
+                    break
+                }
+                val r = generate(context, systemPrompt, chunk, modelId)
+                out.append(if (!r.isNullOrBlank()) r else chunk).append(" ")
+            }
+            Diagnostics.info("Чанкинг завершён за ${System.currentTimeMillis()-start} мс")
+            out.toString().trim().ifBlank { null }
+        }
+
+    private fun splitIntoChunks(text: String, maxLen: Int): List<String> {
+        val result = ArrayList<String>()
+        val sentences = text.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
+        val cur = StringBuilder()
+        for (s in sentences) {
+            if (cur.isNotEmpty() && cur.length + s.length > maxLen) {
+                result.add(cur.toString().trim()); cur.clear()
+            }
+            if (s.length > maxLen) {
+                if (cur.isNotEmpty()) { result.add(cur.toString().trim()); cur.clear() }
+                val words = s.split(" ")
+                val wb = StringBuilder()
+                for (w in words) {
+                    if (wb.isNotEmpty() && wb.length + w.length > maxLen) {
+                        result.add(wb.toString().trim()); wb.clear()
+                    }
+                    wb.append(w).append(" ")
+                }
+                if (wb.isNotEmpty()) result.add(wb.toString().trim())
+            } else cur.append(s).append(" ")
+        }
+        if (cur.isNotEmpty()) result.add(cur.toString().trim())
+        return result.filter { it.isNotBlank() }
+    }
+
     // Правильный chat-формат Llama 3.2 (instruct). Без этих токенов модель
     // не понимает структуру диалога и зацикливается.
     private fun buildPrompt(system: String, user: String): String =

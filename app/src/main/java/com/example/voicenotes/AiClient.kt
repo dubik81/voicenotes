@@ -304,7 +304,7 @@ object AiClient {
         val conn = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 15000
-            readTimeout = 60000
+            readTimeout = 90000
             doOutput = true
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("Authorization", "Bearer ${apiKey.trim()}")
