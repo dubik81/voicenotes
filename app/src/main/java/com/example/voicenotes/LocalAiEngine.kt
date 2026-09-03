@@ -138,128 +138,45 @@ object LocalAiEngine {
     private fun runGenerate(mod: Any, prompt: String): String? {
         return try {
             val cls = mod.javaClass
-            // Логируем ВСЕ методы generate с сигнатурами.
             val genMethods = cls.methods.filter { it.name == "generate" }
-            Diagnostics.info("Методы generate (${genMethods.size}):")
-            genMethods.forEach { m ->
-                Diagnostics.info("  generate(${m.parameterTypes.joinToString { it.simpleName }}) → ${m.returnType.simpleName}")
-            }
-            val cbCls = callbackClass()
-            if (cbCls == null) { Diagnostics.error("Callback-класс не найден"); return null }
-            // Логируем методы callback-интерфейса.
-            Diagnostics.info("Методы Callback: ${cbCls.methods.joinToString { "${it.name}(${it.parameterTypes.joinToString{p->p.simpleName}})" }}")
-
-            val sb = StringBuilder()
-            var callbackCalls = 0
-            val calledMethods = mutableSetOf<String>()
-            val handler = java.lang.reflect.Proxy.newProxyInstance(
-                cbCls.classLoader, arrayOf(cbCls)
-            ) { _, method, args ->
-                callbackCalls++
-                calledMethods.add(method.name)
-                // ТОЛЬКО onResult даёт текст ответа. onStats — это JSON-статистика,
-                // её в текст брать нельзя (иначе prompt_tokens... попадёт в заметку).
-                if (method.name == "onResult" && args != null && args.isNotEmpty()) {
-                    (args[0] as? String)?.let { sb.append(it) }
-                }
-                if (method.returnType == Boolean::class.javaPrimitiveType ||
-                    method.returnType == java.lang.Boolean.TYPE) false else null
-            }
-
+            // РЕАЛЬНЫЙ callback (не Proxy!) — нативный JNI умеет звать только реальный класс.
+            val cb = LocalAiCallback()
             Diagnostics.event("Вызываю generate, длина промпта=${prompt.length}")
-            // ОФИЦИАЛЬНАЯ сигнатура (из примера PyTorch): generate(prompt, seqLen, callback).
-            // seqLen=512 — достаточно для обработки абзаца текста.
-            val attempts = listOf<Pair<String, () -> Any?>>(
-                "(String, int, LlmCallback)" to {
-                    genMethods.firstOrNull { it.parameterTypes.size == 3 &&
-                        it.parameterTypes[0] == String::class.java &&
-                        it.parameterTypes[1] == Int::class.javaPrimitiveType &&
-                        it.parameterTypes[2].simpleName == "LlmCallback" }
-                        ?.invoke(mod, prompt, 512, handler)
-                },
-                "(String, int, LlmCallback, boolean)" to {
-                    genMethods.firstOrNull { it.parameterTypes.size == 4 &&
-                        it.parameterTypes[1] == Int::class.javaPrimitiveType }
-                        ?.invoke(mod, prompt, 512, handler, false)
-                },
-                "(String, LlmCallback)" to {
-                    genMethods.firstOrNull { it.parameterTypes.size == 2 &&
-                        it.parameterTypes[0] == String::class.java }
-                        ?.invoke(mod, prompt, handler)
-                }
-            )
-            var ret: Any? = null
-            for ((sig, call) in attempts) {
-                if (sb.isNotEmpty()) break  // уже получили текст
-                sb.clear(); callbackCalls = 0; calledMethods.clear()
-                try {
-                    Diagnostics.info("Пробую generate $sig")
-                    ret = call()
-                    Diagnostics.event("$sig → вернул=$ret, callback=$callbackCalls, собрано=${sb.length}")
-                    if (sb.isNotEmpty()) { Diagnostics.event("РАБОТАЕТ: $sig"); break }
-                } catch (e: java.lang.reflect.InvocationTargetException) {
-                    Diagnostics.error("$sig нативная ошибка: ${e.targetException?.javaClass?.simpleName}: ${e.targetException?.message?.take(120)}")
+            // Официальная сигнатура generate(prompt, seqLen, callback).
+            var invoked = false
+            // 1) (String, int, LlmCallback)
+            genMethods.firstOrNull {
+                it.parameterTypes.size == 3 &&
+                it.parameterTypes[0] == String::class.java &&
+                it.parameterTypes[1] == Int::class.javaPrimitiveType
+            }?.let { m ->
+                try { m.invoke(mod, prompt, 512, cb); invoked = true
+                    Diagnostics.event("generate(String,int,cb): callback=${cb.calls}, собрано=${cb.sb.length}")
                 } catch (e: Throwable) {
-                    Diagnostics.error("$sig ошибка: ${e.javaClass.simpleName}: ${e.message?.take(120)}")
+                    Diagnostics.error("generate(String,int,cb): ${(e as? java.lang.reflect.InvocationTargetException)?.targetException?.message?.take(80) ?: e.message?.take(80)}")
                 }
             }
-
-            sb.toString().trim().ifBlank {
-                Diagnostics.error("Генерация пуста: callback=$callbackCalls, методы=[${calledMethods.joinToString()}]")
-                null
+            // 2) запас: (String, LlmCallback)
+            if (!invoked || cb.sb.isEmpty()) {
+                genMethods.firstOrNull {
+                    it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java
+                }?.let { m ->
+                    try { m.invoke(mod, prompt, cb)
+                        Diagnostics.event("generate(String,cb): callback=${cb.calls}, собрано=${cb.sb.length}")
+                    } catch (e: Throwable) {
+                        Diagnostics.error("generate(String,cb): ${(e as? java.lang.reflect.InvocationTargetException)?.targetException?.message?.take(80) ?: e.message?.take(80)}")
+                    }
+                }
             }
+            if (cb.sb.isEmpty()) { Diagnostics.error("Генерация пуста: callback=${cb.calls}") }
+            cb.sb.toString().trim().ifBlank { null }
         } catch (e: Throwable) {
-            Diagnostics.error("runGenerate исключение: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+            Diagnostics.error("runGenerate: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
             lastStatus = "ошибка генерации: ${e.message?.take(40)}"
             null
         }
     }
 
-    /**
-     * Самопроверка: прогоняет простой тест и возвращает подробный отчёт,
-     * что именно работает или где сломалось. Для диагностики на устройстве.
-     */
-    suspend fun selfTest(context: Context, modelId: String): String = withContext(Dispatchers.IO) {
-        val sb = StringBuilder()
-        sb.append("Проверка локального ИИ:\n")
-        // 1. модель скачана?
-        val ready = LocalAiModelManager.isReady(context, modelId)
-        sb.append("1. Модель скачана: ${if (ready) "да" else "НЕТ"}\n")
-        if (!ready) { sb.append("→ Скачайте модель."); return@withContext sb.toString() }
-        // 2. токенизатор есть?
-        val tok = LocalAiModelManager.tokenizerFile(context)
-        sb.append("2. Токенизатор: ${if (tok.exists() && tok.length() > 1000) "есть (${tok.length()} б)" else "НЕТ или пустой"}\n")
-        // 3. класс движка найден?
-        val cls = moduleClass()
-        sb.append("3. Класс ExecuTorch: ${if (cls != null) "найден (${cls.name})" else "НЕ НАЙДЕН"}\n")
-        if (cls == null) { sb.append("→ Библиотека ExecuTorch не подключилась."); return@withContext sb.toString() }
-        val cb = callbackClass()
-        sb.append("4. Класс Callback: ${if (cb != null) "найден" else "НЕ НАЙДЕН"}\n")
-        // 5. модель грузится?
-        val t0 = System.currentTimeMillis()
-        val mod = loadModule(context, modelId)
-        sb.append("5. Загрузка модели: ${if (mod != null) "успех (${System.currentTimeMillis()-t0} мс)" else "ПРОВАЛ"}\n")
-        if (mod == null) { sb.append("→ Модель не загрузилась (проверьте формат .pte и нативные библиотеки)."); return@withContext sb.toString() }
-        // 6. генерация?
-        val t1 = System.currentTimeMillis()
-        val sys = "Ответь одним словом."; val usr = "Скажи: привет"
-        val fp = buildPrompt(sys, usr)
-        val out = cleanResponse(runGenerate(mod, fp), fp, sys, usr)
-        val genOk = !out.isNullOrBlank()
-        val genTime = System.currentTimeMillis() - t1
-        if (genOk) {
-            sb.append("6. Генерация: РАБОТАЕТ ($genTime мс)\n")
-            sb.append("   ответ: ").append(out!!.take(60)).append("\n")
-        } else {
-            sb.append("6. Генерация: пустой результат\n")
-        }
-        sb.append("\nИтог: ").append(if (genOk) "OK Локальный ИИ работает!" else "Модель грузится, но не генерирует.")
-        lastStatus = if (genOk) "работает" else "генерация пустая"
-        Diagnostics.info("САМОПРОВЕРКА локального ИИ:\n${sb}")
-        sb.toString()
-    }
-
-    // Создаёт LlmGenerationConfig с параметрами ПРОТИВ зацикливания:
     // repetition_penalty > 1, temperature ~0.7, ограничение длины.
     private fun buildGenConfig(cfgCls: Class<*>): Any? {
         return try {
