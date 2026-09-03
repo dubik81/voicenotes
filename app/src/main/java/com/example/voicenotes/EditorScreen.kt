@@ -347,6 +347,7 @@ fun EditorScreen(
             }
             aiRunning = true
             cornerIndicator = if (settings.localAi) "ai-local" else "ai-cloud"
+            val tUpd = System.currentTimeMillis()
             Diagnostics.action("Обновить смысл ($level), движок=${if (settings.localAi) "локальный" else "облачный"}")
             // Таймаут-страховка: если за 45 сек не завершилось — сбрасываем блокировку.
             val watchdog = scope.launch {
@@ -361,6 +362,7 @@ fun EditorScreen(
                 watchdog.cancel()
                 onChanged(); refreshTick++
                 aiRunning = false; cornerIndicator = ""
+                Diagnostics.event("Обновление $level заняло ${System.currentTimeMillis() - tUpd} мс")
                 status = if (ok) "Готово" else "ИИ не смог обработать"
             }
         }
@@ -390,6 +392,7 @@ fun EditorScreen(
     // Whisper-текст уже получен функцией runWhisper. По кнопке ✨ или авто.
     fun sendToAi() {
         if (original.isBlank()) return
+        val tStart = System.currentTimeMillis()
         Diagnostics.action("Кнопка ИИ / автозапуск (движок смысла=${if (settings.localAi) "локальный" else "облачный"})")
         val voskText = original
         aiRunning = true
@@ -427,7 +430,10 @@ fun EditorScreen(
                 status = "Готово"
             } catch (e: Exception) {
                 status = "Ошибка: ${e.message}"
-            } finally { aiRunning = false; cornerIndicator = "" }
+            } finally {
+                aiRunning = false; cornerIndicator = ""
+                Diagnostics.event("Обработка ИИ заняла ${System.currentTimeMillis() - tStart} мс")
+            }
         }
     }
 
