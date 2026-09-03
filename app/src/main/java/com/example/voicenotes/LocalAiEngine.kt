@@ -220,9 +220,9 @@ object LocalAiEngine {
     // Правильный chat-формат Llama 3.2 (instruct). Без этих токенов модель
     // не понимает структуру диалога и зацикливается.
     private fun buildPrompt(system: String, user: String): String =
-        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n" +
-        "$system<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n" +
-        "$user<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n" +
+        "$system<|eot_id|><|start_header_id|>user<|end_header_id|>\n" +
+        "$user<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"
 
     private fun releaseCurrent() {
         try { module?.let { m -> m.javaClass.getMethod("resetNative").invoke(m) } } catch (_: Throwable) {}
