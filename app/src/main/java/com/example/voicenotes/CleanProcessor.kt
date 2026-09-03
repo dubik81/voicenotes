@@ -76,8 +76,13 @@ object CleanProcessor {
         }
         var res = sb.toString().trim()
         if (res.isNotEmpty() && res.last() !in charArrayOf('.', '!', '?')) res += "."
-        // заглавная «Я»
         res = res.replace(Regex("(?<=^|\\s)я(?=[\\s,.!?]|$)"), "Я")
+        // Нормализация двойной пунктуации.
+        res = res.replace(Regex("\\s+([,.!?])"), "$1")
+        res = res.replace(Regex(",\\s*\\."), ".")
+        res = res.replace(Regex("\\.{2,}"), ".")
+        res = res.replace(Regex(",{2,}"), ",")
+        res = res.replace(Regex("([.!?])\\s*,"), "$1")
         return capitalizeSentences(res)
     }
 

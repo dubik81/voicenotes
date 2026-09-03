@@ -35,6 +35,7 @@ object LocalAiEngine {
 
     @Volatile private var module: Any? = null
     @Volatile private var loadedId: String? = null
+    @Volatile private var lastResetOk: Boolean = true
 
     suspend fun generate(context: Context, systemPrompt: String, userText: String, modelId: String): String? =
         withContext(Dispatchers.IO) {
@@ -45,6 +46,9 @@ object LocalAiEngine {
                 if (moduleClass() == null) {
                     lastStatus = "класс ExecuTorch не найден"; return@withContext null
                 }
+                // Защита от утечки между заметками: если прошлый сброс контекста НЕ сработал,
+                // принудительно выгружаем модуль — следующая загрузка будет с чистым состоянием.
+                if (!lastResetOk) { releaseCurrent(); Diagnostics.info("Модель выгружена для чистого старта") }
                 val mod = loadModule(context, modelId)
                 if (mod == null) { lastStatus = "модель не загрузилась"; return@withContext null }
                 val fullPrompt = buildPrompt(systemPrompt, userText)
@@ -139,10 +143,20 @@ object LocalAiEngine {
         return try {
             val cls = mod.javaClass
             val genMethods = cls.methods.filter { it.name == "generate" }
-            // КЛЮЧЕВОЕ: перед каждой генерацией сбрасываем контекст (KV-кэш).
-            // Без этого второй и последующие запросы падают (Prefill failed error 3).
-            try { cls.getMethod("resetContext").invoke(mod); Diagnostics.info("resetContext OK") }
-            catch (e: Throwable) { Diagnostics.info("resetContext нет: ${e.message?.take(40)}") }
+            // КЛЮЧЕВОЕ против утечки между заметками: сброс контекста (KV-кэш).
+            // Пробуем resetContext; если недоступен — модуль будет перезагружен
+            // принудительно в generate() через forceReload (см. вызывающий код).
+            var resetOk = false
+            try { cls.getMethod("resetContext").invoke(mod); resetOk = true; Diagnostics.info("resetContext OK") }
+            catch (_: Throwable) {
+                // пробуем альтернативные имена
+                for (name in listOf("reset", "resetNative", "resetKVCache")) {
+                    try { cls.getMethod(name).invoke(mod); resetOk = true; Diagnostics.info("$name OK"); break }
+                    catch (_: Throwable) {}
+                }
+            }
+            if (!resetOk) Diagnostics.info("сброс контекста недоступен — будет перезагрузка модели")
+            lastResetOk = resetOk
 
             val cb = LocalAiCallback()
             Diagnostics.event("Вызываю generate, длина промпта=${prompt.length}")

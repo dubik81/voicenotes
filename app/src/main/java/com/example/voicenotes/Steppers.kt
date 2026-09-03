@@ -18,6 +18,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -70,17 +71,20 @@ fun LevelStepper(
     selected: Int,
     accent: Color,
     readyState: (Int) -> VariantProcessor.State,
+    disabledLevels: Set<Int> = emptySet(),
     onSelect: (Int) -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         Level.entries.forEachIndexed { i, lvl ->
             val isSel = i == selected
+            val disabled = i in disabledLevels
             val st = readyState(i)
             Column(
                 Modifier.weight(1f).clip(RoundedCornerShape(10.dp))
                     .background(if (isSel) accent else cs.surfaceVariant)
-                    .clickable { onSelect(i) }
+                    .then(if (disabled) Modifier else Modifier.clickable { onSelect(i) })
+                    .alpha(if (disabled) 0.4f else 1f)
             ) {
                 Box(Modifier.fillMaxWidth().height(34.dp), contentAlignment = Alignment.Center) {
                     Text(

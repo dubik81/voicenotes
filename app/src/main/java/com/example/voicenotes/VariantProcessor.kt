@@ -74,7 +74,6 @@ class VariantProcessor(
     // Полностью офлайн-обработка на правилах (без ИИ) — гарантированный результат.
     private fun rulesBasedAll(text: String): Map<String, String> {
         val result = mutableMapOf<String, String>()
-        for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = Punctuator.punctuate(text)
         val t = Tone.NEUTRAL.ordinal
         result["${Level.CLEAN.ordinal}:$t"] = CleanProcessor.clean(text)
         result["${Level.BRIEF.ordinal}:$t"] = TextCondenser.condense(text, Level.BRIEF)
@@ -105,20 +104,13 @@ class VariantProcessor(
         val result = mutableMapOf<String, String>()
         val t = Tone.NEUTRAL.ordinal
         fun okRes(r: String?, minLen: Int) = !r.isNullOrBlank() && !isLoopy(r) && r.length >= minLen
-        // Дословно
-        val v = LocalAiEngine.generate(context, localPromptFor(Level.VERBATIM, false), text, model)
-        val vClean = if (okRes(v, text.length / 3)) v!! else Punctuator.punctuate(text)
-        for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = vClean
-        // ЧИСТО — гибрид: правила чистят, ИИ полирует
+        // Дословно — пунктуатор (надёжно).
+        // ЧИСТО — единственная задача локального ИИ. Гибрид: правила чистят → ИИ полирует.
         val cInput = CleanProcessor.clean(text)
         val c = LocalAiEngine.generate(context, localPromptFor(Level.CLEAN, false), cInput, model)
         result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3)) c!! else cInput
-        // Кратко
-        val b = LocalAiEngine.generate(context, localPromptFor(Level.BRIEF, false), text, model)
-        result["${Level.BRIEF.ordinal}:$t"] = if (okRes(b, 10)) b!! else TextCondenser.condense(text, Level.BRIEF)
-        // Суть
-        val g = LocalAiEngine.generate(context, localPromptFor(Level.GIST, false), text, model)
-        result["${Level.GIST.ordinal}:$t"] = if (okRes(g, 5)) g!! else TextCondenser.condense(text, Level.GIST)
+        // Кратко/Суть при локальном ИИ НЕ считаем (модель 1B слаба для сжатия) —
+        // кнопки неактивны в интерфейсе.
         return result
     }
 
@@ -126,15 +118,14 @@ class VariantProcessor(
         val model = settings.localAiModel
         val result = mutableMapOf<String, String>()
         val t = Tone.NEUTRAL.ordinal
-        LocalAiEngine.generate(context,
-            "Это лекция. Оформи как стенограмму: исправь ошибки распознавания, расставь пунктуацию, абзацы. Сохрани всё содержание и слова. Верни только текст.",
-            text, model)?.let { result["${Level.CLEAN.ordinal}:$t"] = it }
-        LocalAiEngine.generate(context,
-            "Это лекция. Изложи ЕЁ СОДЕРЖАНИЕ кратко (не рассказывай о лекции, а сожми саму лекцию). Верни только текст.",
-            text, model)?.let { result["${Level.BRIEF.ordinal}:$t"] = it }
-        LocalAiEngine.generate(context,
-            "Это лекция. Изложи её содержание максимально коротко, самую суть. Верни только текст.",
-            text, model)?.let { result["${Level.GIST.ordinal}:$t"] = it }
+        fun okRes(r: String?, minLen: Int) = !r.isNullOrBlank() && !isLoopy(r) && r.length >= minLen
+        // Лекция + локальный ИИ: делаем только стенограмму (Чисто). Гибрид с правилами.
+        val cInput = CleanProcessor.clean(text)
+        val c = LocalAiEngine.generate(context,
+            "Ты редактор лекции. Оформи текст пользователя как читаемую стенограмму: расставь пунктуацию, абзацы, убери оговорки, сохрани всё содержание. Выведи только результат.",
+            cInput, model)
+        result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3)) c!! else cInput
+        // Кратко/Суть при локальном не считаем (неактивны в интерфейсе).
         return result
     }
 
@@ -166,9 +157,9 @@ class VariantProcessor(
                     }
                     try {
                         val all = if (note.isLecture)
-                            processLectureRouted(note.original)
+                            processLectureRouted(note.refinedText ?: note.original)
                         else
-                            processAllRouted(note.original)
+                            processAllRouted(note.refinedText ?: note.original)
                         Diagnostics.info("В обработку ушёл текст (${note.original.length} симв): \"${note.original.take(50)}...\"")
                         // Умный заголовок стенограммы от ИИ.
                         all["TITLE"]?.takeIf { it.isNotBlank() }?.let { note.title = it }
@@ -180,15 +171,8 @@ class VariantProcessor(
                                 states[k(note.id, l, t)] = State.DONE
                             }
                         }
-                        // Дословный вариант от ИИ (умная пунктуация) — сохраняем отдельно.
-                        if (!note.isLecture) {
-                            val vKey = "${Level.VERBATIM.ordinal}:${Tone.NEUTRAL.ordinal}"
-                            all[vKey]?.takeIf { it.isNotBlank() }?.let {
-                                note.putVariant(Level.VERBATIM, Tone.NEUTRAL, it)
-                                // для всех тонов дословный одинаковый
-                                for (t in Tone.entries) note.putVariant(Level.VERBATIM, t, it)
-                            }
-                        }
+                        // «Дословно» (VERBATIM) НЕ трогаем — оно всегда исходный текст,
+                        // не меняется после ИИ (требование пользователя).
                         progressDone[note.id] = combos.count { (l, t) -> note.getVariant(l, t) != null }
                         persist()
                         val allDone = combos.all { (l, t) -> note.getVariant(l, t) != null }
@@ -252,7 +236,7 @@ class VariantProcessor(
 
     /** Вычисление одного варианта с проверкой длины. */
     private suspend fun computeOne(note: Note, l: Level, t: Tone, vary: Boolean = false): String {
-        val orig = note.original
+        val orig = note.refinedText ?: note.original
         // Роутинг: локальный ИИ (если выбран офлайн) или облачный.
         if (settings.useAI && settings.localAi &&
             LocalAiModelManager.isReady(context, settings.localAiModel)) {

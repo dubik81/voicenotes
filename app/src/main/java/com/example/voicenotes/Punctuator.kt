@@ -55,6 +55,13 @@ object Punctuator {
 
         if (t.isNotEmpty() && t.last() !in charArrayOf('.', '!', '?')) t += "."
         t = t.replace(Regex("(?<=^|\\s)я(?=[\\s,.!?]|$)"), "Я")
+        // Нормализация двойной пунктуации: «,.» → «.», «,,» → «,», «..» → «.»,
+        // пробел перед знаком препинания убираем.
+        t = t.replace(Regex("\\s+([,.!?])"), "$1")
+        t = t.replace(Regex(",\\s*\\."), ".")
+        t = t.replace(Regex("\\.{2,}"), ".")
+        t = t.replace(Regex(",{2,}"), ",")
+        t = t.replace(Regex("([.!?])\\s*,"), "$1")
 
         return capitalizeSentences(t)
     }

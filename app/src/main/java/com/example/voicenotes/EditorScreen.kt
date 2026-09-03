@@ -94,8 +94,10 @@ fun EditorScreen(
         original.isBlank() -> ""
         level == Level.VERBATIM -> {
             refreshTick
-            // Вариант ИИ с умной пунктуацией (из variants) или офлайн-пунктуатор.
-            note.variants[note.variantKey(Level.VERBATIM, tone)] ?: Punctuator.punctuate(original)
+            // Показываем текст как есть: для импорта — сырой (что вставил),
+            // для Vosk/Whisper — пунктуированный (persist уже применил пунктуатор).
+            note.variants[note.variantKey(Level.VERBATIM, tone)]
+                ?: note.original.ifBlank { original }
         }
         else -> { refreshTick; note.getVariant(level, tone) ?: "" }
     }
@@ -117,7 +119,7 @@ fun EditorScreen(
     DisposableEffect(Unit) { onDispose { recognizer?.destroy(); audioPlayer.stop() } }
 
     fun persist() {
-        // Сохраняем пунктуированный текст (иначе теряется пунктуация).
+        // Для распознавания (Vosk/Whisper) сохраняем пунктуированный текст.
         note.original = Punctuator.punctuate(original)
         onChanged()
     }
@@ -127,7 +129,6 @@ fun EditorScreen(
         // Полный пересчёт: сбрасываем и считаем заново (новый исходный текст).
         processor.reset(note.id)
         note.variants.clear()
-        // Чистим и историю вариантов — иначе останутся версии от старого текста.
         note.history.clear()
         note.historyIndex.clear()
         persist()
@@ -303,8 +304,19 @@ fun EditorScreen(
     fun updateCurrent() {
         Diagnostics.action("Кнопка Обновить (уровень=${level.name})")
         if (level == Level.VERBATIM) {
-            val path = note.audioPath ?: return
-            if (note.recordMode == "google" || !File(path).exists()) return
+            val path = note.audioPath
+            // Импорт (нет аудио): «Обновить» = чистка/пунктуация по правилам.
+            if (path == null || note.recordMode == "google" || !File(path).exists()) {
+                if (original.isBlank()) return
+                val cleaned = CleanProcessor.clean(original)
+                original = cleaned
+                note.original = cleaned
+                note.putVariant(Level.VERBATIM, tone, cleaned)
+                onChanged(); refreshTick++
+                status = "Текст почищен по правилам"
+                Diagnostics.action("Обновить (импорт): чистка правилами")
+                return
+            }
             voskRerunning = true; cornerIndicator = "vosk"
             scope.launch {
                 try {
@@ -407,8 +419,9 @@ fun EditorScreen(
                     assembled = wt
                 }
                 if (assembled.isNotBlank()) {
-                    original = assembled
-                    note.original = Punctuator.punctuate(assembled)
+                    // Собранный ансамблем текст — основа для смыслов (Чисто/Кратко/Суть).
+                    // «Дословно» (note.original) НЕ трогаем — оно остаётся исходным.
+                    note.refinedText = assembled
                 }
                 processAfterRecording()
                 status = "Готово"
@@ -561,6 +574,7 @@ fun EditorScreen(
                     if (importText.isNotBlank()) {
                         original = importText.trim()
                         note.original = importText.trim()
+                        note.refinedText = null  // сброс собранного текста от прошлого
                         note.variants.clear(); note.history.clear(); note.historyIndex.clear()
                         processor.reset(note.id)
                         Diagnostics.action("Импорт текста (${importText.length} симв) для теста")
@@ -777,8 +791,8 @@ fun EditorScreen(
                     // «Обновить» показывается:
                     //  - в Дословно (офлайн, есть аудио) — перераспознать;
                     //  - в смыслах, когда смыслы готовы — переосмыслить.
-                    val canReupdate = level == Level.VERBATIM && note.recordMode != "google" &&
-                            note.audioPath != null && File(note.audioPath!!).exists()
+                    val canReupdate = level == Level.VERBATIM && original.isNotBlank()
+                    // (для аудио — перераспознавание, для импорта — чистка по правилам)
                     // Обработка смысла доступна всегда: облако / локальный ИИ / правила-запас.
                     val aiAvailable = settings.useAI || settings.localAi
                     val showUpdate = canReupdate || (level != Level.VERBATIM && smyslyReady && aiAvailable)
@@ -863,7 +877,9 @@ fun EditorScreen(
                     LevelStepper(
                         selected = levelIdx,
                         accent = accent,
-                        readyState = { i -> tick; variantStateFor(note, processor, Level.fromIndex(i), tone) }
+                        readyState = { i -> tick; variantStateFor(note, processor, Level.fromIndex(i), tone) },
+                        // При локальном ИИ доступны только Дословно и Чисто (модель 1B слаба для сжатия).
+                        disabledLevels = if (settings.localAi) setOf(Level.BRIEF.ordinal, Level.GIST.ordinal) else emptySet()
                     ) { levelIdx = it }
                     Text(TextCondenser.zoneHint(level), color = accent, fontSize = 12.sp)
 
