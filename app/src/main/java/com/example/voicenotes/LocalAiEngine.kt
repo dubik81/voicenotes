@@ -160,31 +160,33 @@ object LocalAiEngine {
 
             val cb = LocalAiCallback()
             Diagnostics.event("Вызываю generate, длина промпта=${prompt.length}")
-            // Рабочая сигнатура (по логу): generate(String, LlmCallback). Трёхаргументная
-            // (String,int,cb) падает на префилле — не используем.
-            val m2 = genMethods.firstOrNull {
-                it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java
+            // ОБРАЗЕЦ Meta LlamaDemo: generate(prompt, sequence_length, callback).
+            // sequence_length ОБЯЗАТЕЛЕН — держит контекст в рамках, иначе Prefill failed
+            // на следующем запросе. seqLen = длина промпта + запас на ответ.
+            val seqLen = (prompt.length / 3 + 200).coerceIn(128, 768)
+            val m3 = genMethods.firstOrNull {
+                it.parameterTypes.size == 3 && it.parameterTypes[1] == Int::class.javaPrimitiveType &&
+                it.parameterTypes[2].simpleName == "LlmCallback"
             }
-            if (m2 != null) {
+            if (m3 != null) {
                 try {
-                    m2.invoke(mod, prompt, cb)
-                    Diagnostics.event("generate(String,cb): callback=${cb.calls}, собрано=${cb.sb.length}")
+                    m3.invoke(mod, prompt, seqLen, cb)
+                    Diagnostics.event("generate(String,$seqLen,cb): callback=${cb.calls}, собрано=${cb.sb.length}")
                 } catch (e: Throwable) {
                     val msg = (e as? java.lang.reflect.InvocationTargetException)?.targetException?.message ?: e.message
-                    Diagnostics.error("generate(String,cb): ${msg?.take(80)}")
+                    Diagnostics.error("generate(String,int,cb): ${msg?.take(80)}")
                 }
             }
-            // запас: (String, int, LlmCallback) если двухаргументной нет
+            // запас: (String, LlmCallback) без лимита
             if (cb.sb.isEmpty()) {
                 genMethods.firstOrNull {
-                    it.parameterTypes.size == 3 && it.parameterTypes[1] == Int::class.javaPrimitiveType &&
-                    it.parameterTypes[2].simpleName == "LlmCallback"
+                    it.parameterTypes.size == 2 && it.parameterTypes[0] == String::class.java
                 }?.let { m ->
-                    try { m.invoke(mod, prompt, 256, cb)
-                        Diagnostics.event("generate(String,int,cb): callback=${cb.calls}, собрано=${cb.sb.length}")
+                    try { m.invoke(mod, prompt, cb)
+                        Diagnostics.event("generate(String,cb): callback=${cb.calls}, собрано=${cb.sb.length}")
                     } catch (e: Throwable) {
                         val msg = (e as? java.lang.reflect.InvocationTargetException)?.targetException?.message ?: e.message
-                        Diagnostics.error("generate(String,int,cb): ${msg?.take(80)}")
+                        Diagnostics.error("generate(String,cb): ${msg?.take(80)}")
                     }
                 }
             }
@@ -247,14 +249,13 @@ object LocalAiEngine {
                 return@withContext r ?: text
             }
             val chunks = splitIntoChunks(text, 100)
-            Diagnostics.info("Чанкинг: ${chunks.size} кусков (полная изоляция)")
+            Diagnostics.info("Чанкинг: ${chunks.size} кусков")
             val results = ArrayList<String>()
+            // Модель грузится ОДИН раз (как в демо Meta). Между кусками — resetContext
+            // (наши куски независимы, не чат — чистим контекст, но НЕ перезагружаем модель).
             for ((i, chunk) in chunks.withIndex()) {
-                // ПОЛНАЯ ИЗОЛЯЦИЯ: выгружаем модель, грузим заново для ОДНОГО куска.
-                // Модель обрабатывает кусок как первый и единственный запрос.
-                forceReload()
                 val t0 = System.currentTimeMillis()
-                val r = generate(context, systemPrompt, chunk, modelId)
+                val r = generate(context, systemPrompt, chunk, modelId)  // resetContext внутри
                 val good = !r.isNullOrBlank() && r.length <= chunk.length * 2 && !isLoopyLocal(r)
                 val piece = if (good) r!! else chunk
                 results.add(piece)
