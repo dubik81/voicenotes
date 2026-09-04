@@ -886,9 +886,7 @@ fun EditorScreen(
                     LevelStepper(
                         selected = levelIdx,
                         accent = accent,
-                        readyState = { i -> tick; variantStateFor(note, processor, Level.fromIndex(i), tone) },
-                        // При локальном ИИ доступны только Дословно и Чисто (модель 1B слаба для сжатия).
-                        disabledLevels = if (settings.localAi) setOf(Level.BRIEF.ordinal, Level.GIST.ordinal) else emptySet()
+                        readyState = { i -> tick; variantStateFor(note, processor, Level.fromIndex(i), tone) }
                     ) { levelIdx = it }
                     Text(TextCondenser.zoneHint(level), color = accent, fontSize = 12.sp)
 

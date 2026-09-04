@@ -104,14 +104,17 @@ class VariantProcessor(
         val result = mutableMapOf<String, String>()
         val t = Tone.NEUTRAL.ordinal
         fun okRes(r: String?, minLen: Int) = !r.isNullOrBlank() && !isLoopy(r) && r.length >= minLen
-        // Дословно — пунктуатор (надёжно).
-        // ЧИСТО — единственная задача локального ИИ. Гибрид: правила чистят → ИИ полирует.
-        // Через ЧАНКИНГ (по кускам) — иначе локальный падает на длинном тексте.
-        val cInput = CleanProcessor.clean(text)
-        val c = LocalAiEngine.processLong(context, localPromptFor(Level.CLEAN, false), cInput, model)
-        result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3) && !tooDistorted(c!!, cInput)) c else cInput
-        // Кратко/Суть при локальном ИИ НЕ считаем (модель 1B слаба для сжатия) —
-        // кнопки неактивны в интерфейсе.
+        // Дословно — как есть.
+        for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = text
+        // ЧИСТО — надёжные правила (модель не умеет дословное редактирование, выдумывает).
+        result["${Level.CLEAN.ordinal}:$t"] = CleanProcessor.clean(text)
+        // КРАТКО и СУТЬ — РОДНАЯ задача модели (суммаризация, для чего Meta её создала).
+        val b = LocalAiEngine.generate(context,
+            "Кратко перескажи главное из этого текста в 2-3 предложениях:", text, model)
+        result["${Level.BRIEF.ordinal}:$t"] = if (okRes(b, 10)) b!! else TextCondenser.condense(text, Level.BRIEF)
+        val g = LocalAiEngine.generate(context,
+            "Одним предложением напиши, о чём этот текст:", text, model)
+        result["${Level.GIST.ordinal}:$t"] = if (okRes(g, 5)) g!! else TextCondenser.condense(text, Level.GIST)
         return result
     }
 
@@ -241,26 +244,22 @@ class VariantProcessor(
         // Роутинг: локальный ИИ (если выбран офлайн) или облачный.
         if (settings.useAI && settings.localAi &&
             LocalAiModelManager.isReady(context, settings.localAiModel)) {
-            // Для CLEAN: сначала правила убирают паразитов (надёжно), затем локальный ИИ
-            // полирует уже ЧИСТЫЙ текст — слабой модели так проще, результат лучше.
-            val input = if (l == Level.CLEAN) CleanProcessor.clean(orig) else orig
-            val sys = localPromptFor(l, note.isLecture)
-            // Чисто — через чанкинг (по кускам), иначе падает на длинном.
-            val res = if (l == Level.CLEAN)
-                LocalAiEngine.processLong(context, sys, input, settings.localAiModel)
-            else LocalAiEngine.generate(context, sys, input, settings.localAiModel)
-            if (!res.isNullOrBlank() && !isLoopy(res) && res.length >= input.length / 3 &&
-                !tooDistorted(res, input)) {
-                Diagnostics.engine("Один вариант ($l): локальный ИИ, ${res.length} симв")
-                return res
-            }
-            // Локальный слаб на этом тексте → надёжный результат по правилам.
-            Diagnostics.engine("$l: локальный слаб → правила")
-            return when (l) {
-                Level.CLEAN -> CleanProcessor.clean(orig)
-                Level.BRIEF -> TextCondenser.condense(orig, Level.BRIEF)
-                Level.GIST -> TextCondenser.condense(orig, Level.GIST)
-                else -> Punctuator.punctuate(orig)
+            // По назначению модели Meta: суммаризация (Кратко/Суть) — её задача,
+            // дословное редактирование (Чисто) — НЕ её (выдумывает) → правила.
+            when (l) {
+                Level.CLEAN -> { Diagnostics.engine("Чисто: правила (модель не редактирует)"); return CleanProcessor.clean(orig) }
+                Level.VERBATIM -> return Punctuator.punctuate(orig)
+                else -> {
+                    val prompt = if (l == Level.BRIEF)
+                        "Кратко перескажи главное из этого текста в 2-3 предложениях:"
+                    else "Одним предложением напиши, о чём этот текст:"
+                    val res = LocalAiEngine.generate(context, prompt, orig, settings.localAiModel)
+                    if (!res.isNullOrBlank() && !isLoopy(res)) {
+                        Diagnostics.engine("$l: локальный ИИ (суммаризация), ${res.length} симв")
+                        return res
+                    }
+                    return TextCondenser.condense(orig, l)
+                }
             }
         }
         val result = if (settings.useAI)
