@@ -40,6 +40,7 @@ object LocalAiEngine {
     suspend fun generate(context: Context, systemPrompt: String, userText: String, modelId: String): String? =
         withContext(Dispatchers.IO) {
             try {
+                Diagnostics.info("Локальный ИИ: модель=$modelId, файл=${LocalAiModelManager.modelFile(context, modelId).name}, скачана=${LocalAiModelManager.isReady(context, modelId)}")
                 if (!LocalAiModelManager.isReady(context, modelId)) {
                     lastStatus = "модель не скачана"; return@withContext null
                 }
