@@ -18,8 +18,8 @@ android {
         applicationId "com.example.voicenotes"
         minSdk 24
         targetSdk 34
-        versionCode 83
-        versionName "83.0"
+        versionCode 86
+        versionName "86.0"
         ndk {
             // Whisper работает только на arm64-v8a (покрывает все современные телефоны,
             // включая Samsung S25). Ограничение упрощает и ускоряет сборку.

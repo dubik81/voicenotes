@@ -236,49 +236,79 @@ object LocalAiEngine {
      * локальная модель НЕ падает на префилле (Prefill failed на длинном). Лимит времени.
      */
     suspend fun processLong(context: Context, systemPrompt: String, text: String,
-                            modelId: String, deadlineMs: Long = 20000): String? =
+                            modelId: String,
+                            onProgress: ((done: Int, total: Int, partial: String) -> Unit)? = null): String? =
         withContext(Dispatchers.IO) {
             val start = System.currentTimeMillis()
-            if (text.length <= 200) return@withContext generate(context, systemPrompt, text, modelId)
-            val chunks = splitIntoChunks(text, 150)
-            Diagnostics.info("Чанкинг: ${chunks.size} кусков")
-            val out = StringBuilder()
-            for ((i, chunk) in chunks.withIndex()) {
-                if (System.currentTimeMillis() - start > deadlineMs) {
-                    Diagnostics.info("Чанкинг: лимит времени, обработано $i из ${chunks.size}")
-                    for (j in i until chunks.size) out.append(chunks[j]).append(" ")
-                    break
-                }
-                val r = generate(context, systemPrompt, chunk, modelId)
-                out.append(if (!r.isNullOrBlank()) r else chunk).append(" ")
+            if (text.length <= 120) {
+                forceReload()
+                val r = generate(context, systemPrompt, text, modelId)
+                onProgress?.invoke(1, 1, r ?: text)
+                return@withContext r ?: text
             }
-            Diagnostics.info("Чанкинг завершён за ${System.currentTimeMillis()-start} мс")
-            out.toString().trim().ifBlank { null }
+            val chunks = splitIntoChunks(text, 100)
+            Diagnostics.info("Чанкинг: ${chunks.size} кусков (полная изоляция)")
+            val results = ArrayList<String>()
+            for ((i, chunk) in chunks.withIndex()) {
+                // ПОЛНАЯ ИЗОЛЯЦИЯ: выгружаем модель, грузим заново для ОДНОГО куска.
+                // Модель обрабатывает кусок как первый и единственный запрос.
+                forceReload()
+                val t0 = System.currentTimeMillis()
+                val r = generate(context, systemPrompt, chunk, modelId)
+                val good = !r.isNullOrBlank() && r.length <= chunk.length * 2 && !isLoopyLocal(r)
+                val piece = if (good) r!! else chunk
+                results.add(piece)
+                Diagnostics.event("Кусок ${i+1}/${chunks.size}: ${if (good) "ОК" else "откат"} (${System.currentTimeMillis()-t0} мс)")
+                onProgress?.invoke(i + 1, chunks.size, results.joinToString(" "))
+            }
+            Diagnostics.info("Чанкинг завершён: ${chunks.size} кусков за ${System.currentTimeMillis()-start} мс")
+            results.joinToString(" ").trim().ifBlank { null }
         }
 
-    private fun splitIntoChunks(text: String, maxLen: Int): List<String> {
-        val result = ArrayList<String>()
+    /** Принудительная выгрузка модели — следующая генерация с чистого состояния. */
+    fun forceReload() { releaseCurrent() }
+
+    // Детект зацикливания (фраза повторяется).
+    private fun isLoopyLocal(text: String): Boolean {
+        val w = text.split(Regex("\\s+")).filter { it.length > 1 }
+        if (w.size < 8) return false
+        val tri = HashMap<String, Int>()
+        for (i in 0..w.size - 3) {
+            val k = "${w[i]} ${w[i+1]} ${w[i+2]}".lowercase()
+            val c = (tri[k] ?: 0) + 1; tri[k] = c
+            if (c >= 3) return true
+        }
+        return false
+    }
+
+    private fun splitIntoChunks(text: String, target: Int): List<String> {
         val sentences = text.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
-        val cur = StringBuilder()
+        val chunks = ArrayList<String>()
+        var cur = StringBuilder()
         for (s in sentences) {
-            if (cur.isNotEmpty() && cur.length + s.length > maxLen) {
-                result.add(cur.toString().trim()); cur.clear()
-            }
-            if (s.length > maxLen) {
-                if (cur.isNotEmpty()) { result.add(cur.toString().trim()); cur.clear() }
+            if (s.length > target * 1.5) {
+                if (cur.isNotEmpty()) { chunks.add(cur.toString().trim()); cur = StringBuilder() }
                 val words = s.split(" ")
                 val wb = StringBuilder()
                 for (w in words) {
-                    if (wb.isNotEmpty() && wb.length + w.length > maxLen) {
-                        result.add(wb.toString().trim()); wb.clear()
+                    if (wb.isNotEmpty() && wb.length + w.length > target) {
+                        chunks.add(wb.toString().trim()); wb.clear()
                     }
                     wb.append(w).append(" ")
                 }
-                if (wb.isNotEmpty()) result.add(wb.toString().trim())
+                if (wb.isNotEmpty()) cur = StringBuilder(wb)
+            } else if (cur.isNotEmpty() && cur.length + s.length > target) {
+                chunks.add(cur.toString().trim()); cur = StringBuilder(s).append(" ")
             } else cur.append(s).append(" ")
         }
-        if (cur.isNotEmpty()) result.add(cur.toString().trim())
-        return result.filter { it.isNotBlank() }
+        if (cur.toString().isNotBlank()) chunks.add(cur.toString().trim())
+        // объединяем мелкие куски (<40 симв) с предыдущим
+        val merged = ArrayList<String>()
+        for (c in chunks) {
+            if (merged.isNotEmpty() && c.length < 40) merged[merged.size - 1] = merged.last() + " " + c
+            else merged.add(c)
+        }
+        return merged.filter { it.isNotBlank() }
     }
 
     // Правильный chat-формат Llama 3.2 (instruct). Без этих токенов модель
