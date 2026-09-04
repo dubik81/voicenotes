@@ -19,14 +19,20 @@ object LocalAiModelManager {
     val MODELS = mapOf(
         "small" to ModelInfo("small", "llama-1b-int4.pte",
             "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8-ET/resolve/main/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8.pte",
-            1100, "Малая 1B (~1.1 ГБ, быстрая)"),
-        "qlora" to ModelInfo("qlora", "llama-1b-qlora.pte",
-            "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-QLORA_INT4_EO8-ET/resolve/main/Llama-3.2-1B-Instruct-QLORA_INT4_EO8.pte",
-            1100, "Малая 1B QLoRA (~1.1 ГБ, точнее)"),
+            1100, "Llama 1B (для Кратко/Суть)"),
+        "qwen" to ModelInfo("qwen", "qwen25-1_5b.pte",
+            "https://huggingface.co/software-mansion/react-native-executorch-qwen-2.5/resolve/v0.8.0/qwen-2.5-1.5B/original/qwen2_5_1_5b_bf16.pte",
+            3100, "Qwen 2.5 1.5B (лучше для русского/Чисто)"),
         "bf16" to ModelInfo("bf16", "llama-1b-bf16.pte",
             "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-ET/resolve/main/Llama-3.2-1B-Instruct.pte",
-            2500, "Полная 1B (~2.5 ГБ, качество)")
+            2500, "Llama 1B полная (~2.5 ГБ)")
     )
+
+    // Токенизатор зависит от модели: Qwen — свой, Llama — свой.
+    fun tokenizerUrlFor(modelId: String): String = when (modelId) {
+        "qwen" -> "https://huggingface.co/software-mansion/react-native-executorch-qwen-2.5/resolve/v0.8.0/tokenizer.json"
+        else -> "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8-ET/resolve/main/tokenizer.model"
+    }
 
     // Токенизатор (нужен вместе с моделью для работы).
     const val TOKENIZER_URL =
@@ -77,7 +83,7 @@ object LocalAiModelManager {
         val tok = tokenizerFile(context)
         if (!tok.exists() || tok.length() < 1000) {
             try {
-                val tc = (URL(TOKENIZER_URL).openConnection() as HttpURLConnection).apply {
+                val tc = (URL(tokenizerUrlFor(modelId)).openConnection() as HttpURLConnection).apply {
                     connectTimeout = 20000; readTimeout = 60000; instanceFollowRedirects = true
                 }
                 if (tc.responseCode in 200..299) {
