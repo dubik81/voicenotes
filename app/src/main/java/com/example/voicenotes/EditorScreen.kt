@@ -806,7 +806,11 @@ fun EditorScreen(
                     // (для аудио — перераспознавание, для импорта — чистка по правилам)
                     // Обработка смысла доступна всегда: облако / локальный ИИ / правила-запас.
                     val aiAvailable = settings.useAI || settings.localAi
-                    val showUpdate = canReupdate || (level != Level.VERBATIM && smyslyReady && aiAvailable)
+                    // «Обновить» для смыслов: только если движок даёт вариации.
+                    // Локальное Чисто = правила (детерминированы) → Обновить бессмыслен, скрываем.
+                    val localCleanRules = settings.localAi && level == Level.CLEAN
+                    val showUpdate = canReupdate ||
+                        (level != Level.VERBATIM && smyslyReady && aiAvailable && !localCleanRules)
                     val showAiBtn = original.isNotBlank() && aiAvailable && !settings.autoAi && !smyslyReady
 
                     Row(

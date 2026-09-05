@@ -14,6 +14,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -252,7 +253,10 @@ fun SettingsScreen(
                              "Если модель не скачана — используется облачный ИИ.",
                             fontSize = 11.sp, color = cs.onSurfaceVariant)
                         Spacer(Modifier.height(8.dp))
-                        Text("Модель:", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = cs.onSurface)
+                        Text("Модель (нажми чтобы выбрать, затем «Скачать»):", fontSize = 13.sp,
+                            fontWeight = FontWeight.SemiBold, color = cs.onSurface)
+                        Text("Сейчас активна: ${LocalAiModelManager.MODELS[localAiModel]?.label ?: localAiModel}",
+                            fontSize = 11.sp, color = Palette.Amber)
                         Spacer(Modifier.height(4.dp))
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             LocalAiModelManager.MODELS.forEach { (id, info) ->
@@ -358,6 +362,17 @@ fun SettingsScreen(
                     SettingCard {
                         ToggleRow("Тёмная тема", dark, onDarkChange)
                     }
+
+                    Spacer(Modifier.height(16.dp))
+                    // Версия приложения.
+                    val verName = remember {
+                        try {
+                            context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "?"
+                        } catch (_: Exception) { "?" }
+                    }
+                    Text("Смысл · заметки   версия $verName",
+                        fontSize = 12.sp, color = cs.onSurfaceVariant,
+                        modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
 
                     Spacer(Modifier.height(24.dp))
                 }
