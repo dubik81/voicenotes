@@ -107,10 +107,10 @@ class VariantProcessor(
         for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = text
         // КРАТКО и СУТЬ — РОДНАЯ задача модели (суммаризация, для чего Meta её создала).
         val b = LocalAiEngine.generate(context,
-            "Кратко перескажи главное из этого текста в 2-3 предложениях:", text, model)
+            "Перескажи ВЕСЬ этот текст кратко, охватив все основные моменты С НАЧАЛА до конца, в 2-3 предложениях. Не пропускай начало:", text, model)
         val bRes = if (okRes(b, 10)) limitSentences(b!!, 4) else TextCondenser.condense(text, Level.BRIEF)
         val g = LocalAiEngine.generate(context,
-            "Одним предложением напиши, о чём этот текст:", text, model)
+            "Одним предложением опиши, о чём ВЕСЬ этот текст (охвати главное, не только конец):", text, model)
         val gRes = if (okRes(g, 5)) limitSentences(g!!, 2) else TextCondenser.condense(text, Level.GIST)
         // Заполняем ВСЕ тоны одинаково (локальная модель тон не различает).
         for (tn in Tone.entries) {
@@ -258,11 +258,16 @@ class VariantProcessor(
             // дословное редактирование (Чисто) — НЕ её (выдумывает) → правила.
             when (l) {
                 Level.CLEAN -> {
-                    // Пробуем модель для Чисто (Qwen умеет редактировать). Если выдумала
-                    // (сильно исказила/разбухла) — надёжные правила.
-                    val res = LocalAiEngine.generate(context,
-                        "Исправь ошибки и расставь знаки препинания в этом тексте, сохрани все слова:",
-                        orig, settings.localAiModel)
+                    // «Обновить» (vary) чередует промпты — Qwen даёт РАЗНЫЕ вариации.
+                    // ВАЖНО: пунктуацию распознавания НЕ сохранять слепо — она часто кривая
+                    // (точки посреди предложения). Исправлять по смыслу.
+                    val prompts = listOf(
+                        "Исправь этот текст: убери лишние и неправильные знаки препинания, расставь правильные по смыслу, исправь окончания слов. Знаки препинания из распознавания могут быть ошибочны — ставь по смыслу:",
+                        "Отредактируй текст грамотно: правильная пунктуация по смыслу (не доверяй точкам посреди предложений), верные окончания, заглавные буквы:",
+                        "Приведи в порядок: раздели на правильные предложения по смыслу, исправь пунктуацию и окончания. Не сохраняй ошибочные знаки препинания:"
+                    )
+                    val prompt = if (vary) prompts.random() else prompts[0]
+                    val res = LocalAiEngine.generate(context, prompt, orig, settings.localAiModel)
                     if (!res.isNullOrBlank() && !isLoopy(res) && !tooDistorted(res, orig) &&
                         res.length <= orig.length * 2) {
                         Diagnostics.engine("Чисто: локальная модель (${res.length} симв)")
@@ -274,8 +279,8 @@ class VariantProcessor(
                 Level.VERBATIM -> return Punctuator.punctuate(orig)
                 else -> {
                     val prompt = if (l == Level.BRIEF)
-                        "Кратко перескажи главное из этого текста в 2-3 предложениях:"
-                    else "Одним предложением напиши, о чём этот текст:"
+                        "Перескажи ВЕСЬ этот текст кратко, охватив все основные моменты С НАЧАЛА до конца, в 2-3 предложениях. Не пропускай начало:"
+                    else "Одним предложением опиши, о чём ВЕСЬ этот текст (охвати главное, не только конец):"
                     val res = LocalAiEngine.generate(context, prompt, orig, settings.localAiModel)
                     if (!res.isNullOrBlank() && !isLoopy(res)) {
                         // Ограничиваем длину: Суть — до 1-2 предложений, Кратко — до 3-4.

@@ -49,7 +49,11 @@ object LocalAiEngine {
                 }
                 // Защита от утечки между заметками: если прошлый сброс контекста НЕ сработал,
                 // принудительно выгружаем модуль — следующая загрузка будет с чистым состоянием.
-                if (!lastResetOk) { releaseCurrent(); Diagnostics.info("Модель выгружена для чистого старта") }
+                // ВСЕГДА выгружаем модель перед генерацией — каждый вызов "свежий",
+                // как первый. Иначе состояние копится → callback=0 (Qwen молчит на
+                // последующих вызовах). Это возвращает хорошее поведение Qwen.
+                releaseCurrent()
+                Diagnostics.info("Модель выгружена перед генерацией (свежий старт)")
                 val mod = loadModule(context, modelId)
                 if (mod == null) { lastStatus = "модель не загрузилась"; return@withContext null }
                 val fullPrompt = buildPrompt(systemPrompt, userText)

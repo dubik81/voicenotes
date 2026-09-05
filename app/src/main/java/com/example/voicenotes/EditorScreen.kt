@@ -664,7 +664,10 @@ fun EditorScreen(
         }
     }
 
-    val processing = !isListening && original.isNotBlank() && !currentReady
+    // Экран ожидания показывается, ПОКА реально идёт обработка (ИИ или перераспознавание),
+    // либо пока считаются варианты и текущий ещё не готов.
+    val processing = (aiRunning || voskRerunning || whisperRunning) ||
+        (!isListening && original.isNotBlank() && !currentReady && settings.useAI)
 
     Scaffold(containerColor = cs.background) { pad ->
         Column(Modifier.fillMaxSize().padding(pad)) {
