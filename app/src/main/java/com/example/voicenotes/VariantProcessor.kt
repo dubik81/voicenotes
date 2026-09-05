@@ -102,34 +102,44 @@ class VariantProcessor(
     private suspend fun localProcessAll(text: String): Map<String, String> {
         val model = settings.localAiModel
         val result = mutableMapOf<String, String>()
-        val t = Tone.NEUTRAL.ordinal
         fun okRes(r: String?, minLen: Int) = !r.isNullOrBlank() && !isLoopy(r) && r.length >= minLen
         // Дословно — как есть.
         for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = text
-        // ЧИСТО — надёжные правила (модель не умеет дословное редактирование, выдумывает).
-        result["${Level.CLEAN.ordinal}:$t"] = CleanProcessor.clean(text)
         // КРАТКО и СУТЬ — РОДНАЯ задача модели (суммаризация, для чего Meta её создала).
         val b = LocalAiEngine.generate(context,
             "Кратко перескажи главное из этого текста в 2-3 предложениях:", text, model)
-        result["${Level.BRIEF.ordinal}:$t"] = if (okRes(b, 10)) limitSentences(b!!, 4) else TextCondenser.condense(text, Level.BRIEF)
+        val bRes = if (okRes(b, 10)) limitSentences(b!!, 4) else TextCondenser.condense(text, Level.BRIEF)
         val g = LocalAiEngine.generate(context,
             "Одним предложением напиши, о чём этот текст:", text, model)
-        result["${Level.GIST.ordinal}:$t"] = if (okRes(g, 5)) limitSentences(g!!, 2) else TextCondenser.condense(text, Level.GIST)
+        val gRes = if (okRes(g, 5)) limitSentences(g!!, 2) else TextCondenser.condense(text, Level.GIST)
+        // Заполняем ВСЕ тоны одинаково (локальная модель тон не различает).
+        for (tn in Tone.entries) {
+            result["${Level.CLEAN.ordinal}:${tn.ordinal}"] = CleanProcessor.clean(text)
+            result["${Level.BRIEF.ordinal}:${tn.ordinal}"] = bRes
+            result["${Level.GIST.ordinal}:${tn.ordinal}"] = gRes
+        }
         return result
     }
 
     private suspend fun localProcessLecture(text: String): Map<String, String> {
         val model = settings.localAiModel
         val result = mutableMapOf<String, String>()
-        val t = Tone.NEUTRAL.ordinal
         fun okRes(r: String?, minLen: Int) = !r.isNullOrBlank() && !isLoopy(r) && r.length >= minLen
-        // Лекция + локальный ИИ: делаем только стенограмму (Чисто). Гибрид с правилами.
-        val cInput = CleanProcessor.clean(text)
-        val c = LocalAiEngine.processLong(context,
-            "Ты редактор лекции. Оформи текст пользователя как читаемую стенограмму: расставь пунктуацию, абзацы, убери оговорки, сохрани всё содержание. Выведи только результат.",
-            cInput, model)
-        result["${Level.CLEAN.ordinal}:$t"] = if (okRes(c, cInput.length / 3) && !tooDistorted(c!!, cInput)) c else cInput
-        // Кратко/Суть при локальном не считаем (неактивны в интерфейсе).
+        // По назначению модели: Чисто (стенограмма) — правила (модель выдумывает).
+        // Кратко/Суть (конспект лекции) — суммаризация, родная задача модели.
+        val cleanText = CleanProcessor.clean(text)
+        val b = LocalAiEngine.generate(context,
+            "Это лекция. Кратко изложи её содержание в 3-4 предложениях (конспект):", text, model)
+        val bRes = if (okRes(b, 10)) limitSentences(b!!, 5) else TextCondenser.condense(text, Level.BRIEF)
+        val g = LocalAiEngine.generate(context,
+            "Это лекция. Одним предложением: о чём она?", text, model)
+        val gRes = if (okRes(g, 5)) limitSentences(g!!, 2) else TextCondenser.condense(text, Level.GIST)
+        // Все тоны одинаково.
+        for (tn in Tone.entries) {
+            result["${Level.CLEAN.ordinal}:${tn.ordinal}"] = cleanText
+            result["${Level.BRIEF.ordinal}:${tn.ordinal}"] = bRes
+            result["${Level.GIST.ordinal}:${tn.ordinal}"] = gRes
+        }
         return result
     }
 
@@ -247,7 +257,20 @@ class VariantProcessor(
             // По назначению модели Meta: суммаризация (Кратко/Суть) — её задача,
             // дословное редактирование (Чисто) — НЕ её (выдумывает) → правила.
             when (l) {
-                Level.CLEAN -> { Diagnostics.engine("Чисто: правила (модель не редактирует)"); return CleanProcessor.clean(orig) }
+                Level.CLEAN -> {
+                    // Пробуем модель для Чисто (Qwen умеет редактировать). Если выдумала
+                    // (сильно исказила/разбухла) — надёжные правила.
+                    val res = LocalAiEngine.generate(context,
+                        "Исправь ошибки и расставь знаки препинания в этом тексте, сохрани все слова:",
+                        orig, settings.localAiModel)
+                    if (!res.isNullOrBlank() && !isLoopy(res) && !tooDistorted(res, orig) &&
+                        res.length <= orig.length * 2) {
+                        Diagnostics.engine("Чисто: локальная модель (${res.length} симв)")
+                        return res
+                    }
+                    Diagnostics.engine("Чисто: модель исказила → правила")
+                    return CleanProcessor.clean(orig)
+                }
                 Level.VERBATIM -> return Punctuator.punctuate(orig)
                 else -> {
                     val prompt = if (l == Level.BRIEF)

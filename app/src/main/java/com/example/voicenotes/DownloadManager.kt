@@ -27,12 +27,17 @@ object DownloadManager {
         errors.remove(key)
         progress[key] = 0
         jobs[key] = scope.launch(Dispatchers.IO) {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            val wl = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "voicenotes:whdownload")
             try {
+                wl.acquire(60 * 60 * 1000L)
                 WhisperModelManager.download(context, modelId) { p -> progress[key] = p }
                 progress[key] = -1
             } catch (e: Exception) {
                 progress[key] = -1
                 errors[key] = e.message ?: "Ошибка загрузки"
+            } finally {
+                if (wl.isHeld) wl.release()
             }
         }
     }
@@ -44,12 +49,19 @@ object DownloadManager {
         errors.remove(key)
         progress[key] = 0
         jobs[key] = scope.launch(Dispatchers.IO) {
+            // Wake lock: не даём процессору уснуть при потухшем экране —
+            // иначе скачивание большой модели прерывается.
+            val pm = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            val wl = pm.newWakeLock(android.os.PowerManager.PARTIAL_WAKE_LOCK, "voicenotes:download")
             try {
+                wl.acquire(60 * 60 * 1000L)  // максимум час
                 LocalAiModelManager.download(context, modelId) { p -> progress[key] = p }
                 progress[key] = -1
             } catch (e: Exception) {
                 progress[key] = -1
                 errors[key] = e.message ?: "Ошибка загрузки"
+            } finally {
+                if (wl.isHeld) wl.release()
             }
         }
     }

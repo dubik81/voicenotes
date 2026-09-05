@@ -127,11 +127,12 @@ fun EditorScreen(
 
     // После нового текста: сбрасываем варианты и запускаем полный фоновый расчёт.
     fun startProcessingAll() {
-        // Полный пересчёт: сбрасываем и считаем заново (новый исходный текст).
+        // Пересчёт смыслов. Дословно (VERBATIM) и его историю НЕ трогаем — оно уже
+        // установлено (запись/импорт/обновление), обработка меняет только Чисто/Кратко/Суть.
         processor.reset(note.id)
-        note.variants.clear()
-        note.history.clear()
-        note.historyIndex.clear()
+        // Чистим только смыслы (CLEAN/BRIEF/GIST), не VERBATIM.
+        val verbatimKeys = Tone.entries.map { note.variantKey(Level.VERBATIM, it) }
+        note.variants.keys.filter { it !in verbatimKeys }.forEach { note.variants.remove(it) }
         persist()
         processor.ensureAll(note, level, tone)
     }
@@ -252,6 +253,11 @@ fun EditorScreen(
     var whisperDownload by remember { mutableStateOf(-1) }
     var aiRunning by remember { mutableStateOf(false) }
     var whisperText by remember { mutableStateOf<String?>(null) }  // второй текст от Whisper
+    // Экран ожидания: прогресс обработки.
+    var progressPercent by remember { mutableStateOf(-1) }   // -1 = не идёт, 0..100
+    var progressLabel by remember { mutableStateOf("") }      // "Обрабатываю…", "Часть 2 из 5"
+    var progressSeconds by remember { mutableStateOf(0) }     // счётчик секунд
+    var progressPreview by remember { mutableStateOf("") }    // живой текст (по кускам)
     var voskRerunning by remember { mutableStateOf(false) }        // идёт перераспознавание Vosk
     // Индикатор в углу: "vosk"/"whisper"/"ai-cloud"/"ai-local"/"" — что сейчас работает.
     var cornerIndicator by remember { mutableStateOf("") }
@@ -650,6 +656,14 @@ fun EditorScreen(
         )
     }
 
+    // Тикающий счётчик секунд, пока идёт обработка ИИ.
+    LaunchedEffect(aiRunning) {
+        if (aiRunning) {
+            progressSeconds = 0
+            while (aiRunning) { kotlinx.coroutines.delay(1000); progressSeconds++ }
+        }
+    }
+
     val processing = !isListening && original.isNotBlank() && !currentReady
 
     Scaffold(containerColor = cs.background) { pad ->
@@ -754,13 +768,17 @@ fun EditorScreen(
                             val d = processor.doneCount(note.id)
                             val tot = processor.totalCount(note.id)
                             refreshTick
-                            ShimmerText(
+                            WaitingScreen(
+                                accent = accent,
+                                seconds = progressSeconds,
+                                percent = if (tot > 0) (d * 100 / tot) else -1,
                                 label = when {
-                                    settings.useAI && tot > 0 -> "ИИ обрабатывает варианты: $d из $tot…"
-                                    settings.useAI -> "ИИ обрабатывает…"
-                                    else -> "Обрабатываю…"
+                                    settings.localAi -> "ИИ на устройстве работает…"
+                                    settings.useAI -> "Облачный ИИ обрабатывает…"
+                                    else -> "Обрабатываю по правилам…"
                                 },
-                                accent = accent
+                                detail = if (tot > 0) "Готово вариантов: $d из $tot" else "",
+                                preview = progressPreview
                             )
                         }
                         shown.isBlank() -> Text("Текст появится здесь.", color = cs.onSurfaceVariant,
@@ -806,11 +824,9 @@ fun EditorScreen(
                     // (для аудио — перераспознавание, для импорта — чистка по правилам)
                     // Обработка смысла доступна всегда: облако / локальный ИИ / правила-запас.
                     val aiAvailable = settings.useAI || settings.localAi
-                    // «Обновить» для смыслов: только если движок даёт вариации.
-                    // Локальное Чисто = правила (детерминированы) → Обновить бессмыслен, скрываем.
-                    val localCleanRules = settings.localAi && level == Level.CLEAN
-                    val showUpdate = canReupdate ||
-                        (level != Level.VERBATIM && smyslyReady && aiAvailable && !localCleanRules)
+                    // «Обновить» — переобработать текущим движком/моделью (нужно, например,
+                    // чтобы переделать старую заметку новой моделью после её выбора).
+                    val showUpdate = canReupdate || (level != Level.VERBATIM && smyslyReady && aiAvailable)
                     val showAiBtn = original.isNotBlank() && aiAvailable && !settings.autoAi && !smyslyReady
 
                     Row(
@@ -1025,6 +1041,67 @@ private fun SegOffOn(offSelected: Boolean, onOff: () -> Unit, onOn: () -> Unit) 
                     color = if (!offSelected) Color.White else cs.onSurfaceVariant,
                     fontWeight = if (!offSelected) FontWeight.Bold else FontWeight.Normal,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 7.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun WaitingScreen(
+    accent: Color,
+    seconds: Int,
+    percent: Int,
+    label: String,
+    detail: String,
+    preview: String
+) {
+    val cs = MaterialTheme.colorScheme
+    // Пульсирующая точка-индикатор.
+    val pulse = rememberInfiniteTransition(label = "wait")
+    val alpha by pulse.animateFloat(
+        initialValue = 0.4f, targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(700, easing = LinearEasing), RepeatMode.Reverse),
+        label = "a"
+    )
+    Column(
+        Modifier.fillMaxSize().padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        // Заголовок с пульсирующей искрой.
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("✦", color = accent.copy(alpha = alpha), fontSize = 22.sp)
+            Spacer(Modifier.width(8.dp))
+            Text(label, color = cs.onSurface, fontSize = 16.sp, fontWeight = FontWeight.SemiBold)
+        }
+        Spacer(Modifier.height(16.dp))
+        // Полоса прогресса.
+        if (percent in 0..100) {
+            LinearProgressIndicator(
+                progress = { percent / 100f },
+                modifier = Modifier.fillMaxWidth(0.8f).height(8.dp).clip(RoundedCornerShape(4.dp)),
+                color = accent, trackColor = cs.surfaceVariant
+            )
+            Spacer(Modifier.height(6.dp))
+            Text("$percent%", color = accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+        } else {
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth(0.8f).height(8.dp).clip(RoundedCornerShape(4.dp)),
+                color = accent, trackColor = cs.surfaceVariant
+            )
+        }
+        Spacer(Modifier.height(10.dp))
+        // Счётчик времени + детали.
+        Text("прошло ${seconds} сек", color = cs.onSurfaceVariant, fontSize = 12.sp)
+        if (detail.isNotBlank()) {
+            Text(detail, color = cs.onSurfaceVariant, fontSize = 12.sp)
+        }
+        // Живой текст (по мере готовности).
+        if (preview.isNotBlank()) {
+            Spacer(Modifier.height(16.dp))
+            Surface(color = cs.surfaceVariant.copy(alpha = 0.4f), shape = RoundedCornerShape(12.dp)) {
+                Text(preview.take(300), color = cs.onSurface, fontSize = 13.sp,
+                    modifier = Modifier.padding(12.dp))
             }
         }
     }
