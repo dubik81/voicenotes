@@ -119,8 +119,9 @@ fun EditorScreen(
     DisposableEffect(Unit) { onDispose { recognizer?.destroy(); audioPlayer.stop() } }
 
     fun persist() {
-        // Для распознавания (Vosk/Whisper) сохраняем пунктуированный текст.
-        note.original = Punctuator.punctuate(original)
+        // Сохраняем note.original КАК ЕСТЬ — не перепунктуируем каждый раз.
+        // (пунктуация уже применена при распознавании; импорт остаётся сырым).
+        // Дословно не должно меняться при последующих действиях (ИИ и т.п.).
         onChanged()
     }
 
@@ -327,6 +328,7 @@ fun EditorScreen(
                         val punct = Punctuator.punctuate(better)
                         note.original = punct
                         note.putVariant(Level.VERBATIM, tone, punct)  // версия в историю → стрелки ‹ ›
+                        Diagnostics.action("Дословно изменено: перераспознавание Vosk (кнопка Обновить)")
                     }
                     cornerIndicator = "whisper"
                     val wt = WhisperEngine.transcribe(context, path, settings.whisperModel)
