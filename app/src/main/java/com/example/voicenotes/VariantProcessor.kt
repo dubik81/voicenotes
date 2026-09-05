@@ -111,10 +111,10 @@ class VariantProcessor(
         // КРАТКО и СУТЬ — РОДНАЯ задача модели (суммаризация, для чего Meta её создала).
         val b = LocalAiEngine.generate(context,
             "Кратко перескажи главное из этого текста в 2-3 предложениях:", text, model)
-        result["${Level.BRIEF.ordinal}:$t"] = if (okRes(b, 10)) b!! else TextCondenser.condense(text, Level.BRIEF)
+        result["${Level.BRIEF.ordinal}:$t"] = if (okRes(b, 10)) limitSentences(b!!, 4) else TextCondenser.condense(text, Level.BRIEF)
         val g = LocalAiEngine.generate(context,
             "Одним предложением напиши, о чём этот текст:", text, model)
-        result["${Level.GIST.ordinal}:$t"] = if (okRes(g, 5)) g!! else TextCondenser.condense(text, Level.GIST)
+        result["${Level.GIST.ordinal}:$t"] = if (okRes(g, 5)) limitSentences(g!!, 2) else TextCondenser.condense(text, Level.GIST)
         return result
     }
 
@@ -255,8 +255,10 @@ class VariantProcessor(
                     else "Одним предложением напиши, о чём этот текст:"
                     val res = LocalAiEngine.generate(context, prompt, orig, settings.localAiModel)
                     if (!res.isNullOrBlank() && !isLoopy(res)) {
-                        Diagnostics.engine("$l: локальный ИИ (суммаризация), ${res.length} симв")
-                        return res
+                        // Ограничиваем длину: Суть — до 1-2 предложений, Кратко — до 3-4.
+                        val limited = limitSentences(res, if (l == Level.GIST) 2 else 4)
+                        Diagnostics.engine("$l: локальный ИИ (суммаризация), ${limited.length} симв")
+                        return limited
                     }
                     return TextCondenser.condense(orig, l)
                 }
@@ -275,6 +277,12 @@ class VariantProcessor(
             } else TextCondenser.condense(orig, l)
         }
         return result
+    }
+
+    // Оставляет первые N предложений (для ограничения длины суммаризации).
+    private fun limitSentences(text: String, n: Int): String {
+        val parts = text.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
+        return parts.take(n).joinToString(" ").trim()
     }
 
     // Детект ИСКАЖЕНИЯ: локальный ИИ выдумал слова не из исходника.
