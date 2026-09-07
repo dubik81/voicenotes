@@ -16,16 +16,30 @@ import java.util.zip.ZipInputStream
  */
 object VoskModelManager {
 
-    // Официальная маленькая русская модель Vosk.
-    private const val MODEL_URL =
-        "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
-    private const val MODEL_DIR_NAME = "vosk-model-small-ru-0.22"
+    // Маленькая (~50 МБ, быстрая) и большая (~1.8 ГБ, точнее) русские модели Vosk.
+    private const val SMALL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"
+    private const val SMALL_DIR = "vosk-model-small-ru-0.22"
+    private const val BIG_URL = "https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip"
+    private const val BIG_DIR = "vosk-model-ru-0.42"
 
-    fun modelDir(context: Context): File = File(context.filesDir, MODEL_DIR_NAME)
+    // Какую модель использовать (задаётся из настроек).
+    @Volatile var useBig: Boolean = false
+
+    private fun url() = if (useBig) BIG_URL else SMALL_URL
+    private fun dirName() = if (useBig) BIG_DIR else SMALL_DIR
+    private val MODEL_URL get() = url()
+    private val MODEL_DIR_NAME get() = dirName()
+
+    fun modelDir(context: Context): File = File(context.filesDir, dirName())
 
     fun isReady(context: Context): Boolean {
         val d = modelDir(context)
-        // Признак готовности: есть подпапка am/ (акустическая модель)
+        return d.exists() && File(d, "am").exists()
+    }
+
+    /** Готова ли конкретная модель (для показа в настройках). */
+    fun isReadySize(context: Context, big: Boolean): Boolean {
+        val d = File(context.filesDir, if (big) BIG_DIR else SMALL_DIR)
         return d.exists() && File(d, "am").exists()
     }
 

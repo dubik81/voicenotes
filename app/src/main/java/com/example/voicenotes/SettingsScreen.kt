@@ -147,6 +147,20 @@ fun SettingsScreen(
                              "Модель Vosk (~45 МБ) скачается при первом офлайн-запуске.",
                             fontSize = 11.sp, color = cs.onSurfaceVariant)
                         HorizontalDivider(Modifier.padding(vertical = 10.dp))
+                        // Большая модель Vosk — точнее.
+                        var voskBig by remember { mutableStateOf(settings.voskBig) }
+                        ToggleRow("Большая модель Vosk (точнее, ~1.8 ГБ)", voskBig) {
+                            voskBig = it; settings.voskBig = it
+                            VoskModelManager.useBig = it
+                        }
+                        Text("Более точное офлайн-распознавание. Скачается ~1.8 ГБ при первом " +
+                             "использовании (нужен интернет). Маленькая модель (~45 МБ) быстрее, но проще.",
+                            fontSize = 11.sp, color = cs.onSurfaceVariant)
+                        Text(if (VoskModelManager.isReadySize(context, true)) "✓ Большая модель скачана"
+                             else "Большая модель ещё не скачана",
+                            fontSize = 10.sp,
+                            color = if (VoskModelManager.isReadySize(context, true)) Palette.Green else cs.onSurfaceVariant)
+                        HorizontalDivider(Modifier.padding(vertical = 10.dp))
                         Text("Авто-остановка при паузе", fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold, color = cs.onSurface)
                         Spacer(Modifier.height(6.dp))

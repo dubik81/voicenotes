@@ -53,6 +53,11 @@ class Settings(context: Context) {
         get() = prefs.getString("rec_lang", "") ?: ""
         set(v) = prefs.edit().putString("rec_lang", v).apply()
 
+    /** Использовать большую модель Vosk (~1.8 ГБ, точнее). */
+    var voskBig: Boolean
+        get() = prefs.getBoolean("vosk_big", false)
+        set(v) = prefs.edit().putBoolean("vosk_big", v).apply()
+
     /** Уточнять офлайн-запись через Whisper (точнее Vosk). */
     var useWhisper: Boolean
         get() = prefs.getBoolean("use_whisper", true)

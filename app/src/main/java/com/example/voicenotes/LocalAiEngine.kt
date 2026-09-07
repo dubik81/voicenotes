@@ -57,7 +57,14 @@ object LocalAiEngine {
                 val mod = loadModule(context, modelId)
                 if (mod == null) { lastStatus = "модель не загрузилась"; return@withContext null }
                 val fullPrompt = buildPrompt(systemPrompt, userText)
-                val raw = runGenerate(mod, fullPrompt)
+                var raw = runGenerate(mod, fullPrompt)
+                // Qwen иногда молчит на первом вызове (callback=0). Повтор один раз.
+                if (raw.isNullOrBlank()) {
+                    Diagnostics.info("Пустой ответ — повтор генерации")
+                    releaseCurrent()
+                    val mod2 = loadModule(context, modelId)
+                    if (mod2 != null) raw = runGenerate(mod2, fullPrompt)
+                }
                 // Очищаем ответ от эха промпта и JSON-статистики.
                 val cleaned = cleanResponse(raw, fullPrompt, systemPrompt, userText)
                 lastStatus = if (cleaned.isNullOrBlank()) "генерация пустая" else "работает"

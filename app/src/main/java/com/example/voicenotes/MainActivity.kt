@@ -45,6 +45,10 @@ fun KeepScreenOn(activity: ComponentActivity, resetKey: Int) {
 fun App() {
     val context = LocalContext.current
     val settings = remember { Settings(context) }
+    LaunchedEffect(Unit) {
+        RecognitionDictionary.load(context)
+        VoskModelManager.useBig = settings.voskBig
+    }
     val store = remember { NoteStore(context) }
     val appScope = rememberCoroutineScope()
 

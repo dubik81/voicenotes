@@ -144,7 +144,9 @@ fun EditorScreen(
     }
 
     fun onRecognized(text: String) {
-        original = if (original.isBlank()) text else "$original $text"
+        // Словарь исправлений частых ошибок распознавания (офлайн, мгновенно).
+        val fixed = RecognitionDictionary.apply(text)
+        original = if (original.isBlank()) fixed else "$original $fixed"
         if (note.title == "Заметка" || note.title == "Лекция") {
             val t = original.take(30).trim()
             if (t.isNotBlank()) note.title = t
@@ -189,8 +191,14 @@ fun EditorScreen(
 
     fun buildIntent() = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-        putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+        // Явный язык из настроек (не системный — иначе может распознавать не на том языке).
+        val lang = settings.recognitionLang.ifBlank { "ru-RU" }
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang)
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang)
+        putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, lang)
         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+        // Несколько гипотез — берём лучшую.
+        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
         val ms = settings.pauseSeconds * 1000L
         if (ms > 0) {
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, ms)
@@ -656,18 +664,20 @@ fun EditorScreen(
         )
     }
 
-    // Тикающий счётчик секунд, пока идёт обработка ИИ.
-    LaunchedEffect(aiRunning) {
-        if (aiRunning) {
-            progressSeconds = 0
-            while (aiRunning) { kotlinx.coroutines.delay(1000); progressSeconds++ }
-        }
-    }
+    // Тикающий счётчик секунд — идёт, пока показывается экран ожидания (весь процесс).
 
     // Экран ожидания показывается, ПОКА реально идёт обработка (ИИ или перераспознавание),
     // либо пока считаются варианты и текущий ещё не готов.
     val processing = (aiRunning || voskRerunning || whisperRunning) ||
         (!isListening && original.isNotBlank() && !currentReady && settings.useAI)
+
+    // Счётчик секунд — тикает весь процесс обработки (не сбрасывается между вызовами).
+    LaunchedEffect(processing) {
+        if (processing) {
+            progressSeconds = 0
+            while (processing) { kotlinx.coroutines.delay(1000); progressSeconds++ }
+        }
+    }
 
     Scaffold(containerColor = cs.background) { pad ->
         Column(Modifier.fillMaxSize().padding(pad)) {
@@ -774,14 +784,14 @@ fun EditorScreen(
                             WaitingScreen(
                                 accent = accent,
                                 seconds = progressSeconds,
-                                percent = if (tot > 0) (d * 100 / tot) else -1,
+                                percent = if (tot > 0) (d * 100 / tot).coerceIn(0, 100) else -1,
                                 label = when {
                                     settings.localAi -> "ИИ на устройстве работает…"
                                     settings.useAI -> "Облачный ИИ обрабатывает…"
                                     else -> "Обрабатываю по правилам…"
                                 },
                                 detail = if (tot > 0) "Готово вариантов: $d из $tot" else "",
-                                preview = progressPreview
+                                preview = original  // текст заметки, над которым работает ИИ
                             )
                         }
                         shown.isBlank() -> Text("Текст появится здесь.", color = cs.onSurfaceVariant,
@@ -1099,12 +1109,14 @@ private fun WaitingScreen(
         if (detail.isNotBlank()) {
             Text(detail, color = cs.onSurfaceVariant, fontSize = 12.sp)
         }
-        // Живой текст (по мере готовности).
+        // Текст заметки, над которым работает ИИ.
         if (preview.isNotBlank()) {
             Spacer(Modifier.height(16.dp))
+            Text("Обрабатываемый текст:", color = cs.onSurfaceVariant, fontSize = 11.sp)
+            Spacer(Modifier.height(4.dp))
             Surface(color = cs.surfaceVariant.copy(alpha = 0.4f), shape = RoundedCornerShape(12.dp)) {
-                Text(preview.take(300), color = cs.onSurface, fontSize = 13.sp,
-                    modifier = Modifier.padding(12.dp))
+                Text(preview, color = cs.onSurface, fontSize = 13.sp,
+                    modifier = Modifier.padding(12.dp).fillMaxWidth())
             }
         }
     }

@@ -107,10 +107,10 @@ class VariantProcessor(
         for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = text
         // КРАТКО и СУТЬ — РОДНАЯ задача модели (суммаризация, для чего Meta её создала).
         val b = LocalAiEngine.generate(context,
-            "Перескажи ВЕСЬ этот текст кратко, охватив все основные моменты С НАЧАЛА до конца, в 2-3 предложениях. Не пропускай начало:", text, model)
+            "Кратко перескажи этот текст в 2-3 предложениях:", text, model)
         val bRes = if (okRes(b, 10)) limitSentences(b!!, 4) else TextCondenser.condense(text, Level.BRIEF)
         val g = LocalAiEngine.generate(context,
-            "Одним предложением опиши, о чём ВЕСЬ этот текст (охвати главное, не только конец):", text, model)
+            "О чём этот текст? Ответь кратко:", text, model)
         val gRes = if (okRes(g, 5)) limitSentences(g!!, 2) else TextCondenser.condense(text, Level.GIST)
         // Заполняем ВСЕ тоны одинаково (локальная модель тон не различает).
         for (tn in Tone.entries) {
@@ -258,13 +258,11 @@ class VariantProcessor(
             // дословное редактирование (Чисто) — НЕ её (выдумывает) → правила.
             when (l) {
                 Level.CLEAN -> {
-                    // «Обновить» (vary) чередует промпты — Qwen даёт РАЗНЫЕ вариации.
-                    // ВАЖНО: пунктуацию распознавания НЕ сохранять слепо — она часто кривая
-                    // (точки посреди предложения). Исправлять по смыслу.
+                    // Простые промпты работают лучше сложных (модель 1.5B теряется в условиях).
                     val prompts = listOf(
-                        "Исправь этот текст: убери лишние и неправильные знаки препинания, расставь правильные по смыслу, исправь окончания слов. Знаки препинания из распознавания могут быть ошибочны — ставь по смыслу:",
-                        "Отредактируй текст грамотно: правильная пунктуация по смыслу (не доверяй точкам посреди предложений), верные окончания, заглавные буквы:",
-                        "Приведи в порядок: раздели на правильные предложения по смыслу, исправь пунктуацию и окончания. Не сохраняй ошибочные знаки препинания:"
+                        "Расставь знаки препинания и исправь ошибки в тексте. Ставь точки, запятые, заглавные буквы:",
+                        "Добавь в текст правильную пунктуацию (точки, запятые) и исправь ошибки:",
+                        "Оформи текст: расставь точки и запятые, исправь окончания слов:"
                     )
                     val prompt = if (vary) prompts.random() else prompts[0]
                     val res = LocalAiEngine.generate(context, prompt, orig, settings.localAiModel)
@@ -279,8 +277,8 @@ class VariantProcessor(
                 Level.VERBATIM -> return Punctuator.punctuate(orig)
                 else -> {
                     val prompt = if (l == Level.BRIEF)
-                        "Перескажи ВЕСЬ этот текст кратко, охватив все основные моменты С НАЧАЛА до конца, в 2-3 предложениях. Не пропускай начало:"
-                    else "Одним предложением опиши, о чём ВЕСЬ этот текст (охвати главное, не только конец):"
+                        "Кратко перескажи этот текст в 2-3 предложениях:"
+                    else "О чём этот текст? Ответь кратко:"
                     val res = LocalAiEngine.generate(context, prompt, orig, settings.localAiModel)
                     if (!res.isNullOrBlank() && !isLoopy(res)) {
                         // Ограничиваем длину: Суть — до 1-2 предложений, Кратко — до 3-4.
@@ -325,6 +323,10 @@ class VariantProcessor(
 
     // Детект ЯВНОГО зацикливания (одна фраза повторяется много раз подряд).
     private fun isLoopy(text: String): Boolean {
+        // Мусор-абракадабра: много латиницы/цифр вместо русского («alpha 2023 Cre01»).
+        val letters = text.count { it.isLetter() }
+        val latin = text.count { it in 'a'..'z' || it in 'A'..'Z' }
+        if (letters > 10 && latin.toDouble() / letters > 0.5) return true
         val words = text.split(Regex("\\s+")).filter { it.length > 1 }
         if (words.size < 10) return false
         // 3-словное сочетание повторяется 3+ раза — явная галлюцинация
