@@ -107,10 +107,10 @@ class VariantProcessor(
         for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = text
         // КРАТКО и СУТЬ — РОДНАЯ задача модели (суммаризация, для чего Meta её создала).
         val b = LocalAiEngine.generate(context,
-            "Кратко перескажи этот текст в 2-3 предложениях:", text, model)
+            "Кратко перескажи этот текст в 2-3 предложениях. Не заменяй конкретные факты общими словами:", text, model)
         val bRes = if (okRes(b, 10)) limitSentences(b!!, 4) else TextCondenser.condense(text, Level.BRIEF)
         val g = LocalAiEngine.generate(context,
-            "О чём этот текст? Ответь кратко:", text, model)
+            "О чём этот текст? Ответь кратко, не искажая смысл:", text, model)
         val gRes = if (okRes(g, 5)) limitSentences(g!!, 2) else TextCondenser.condense(text, Level.GIST)
         // Заполняем ВСЕ тоны одинаково (локальная модель тон не различает).
         for (tn in Tone.entries) {
@@ -260,9 +260,9 @@ class VariantProcessor(
                 Level.CLEAN -> {
                     // Простые промпты работают лучше сложных (модель 1.5B теряется в условиях).
                     val prompts = listOf(
-                        "Расставь знаки препинания и исправь ошибки в тексте. Ставь точки, запятые, заглавные буквы:",
-                        "Добавь в текст правильную пунктуацию (точки, запятые) и исправь ошибки:",
-                        "Оформи текст: расставь точки и запятые, исправь окончания слов:"
+                        "Это распознанная речь, пунктуация в ней автоматическая и часто ошибочна. Расставь правильные знаки препинания по смыслу и исправь ошибки распознавания:",
+                        "Исходная пунктуация ненадёжна. Переосмысли знаки препинания по смыслу, исправь окончания слов:",
+                        "Оформи текст грамотно: раздели на предложения по смыслу, поставь правильные точки и запятые:"
                     )
                     val prompt = if (vary) prompts.random() else prompts[0]
                     val res = LocalAiEngine.generate(context, prompt, orig, settings.localAiModel)
@@ -277,8 +277,8 @@ class VariantProcessor(
                 Level.VERBATIM -> return Punctuator.punctuate(orig)
                 else -> {
                     val prompt = if (l == Level.BRIEF)
-                        "Кратко перескажи этот текст в 2-3 предложениях:"
-                    else "О чём этот текст? Ответь кратко:"
+                        "Кратко перескажи этот текст в 2-3 предложениях. Не заменяй конкретные факты общими словами:"
+                    else "О чём этот текст? Ответь кратко, не искажая смысл:"
                     val res = LocalAiEngine.generate(context, prompt, orig, settings.localAiModel)
                     if (!res.isNullOrBlank() && !isLoopy(res)) {
                         // Ограничиваем длину: Суть — до 1-2 предложений, Кратко — до 3-4.
