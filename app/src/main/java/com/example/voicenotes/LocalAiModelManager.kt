@@ -75,6 +75,63 @@ object LocalAiModelManager {
         Diagnostics.info("Токенизатор скачан: ${tok.name} (${tok.length()} б)")
     }
 
+    /**
+     * v117: Конвертация HF tokenizer.json (Qwen) → формат tiktoken («base64 rank» построчно).
+     * Причина: HF-токенизатор внутри ExecuTorch не читает кириллицу на входе (модель отвечала
+     * «ваш текст напоминает русский с ошибками», «Скажи: привет» → «I'm not able to understand»),
+     * а tiktoken-путь работает по байтам и с русским справляется. Служебные токены в tiktoken
+     * получают ID = размер словаря + номер в списке Llama 3, поэтому в промпте используются
+     * их «псевдонимы» (см. LocalAiEngine.buildPrompt).
+     */
+    fun tiktokenFile(context: Context, modelId: String): File =
+        File(File(context.filesDir, "localai"), "tokenizer_${modelId}.tiktoken")
+
+    fun convertJsonToTiktoken(json: File, out: File): String {
+        val text = json.readText()
+        val root = org.json.JSONObject(text)
+        val vocab = root.getJSONObject("model").getJSONObject("vocab")
+        // Минимальный ID служебных токенов — всё, что выше, в основной словарь не идёт.
+        var minAdded = Int.MAX_VALUE
+        root.optJSONArray("added_tokens")?.let { arr ->
+            for (i in 0 until arr.length()) minAdded = minOf(minAdded, arr.getJSONObject(i).getInt("id"))
+        }
+        // GPT-2 bytes_to_unicode → обратная таблица (символ словаря → байт).
+        val bs = ArrayList<Int>(); val cs = ArrayList<Int>()
+        for (b in 33..126) { bs.add(b); cs.add(b) }
+        for (b in 161..172) { bs.add(b); cs.add(b) }
+        for (b in 174..255) { bs.add(b); cs.add(b) }
+        var n = 0
+        for (b in 0..255) if (b !in bs) { bs.add(b); cs.add(256 + n); n++ }
+        val charToByte = HashMap<Int, Int>()
+        for (i in bs.indices) charToByte[cs[i]] = bs[i]
+
+        val byId = arrayOfNulls<String>(minAdded)
+        var count = 0; var bad = 0
+        val keys = vocab.keys()
+        while (keys.hasNext()) {
+            val tok = keys.next(); val id = vocab.getInt(tok)
+            if (id >= minAdded) continue
+            val bytes = java.io.ByteArrayOutputStream()
+            var ok = true
+            var i = 0
+            while (i < tok.length) {
+                val cp = tok.codePointAt(i); i += Character.charCount(cp)
+                val b = charToByte[cp]
+                if (b == null) { ok = false; break }
+                bytes.write(b)
+            }
+            if (!ok) { bad++; continue }
+            byId[id] = android.util.Base64.encodeToString(bytes.toByteArray(), android.util.Base64.NO_WRAP)
+            count++
+        }
+        val gaps = byId.count { it == null }
+        if (gaps > 0) throw RuntimeException("словарь с пропусками: $gaps из $minAdded (не сконвертировано $bad)")
+        val tmp = File(out.absolutePath + ".part")
+        tmp.bufferedWriter().use { w -> for (id in 0 until minAdded) { w.write(byId[id]); w.write(" "); w.write(id.toString()); w.write("\n") } }
+        tmp.renameTo(out)
+        return "словарь $count токенов, служебные с $minAdded"
+    }
+
     fun hasTokenizer(context: Context, modelId: String): Boolean =
         tokenizerFile(context, modelId).let { it.exists() && it.length() > 1000 }
 

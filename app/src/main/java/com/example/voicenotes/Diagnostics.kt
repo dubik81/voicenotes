@@ -51,7 +51,9 @@ object Diagnostics {
             val crash = File(context.filesDir, "last_crash.txt")
             if (live.exists()) {
                 val lines = live.readLines()
-                val normalEnd = lines.lastOrNull()?.contains(END_MARK) == true
+                // Нормальный выход — если метка есть в хвосте (фоновые задачи могут дописать
+                // несколько строк ПОСЛЕ неё; v116 из-за этого ложно объявлял «аварийно»).
+                val normalEnd = lines.takeLast(40).any { it.contains(END_MARK) }
                 previousRunCrashed = lines.isNotEmpty() && !normalEnd
                 val tail = lines.takeLast(PREV_TAIL)
                 prevSession = buildString {

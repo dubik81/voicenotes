@@ -1,6 +1,7 @@
 package com.example.voicenotes
 
 import android.content.Context
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
@@ -59,6 +60,83 @@ object LocalAiEngine {
     // тумблера) раньше налезали друг на друга.
     private val genMutex = Mutex()
 
+    // ── v117: режим промпта/токенизатора: "llama" (формат Llama 3, рабочий в v98–v102),
+    //    "chatml" (родной Qwen), "tiktoken" (словарь конвертирован, ChatML через псевдонимы).
+    // Определяется пробами один раз и запоминается в настройках; самопроверка сбрасывает.
+    @Volatile var tokMode: String = ""
+        private set
+    private const val PREF = "localai_prefs"
+    private fun prefs(context: Context) = context.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+    private fun loadTokMode(context: Context, modelId: String): String {
+        if (tokMode.isBlank()) tokMode = prefs(context).getString("tokmode_$modelId", "") ?: ""
+        return tokMode
+    }
+    private fun saveTokMode(context: Context, modelId: String, mode: String) {
+        tokMode = mode; prefs(context).edit().putString("tokmode_$modelId", mode).apply()
+    }
+    fun resetTokMode(context: Context, modelId: String) = saveTokMode(context, modelId, "")
+
+    /** Путь к токенизатору с учётом режима. */
+    private fun tokenizerPath(context: Context, modelId: String): String =
+        if (tokMode == "tiktoken" && modelId.startsWith("qwen") && LocalAiModelManager.tiktokenFile(context, modelId).exists())
+            LocalAiModelManager.tiktokenFile(context, modelId).absolutePath
+        else LocalAiModelManager.tokenizerFile(context, modelId).absolutePath
+
+    /** Ответ похож на отказ ассистента («Извините, я не могу…») — это не результат. */
+    fun isRefusal(t: String): Boolean {
+        val l = t.trim().lowercase().take(120)
+        return listOf("извините", "простите", "к сожалению", "я не могу", "не могу помочь", "не могу понять",
+            "i apologize", "i'm sorry", "i am sorry", "i cannot", "i can't", "i'm not able", "as an ai")
+            .any { l.startsWith(it) || l.contains(" $it") }
+    }
+
+    /**
+     * ПРОБА РЕЖИМА ПРОМПТА (один раз, результат запоминается; самопроверка повторяет).
+     * Факт из истории проекта: Qwen давала отличный русский результат в v98–v102, когда
+     * промпт строился в формате Llama (тем же токенизатором). После перевода на ChatML (v116)
+     * модель стала отвечать отказами «не могу понять ваш текст». Поэтому порядок проб:
+     *   1) "llama"   — формат Llama 3 (ИЗВЕСТНО РАБОЧИЙ для этой сборки) — если русский читается, стоп;
+     *   2) "chatml"  — родной формат Qwen;
+     *   3) "tiktoken"— словарь конвертирован в tiktoken + ChatML через псевдонимы.
+     * Проба = «Повтори это слово: яблоко» → в ответе должно быть «яблоко».
+     */
+    private suspend fun ensureTokMode(context: Context, modelId: String) {
+        if (!modelId.startsWith("qwen")) { if (tokMode.isBlank()) tokMode = "llama"; return }
+        if (loadTokMode(context, modelId).isNotBlank()) return
+        Diagnostics.info("ПРОБА РЕЖИМА ПРОМПТА (один раз): llama → chatml → tiktoken; тест «яблоко»")
+        for (mode in listOf("llama", "chatml", "tiktoken")) {
+            try {
+                if (mode == "tiktoken") {
+                    val tt = LocalAiModelManager.tiktokenFile(context, modelId)
+                    if (!tt.exists()) {
+                        val t0 = System.currentTimeMillis()
+                        val r = LocalAiModelManager.convertJsonToTiktoken(LocalAiModelManager.tokenizerFile(context, modelId), tt)
+                        Diagnostics.info("tiktoken создан: $r, ${tt.length()} б за ${System.currentTimeMillis()-t0} мс")
+                    }
+                }
+                tokMode = mode; releaseCurrent()
+                val ru = probe(context, modelId, "Ответь одним словом.", "Повтори это слово: яблоко", "яблоко")
+                Diagnostics.info("Проба [$mode]: русский=${if (ru.first) "ЧИТАЕТ" else "нет"} («${ru.second}»)")
+                if (ru.first) { saveTokMode(context, modelId, mode); releaseCurrent(); return }
+            } catch (e: Throwable) {
+                Diagnostics.error("Проба [$mode] упала: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+            }
+        }
+        releaseCurrent()
+        saveTokMode(context, modelId, "llama")
+        Diagnostics.error("Ни один режим не прошёл пробу «яблоко» — остаюсь на llama (рабочий в v98–v102)")
+    }
+
+    private fun probe(context: Context, modelId: String, sys: String, usr: String, expect: String): Pair<Boolean, String> {
+        return try {
+            releaseCurrent()
+            val mod = loadModule(context, modelId) ?: return false to "модель не загрузилась"
+            val fp = buildPrompt(modelId, sys, usr)
+            val out = cleanResponse(runGenerate(mod, fp), fp, sys, usr) ?: return false to "пусто"
+            (out.lowercase().contains(expect)) to out.take(60).replace('\n', ' ')
+        } catch (e: Throwable) { false to "ошибка: ${e.message?.take(40)}" }
+    }
+
     /** Текущий общий лимит токенов на вызов (промпт+ответ). */
     private fun seqBudget(): Int = if (workingCall == "2arg" || workingCall == "") DEFAULT_SEQ_LEN else WANT_SEQ_LEN
 
@@ -75,13 +153,14 @@ object LocalAiEngine {
         return (inTok * CHARS_PER_TOKEN).toInt().coerceIn(60, 900)
     }
 
-    suspend fun generate(context: Context, systemPrompt: String, userText: String, modelId: String): String? =
+    suspend fun generate(context: Context, systemPrompt: String, userText: String, modelId: String,
+                         maxNewTok: Int = 0): String? =
         withContext(Dispatchers.IO) {
           genMutex.withLock {
             if (!currentCoroutineContext().isActive) return@withContext null   // обработку отменили, пока ждали очередь
             try {
                 val tokF = LocalAiModelManager.tokenizerFile(context, modelId)
-                Diagnostics.info("Локальный ИИ: модель=$modelId, файл=${LocalAiModelManager.modelFile(context, modelId).name}, скачана=${LocalAiModelManager.isReady(context, modelId)}, токенизатор=${tokF.name}${if (tokF.exists()) "" else " (НЕТ!)"}, бюджет=${seqBudget()} ток.")
+                Diagnostics.info("Локальный ИИ: модель=$modelId, файл=${LocalAiModelManager.modelFile(context, modelId).name}, скачана=${LocalAiModelManager.isReady(context, modelId)}, токенизатор=${tokF.name}${if (tokF.exists()) "" else " (НЕТ!)"}, бюджет=${seqBudget()} ток., токенизатор-режим=${loadTokMode(context, modelId).ifBlank { "не определён" }}")
                 if (!LocalAiModelManager.isReady(context, modelId)) {
                     lastStatus = "модель не скачана"; return@withContext null
                 }
@@ -91,6 +170,7 @@ object LocalAiEngine {
                         Diagnostics.error("Токенизатор не скачался: ${e.message?.take(60)}") }
                     if (!tokF.exists()) { lastStatus = "нет токенизатора"; return@withContext null }
                 }
+                ensureTokMode(context, modelId)
                 if (moduleClass() == null) {
                     lastStatus = "класс ExecuTorch не найден"; return@withContext null
                 }
@@ -104,18 +184,25 @@ object LocalAiEngine {
                 val mod = loadModule(context, modelId)
                 if (mod == null) { lastStatus = "модель не загрузилась"; return@withContext null }
                 val fullPrompt = buildPrompt(modelId, systemPrompt, userText)
-                var raw = runGenerate(mod, fullPrompt)
+                // Сколько токенов ответа просить: по длине входа (Чисто ≈ вход ×1.4) или подсказка.
+                val wantOut = if (maxNewTok > 0) maxNewTok else ((userText.length / CHARS_PER_TOKEN) * 1.4).toInt() + 24
+                var raw = runGenerate(mod, fullPrompt, wantOut)
                 // Qwen иногда молчит на первом вызове (callback=0). Повтор один раз.
                 if (raw.isNullOrBlank()) {
                     Diagnostics.info("Пустой ответ — повтор генерации")
                     releaseCurrent()
                     val mod2 = loadModule(context, modelId)
-                    if (mod2 != null) raw = runGenerate(mod2, fullPrompt)
+                    if (mod2 != null) raw = runGenerate(mod2, fullPrompt, wantOut)
                 }
                 // Очищаем ответ от эха промпта и JSON-статистики.
                 val cleaned = cleanResponse(raw, fullPrompt, systemPrompt, userText)
                 lastStatus = if (cleaned.isNullOrBlank()) "генерация пустая" else "работает"
                 if (!cleaned.isNullOrBlank()) Diagnostics.event("Ответ модели (${cleaned.length} симв): \"${cleaned.take(70).replace('\n', ' ')}…\"")
+                if (!cleaned.isNullOrBlank() && isRefusal(cleaned)) {
+                    Diagnostics.error("Ответ модели — ОТКАЗ («${cleaned.take(40)}…») → считаем провалом")
+                    lastStatus = "модель отказалась"
+                    return@withContext null
+                }
                 cleaned
             } catch (e: Throwable) {
                 lastStatus = "ошибка: ${e.message?.take(40)}"; null
@@ -133,10 +220,18 @@ object LocalAiEngine {
             val idx = t.indexOf(p)
             if (p.isNotBlank() && idx in 0..50) t = t.substring(idx + p.length)
         }
+        // Ответ заканчивается на первом служебном маркере конца/новой реплики: с большим
+        // seqLen модель может «продолжить диалог» за себя — этот хвост отрезаем.
+        for (mark in listOf("<|eot_id|>", "<|end_of_text|>", "<|im_end|>", "<|endoftext|>",
+                "<|start_header_id|>", "<|im_start|>", "<|reserved_special_token_0|>")) {
+            val i = t.indexOf(mark)
+            if (i > 0) t = t.substring(0, i)
+        }
         // убрать служебные токены Llama (<|eot_id|>, <|end_of_text|>, заголовки)
         for (tok in listOf("<|eot_id|>", "<|end_of_text|>", "<|begin_of_text|>",
                 "<|start_header_id|>", "<|end_header_id|>", "<|python_tag|>",
-                "<|im_start|>", "<|im_end|>", "<|endoftext|>")) {
+                "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+                "<|reserved_special_token_0|>", "<|reserved_special_token_1|>")) {
             t = t.replace(tok, " ")
         }
         // хвост шаблона чата, если модель его повторила («assistant\n…»)
@@ -177,7 +272,8 @@ object LocalAiEngine {
             // Логируем доступные конструкторы.
             Diagnostics.info("Конструкторы LlmModule: ${cls.constructors.joinToString { c -> "(${c.parameterTypes.joinToString{p->p.simpleName}})" }}")
             val path = LocalAiModelManager.modelFile(context, modelId).absolutePath
-            val tok = LocalAiModelManager.tokenizerFile(context, modelId).absolutePath
+            val tok = tokenizerPath(context, modelId)
+            Diagnostics.info("Токенизатор для загрузки: ${File(tok).name} (режим ${tokMode.ifBlank { "llama" }})")
             val m = try {
                 cls.getConstructor(String::class.java, String::class.java, Float::class.javaPrimitiveType)
                     .newInstance(path, tok, 0.3f).also { Diagnostics.info("Конструктор: (model,tok,temp)") }
@@ -204,7 +300,7 @@ object LocalAiEngine {
         }
     }
 
-    private fun runGenerate(mod: Any, prompt: String): String? {
+    private fun runGenerate(mod: Any, prompt: String, wantOut: Int = 0): String? {
         return try {
             val cls = mod.javaClass
             val genMethods = cls.methods.filter { it.name == "generate" }
@@ -233,12 +329,8 @@ object LocalAiEngine {
                     if (cb.sb.isNotEmpty()) {
                         // Проверка, что явный seqLen реально действует: если при большом промпте
                         // ответ крошечный — лимит всё равно 128, значит этот путь бесполезен.
-                        if (tag != "2arg" && !budgetVerified) {
-                            if (cb.calls + promptTok > 150) { budgetVerified = true; Diagnostics.info("Бюджет seqLen подтверждён (>128 токенов за вызов)") }
-                            else if (cb.calls < 15 && promptTok > 90) {
-                                Diagnostics.error("generate[$tag]: seqLen не действует (ответ ${cb.calls} ток.) → бюджет 128, путь отключён")
-                                brokenCalls.add(tag); workingCall = ""; return true
-                            }
+                        if (tag != "2arg" && !budgetVerified && cb.calls + promptTok > 150) {
+                            budgetVerified = true; Diagnostics.info("Бюджет seqLen подтверждён (>128 токенов за вызов)")
                         }
                         workingCall = tag; true
                     } else { brokenCalls.add(tag); false }
@@ -251,7 +343,10 @@ object LocalAiEngine {
             // 1) generate(String, int seqLen, LlmCallback, boolean echo) — явный лимит, без эха.
             //    (3-арг (String,int,cb) в этой сборке ВСЕГДА давал «Prefill failed» — это
             //    устаревший путь через prefillPrompt; его больше не трогаем.)
-            val seqLen = maxOf(WANT_SEQ_LEN, promptTok + 64)
+            // Явный лимит: промпт + нужный ответ (+запас). Не просим лишнего: в формате Llama
+            // у Qwen нет своего стоп-токена, и лишний бюджет уходит на «продолжение диалога».
+            val seqLen = if (wantOut > 0) (promptTok + wantOut + 16).coerceIn(promptTok + 48, 1024)
+                         else maxOf(WANT_SEQ_LEN, promptTok + 64)
             val m4 = genMethods.firstOrNull {
                 it.parameterTypes.size == 4 && it.parameterTypes[0] == String::class.java &&
                 it.parameterTypes[1] == Int::class.javaPrimitiveType &&
@@ -485,8 +580,14 @@ object LocalAiEngine {
     // «инструкция → текст → ответ» и вдобавок тратит на них бюджет токенов.
     //  • Qwen 2.5  — ChatML: <|im_start|>role … <|im_end|>
     //  • Llama 3.2 — <|begin_of_text|><|start_header_id|>role<|end_header_id|> … <|eot_id|>
+    // В режиме tiktoken служебные токены Qwen доступны под именами Llama 3 (ID по порядку:
+    // <|endoftext|>=<|begin_of_text|>, <|im_start|>=<|end_of_text|>, <|im_end|>=<|reserved_special_token_0|>).
     private fun buildPrompt(modelId: String, system: String, user: String): String =
-        if (modelId.startsWith("qwen"))
+        if (modelId.startsWith("qwen") && tokMode == "tiktoken")
+            "<|end_of_text|>system\n$system<|reserved_special_token_0|>\n" +
+            "<|end_of_text|>user\n$user<|reserved_special_token_0|>\n" +
+            "<|end_of_text|>assistant\n"
+        else if (modelId.startsWith("qwen") && tokMode == "chatml")
             "<|im_start|>system\n$system<|im_end|>\n" +
             "<|im_start|>user\n$user<|im_end|>\n" +
             "<|im_start|>assistant\n"
@@ -513,6 +614,10 @@ object LocalAiEngine {
         sb.append("3. Класс ExecuTorch: ${if (cls != null) "найден" else "НЕ НАЙДЕН"}\n")
         if (cls == null) { sb.append("→ Библиотека не подключилась."); Diagnostics.info("САМОПРОВЕРКА:\n$sb"); return@withContext sb.toString() }
         val t0 = System.currentTimeMillis()
+        resetTokMode(context, modelId)
+        ensureTokMode(context, modelId)
+        sb.append("3а. Режим промпта по пробе «яблоко»: ${tokMode} (подробности в ЧЯ «Проба [...]»)\n")
+        releaseCurrent()
         val mod = loadModule(context, modelId)
         sb.append("4. Загрузка модели: ${if (mod != null) "успех (${System.currentTimeMillis()-t0} мс)" else "ПРОВАЛ"}\n")
         if (mod == null) { sb.append("→ Модель не загрузилась."); Diagnostics.info("САМОПРОВЕРКА:\n$sb"); return@withContext sb.toString() }

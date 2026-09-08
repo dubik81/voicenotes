@@ -453,11 +453,11 @@ fun EditorScreen(
                     status = "Собираю точный текст (ансамбль)…"
                     try {
                         val result = if (settings.localAi) {
-                            // Офлайн: только локальный ИИ. Если не смог — берём текст Whisper
-                            // (НЕ облако — сбой офлайна не маскируем).
-                            LocalAiEngine.generate(context, AiClient.assembleSystemPrompt(),
-                                "Вариант 1 (Vosk):\n$voskText\n\nВариант 2 (Whisper):\n$wt",
-                                settings.localAiModel) ?: wt
+                            // Офлайн: ансамбль двух полных текстов в маленькую модель не влезает
+                            // (бюджет токенов) — берём текст Whisper как более точный. Облако не
+                            // трогаем: сбой офлайна не маскируем.
+                            Diagnostics.engine("Ансамбль: офлайн → берём текст Whisper без модели")
+                            wt
                         } else {
                             AiClient.assembleFromTwo(voskText, wt, settings.apiKey)
                         }
@@ -633,6 +633,8 @@ fun EditorScreen(
                         processor.reset(note.id)
                         Diagnostics.action("Импорт текста (${importText.length} симв) для теста")
                         onChanged()
+                        // Раньше после вставки ничего не запускалось — обработка стартует, как после записи.
+                        if (settings.useAI && settings.autoAi) startProcessingAll()
                     }
                     showImport = false
                 }) { Text("Вставить") }
@@ -801,12 +803,14 @@ fun EditorScreen(
                         offSelected = localAi,
                         onOff = {
                             if (localAi) return@SegOffOn
+                            if (aiRunning) { status = "Дождитесь завершения обновления"; return@SegOffOn }
                             localAi = true; settings.localAi = true
                             Diagnostics.action("Смысл → Офлайн (локальный ИИ) — пересчёт смыслов")
                             if (original.isNotBlank() && settings.useAI && settings.autoAi) startProcessingAll()
                         },
                         onOn = {
                             if (!localAi) return@SegOffOn
+                            if (aiRunning) { status = "Дождитесь завершения обновления"; return@SegOffOn }
                             localAi = false; settings.localAi = false
                             Diagnostics.action("Смысл → Онлайн (облачный ИИ) — пересчёт смыслов")
                             if (original.isNotBlank() && settings.useAI && settings.autoAi) startProcessingAll()
@@ -999,11 +1003,18 @@ fun EditorScreen(
 
                     // Тон: скрыт в режиме лекции, неактивен при «Дословно».
                     if (!note.isLecture) {
+                        // Тон различает только облако: локальная модель даёт один текст на все
+                        // тоны, поэтому в режиме «Смысл Офл» ступень тона выключена (иначе
+                        // кнопки «работают», но ничего не меняют).
                         ToneStepper(
                             selected = toneIdx,
-                            enabled = level != Level.VERBATIM,
+                            enabled = level != Level.VERBATIM && !localAi,
                             readyState = { i -> tick; variantStateFor(note, processor, level, Tone.fromIndex(i)) }
                         ) { toneIdx = it }
+                        if (localAi && level != Level.VERBATIM) {
+                            Text("Тон — только в режиме «Смысл Онл»", fontSize = 10.sp,
+                                color = cs.onSurfaceVariant, modifier = Modifier.padding(start = 16.dp))
+                        }
                         Spacer(Modifier.height(6.dp))
                     }
 
