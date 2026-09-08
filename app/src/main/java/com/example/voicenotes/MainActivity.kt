@@ -12,6 +12,19 @@ import androidx.compose.runtime.rememberCoroutineScope
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Перехватчик крашей: пишем причину в диагностику ПЕРЕД падением.
+        val prev = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                Diagnostics.error("КРАШ: ${e.javaClass.simpleName}: ${e.message?.take(120)}")
+                Diagnostics.error("КРАШ стек: ${e.stackTrace.take(3).joinToString(" <- ") { "${it.className.substringAfterLast('.')}.${it.methodName}:${it.lineNumber}" }}")
+                // сохраняем лог на диск, чтобы прочитать после перезапуска
+                try {
+                    java.io.File(filesDir, "last_crash.txt").writeText(Diagnostics.dump())
+                } catch (_: Throwable) {}
+            } catch (_: Throwable) {}
+            prev?.uncaughtException(t, e)
+        }
         setContent { App() }
     }
 }
