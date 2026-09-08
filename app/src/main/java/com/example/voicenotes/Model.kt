@@ -51,7 +51,9 @@ data class Note(
     // История редакций: ключ "levelOrd:toneOrd" -> список версий текста.
     val history: MutableMap<String, MutableList<String>> = mutableMapOf(),
     // Текущий индекс в истории для каждого варианта.
-    val historyIndex: MutableMap<String, Int> = mutableMapOf()
+    val historyIndex: MutableMap<String, Int> = mutableMapOf(),
+    // Метка движка для каждой версии истории (параллельно history): «облако», «Qwen», «правила»…
+    val historyEngine: MutableMap<String, MutableList<String>> = mutableMapOf()
 ) {
     fun variantKey(level: Level, tone: Tone) = "${level.ordinal}:${tone.ordinal}"
 
@@ -59,18 +61,32 @@ data class Note(
         if (level == Level.VERBATIM) (variants[variantKey(level, tone)] ?: original)
         else variants[variantKey(level, tone)]
 
-    fun putVariant(level: Level, tone: Tone, text: String) {
+    fun putVariant(level: Level, tone: Tone, text: String, engine: String = "") {
         val key = variantKey(level, tone)
         variants[key] = text
         // добавляем в историю (если это новая версия, не дубль текущей)
         val hist = history.getOrPut(key) { mutableListOf() }
+        val eng = historyEngine.getOrPut(key) { mutableListOf() }
+        while (eng.size < hist.size) eng.add("")           // выравниваем со старыми данными
         if (hist.isEmpty() || hist.last() != text) {
             // если мы не в конце истории — обрезаем «будущее» перед добавлением
             val idx = historyIndex[key] ?: (hist.size - 1)
-            while (hist.size > idx + 1) hist.removeAt(hist.size - 1)
-            hist.add(text)
+            while (hist.size > idx + 1) { hist.removeAt(hist.size - 1); if (eng.size > hist.size) eng.removeAt(eng.size - 1) }
+            hist.add(text); eng.add(engine)
             historyIndex[key] = hist.size - 1
+        } else if (engine.isNotBlank() && eng.isNotEmpty()) {
+            eng[eng.size - 1] = engine
         }
+    }
+
+    /** Подпись текущей версии: «2/4 · облако» (для стрелок истории). */
+    fun versionLabel(level: Level, tone: Tone): String {
+        val key = variantKey(level, tone)
+        val hist = history[key] ?: return ""
+        if (hist.size < 2) return ""
+        val idx = (historyIndex[key] ?: (hist.size - 1)).coerceIn(0, hist.size - 1)
+        val eng = historyEngine[key]?.getOrNull(idx).orEmpty()
+        return "${idx + 1}/${hist.size}" + if (eng.isNotBlank()) " · $eng" else ""
     }
 
     /** Можно ли шагнуть к предыдущей версии. */
@@ -124,6 +140,11 @@ data class Note(
         val hi = JSONObject()
         historyIndex.forEach { (k, idx) -> hi.put(k, idx) }
         put("historyIndex", hi)
+        val he = JSONObject()
+        historyEngine.forEach { (k, list) ->
+            val arr = JSONArray(); list.forEach { arr.put(it) }; he.put(k, arr)
+        }
+        put("historyEngine", he)
     }
 
     companion object {
@@ -145,6 +166,15 @@ data class Note(
             o.optJSONObject("historyIndex")?.let { hij ->
                 hij.keys().forEach { k -> historyIndex[k] = hij.getInt(k) }
             }
+            val historyEngine = mutableMapOf<String, MutableList<String>>()
+            o.optJSONObject("historyEngine")?.let { hej ->
+                hej.keys().forEach { k ->
+                    val arr = hej.getJSONArray(k)
+                    val list = mutableListOf<String>()
+                    for (i in 0 until arr.length()) list.add(arr.getString(i))
+                    historyEngine[k] = list
+                }
+            }
             return Note(
                 id = o.getLong("id"),
                 title = o.getString("title"),
@@ -157,7 +187,8 @@ data class Note(
                 isRefined = o.optBoolean("isRefined", false),
                 variants = variants,
                 history = history,
-                historyIndex = historyIndex
+                historyIndex = historyIndex,
+                historyEngine = historyEngine
             )
         }
 

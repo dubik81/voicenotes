@@ -304,11 +304,21 @@ fun EditorScreen(
                 downloadProgress = -1
             }
             status = "Готовлю распознавание…"
-            Diagnostics.info("Vosk: модель готова, загружаю (big=${VoskModelManager.useBig})")
+            // Большая Vosk (1.8 ГБ на диске) при загрузке в память требует несколько ГБ.
+            // Если свободной памяти мало — это верный путь к нативному вылету (его Java
+            // не перехватывает). Тогда берём маленькую и честно говорим об этом.
+            val freeMb = Diagnostics.availMemMb(context)
+            if (VoskModelManager.useBig && freeMb in 0..2999) {
+                VoskModelManager.useBig = false
+                Diagnostics.error("Большая Vosk: свободно только $freeMb МБ (<3000) → переключаюсь на маленькую")
+                status = "Мало памяти для большой Vosk — использую маленькую"
+            }
+            Diagnostics.info("Vosk: модель готова, загружаю (big=${VoskModelManager.useBig}, свободно $freeMb МБ) — если лог оборвётся здесь, вылет при загрузке модели")
+            val t0 = System.currentTimeMillis()
             val model = try { VoskHolder.getModel(context) }
-            catch (e: Exception) { status = "Ошибка модели: ${e.message}"
-                Diagnostics.error("Vosk загрузка модели упала: ${e.message?.take(80)}"); return@launch }
-            Diagnostics.info("Vosk: модель загружена, старт записи")
+            catch (e: Throwable) { status = "Ошибка модели Vosk: ${e.message}"
+                Diagnostics.error("Vosk загрузка модели упала: ${e.javaClass.simpleName}: ${e.message?.take(80)}"); return@launch }
+            Diagnostics.info("Vosk: модель загружена за ${System.currentTimeMillis() - t0} мс, старт записи")
             val audioFile = if (settings.saveAudio)
                 File(context.filesDir, "audio_${note.id}.wav").also { note.audioPath = it.absolutePath }
             else null
@@ -317,11 +327,18 @@ fun EditorScreen(
             voskEngine = engine
             isListening = true
             status = "Говорите… (Vosk)"
-            engine.start(
-                onPartial = { p -> liveText = p; lastSpeechAt = System.currentTimeMillis() },
-                onFinal = { t -> if (t.isNotBlank()) { onRecognized(t); lastSpeechAt = System.currentTimeMillis() }; liveText = "" },
-                onError = { msg -> status = msg; isListening = false }
-            )
+            try {
+                engine.start(
+                    onPartial = { p -> liveText = p; lastSpeechAt = System.currentTimeMillis() },
+                    onFinal = { t -> if (t.isNotBlank()) { onRecognized(t); lastSpeechAt = System.currentTimeMillis() }; liveText = "" },
+                    onError = { msg -> status = msg; isListening = false; Diagnostics.error("Vosk: $msg") }
+                )
+                Diagnostics.event("Vosk: запись идёт (аудио=${audioFile != null})")
+            } catch (e: Throwable) {
+                isListening = false; voskEngine = null
+                status = "Не удалось начать запись: ${e.message}"
+                Diagnostics.error("Vosk start упал: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+            }
         }
     }
 
@@ -339,7 +356,7 @@ fun EditorScreen(
                 val cleaned = CleanProcessor.clean(original)
                 original = cleaned
                 note.original = cleaned
-                note.putVariant(Level.VERBATIM, tone, cleaned)
+                note.putVariant(Level.VERBATIM, tone, cleaned, "правила")
                 onChanged(); refreshTick++
                 status = "Текст почищен по правилам"
                 Diagnostics.action("Обновить (импорт): чистка правилами")
@@ -354,14 +371,14 @@ fun EditorScreen(
                         original = better
                         val punct = Punctuator.punctuate(better)
                         note.original = punct
-                        note.putVariant(Level.VERBATIM, tone, punct)  // версия в историю → стрелки ‹ ›
+                        note.putVariant(Level.VERBATIM, tone, punct, "Vosk")  // версия в историю → стрелки ‹ ›
                         Diagnostics.action("Дословно изменено: перераспознавание Vosk (кнопка Обновить)")
                     }
                     cornerIndicator = "whisper"
                     val wt = WhisperEngine.transcribe(context, path, settings.whisperModel)
                     if (!wt.isNullOrBlank()) {
                         whisperText = wt
-                        note.putVariant(Level.VERBATIM, tone, Punctuator.punctuate(wt))  // ещё версия
+                        note.putVariant(Level.VERBATIM, tone, Punctuator.punctuate(wt), "Whisper")  // ещё версия
                     }
                     status = "Дословный текст обновлён"
                 } catch (e: Exception) {
@@ -683,8 +700,12 @@ fun EditorScreen(
 
     // Экран ожидания показывается, ПОКА реально идёт обработка (ИИ или перераспознавание),
     // либо пока считаются варианты и текущий ещё не готов.
+    // (только пока процессор реально работает: после отмены/сбоя экран ожидания
+    // не должен висеть вечно — вместо него подсказка и кнопка ↻)
+    refreshTick
+    val batchRunning = processor.isActive(note.id)
     val processing = (aiRunning || voskRerunning || whisperRunning) ||
-        (!isListening && original.isNotBlank() && !currentReady && settings.useAI)
+        (!isListening && original.isNotBlank() && !currentReady && settings.useAI && batchRunning)
 
     // Счётчик секунд — тикает весь процесс обработки (не сбрасывается между вызовами).
     LaunchedEffect(processing) {
@@ -772,13 +793,24 @@ fun EditorScreen(
                     Spacer(Modifier.width(4.dp))
                     // Работа со смыслом: Офлайн (локальный ИИ) / Онлайн (облачный)
                     Text("Смысл", fontSize = 11.sp, color = cs.onSurfaceVariant)
+                    // Смена движка смысла = пересчёт Чисто/Кратко/Суть НОВЫМ движком (старые
+                    // результаты уходят в историю ‹ ›). Раньше при переключении оставались
+                    // варианты от прежнего движка/правил, и пользователь видел под «Онл»
+                    // сырой текст правил, а облачный результат приезжал позже поверх.
                     SegOffOn(
                         offSelected = localAi,
-                        onOff = { localAi = true; settings.localAi = true; Diagnostics.action("Смысл → Офлайн (локальный ИИ)") },
-                        onOn = { localAi = false; settings.localAi = false
-                            Diagnostics.action("Смысл → Онлайн (облачный ИИ)")
-                            // Досчитать варианты, которых нет (после локального были только CLEAN).
-                            if (original.isNotBlank() && settings.useAI) processor.ensureAll(note, level, tone) }
+                        onOff = {
+                            if (localAi) return@SegOffOn
+                            localAi = true; settings.localAi = true
+                            Diagnostics.action("Смысл → Офлайн (локальный ИИ) — пересчёт смыслов")
+                            if (original.isNotBlank() && settings.useAI && settings.autoAi) startProcessingAll()
+                        },
+                        onOn = {
+                            if (!localAi) return@SegOffOn
+                            localAi = false; settings.localAi = false
+                            Diagnostics.action("Смысл → Онлайн (облачный ИИ) — пересчёт смыслов")
+                            if (original.isNotBlank() && settings.useAI && settings.autoAi) startProcessingAll()
+                        }
                     )
                 }
             }
@@ -800,12 +832,14 @@ fun EditorScreen(
                                 accent = accent,
                                 seconds = progressSeconds,
                                 percent = if (tot > 0) (d * 100 / tot).coerceIn(0, 100) else -1,
-                                label = when {
-                                    activeEngine == "local" -> "ИИ на устройстве работает…"
-                                    activeEngine == "cloud" -> "Облачный ИИ обрабатывает…"
-                                    else -> "Обрабатываю по правилам…"
+                                label = when (activeEngine.ifBlank { processor.activeEngine(note.id) }) {
+                                    "local" -> "ИИ на устройстве работает…"
+                                    "cloud" -> "Облачный ИИ обрабатывает…"
+                                    "rules" -> "Обрабатываю по правилам…"
+                                    else -> if (voskRerunning || whisperRunning) "Перераспознаю аудио…" else "Обрабатываю…"
                                 },
-                                detail = if (tot > 0) "Готово вариантов: $d из $tot" else "",
+                                detail = processor.stage(note.id).ifBlank {
+                                    if (tot > 0) "Готово вариантов: $d из $tot" else "" },
                                 preview = original,
                                 onCancel = {
                                     processor.cancel(note.id)
@@ -814,8 +848,11 @@ fun EditorScreen(
                                 }
                             )
                         }
-                        shown.isBlank() -> Text("Текст появится здесь.", color = cs.onSurfaceVariant,
-                            fontSize = 15.sp, modifier = Modifier.padding(20.dp))
+                        shown.isBlank() -> Text(
+                            if (original.isNotBlank() && level != Level.VERBATIM)
+                                "Этот вариант не рассчитан${processor.lastAiError?.let { " (${it.take(60)})" } ?: ""}.\nНажмите ↻, чтобы обработать."
+                            else "Текст появится здесь.",
+                            color = cs.onSurfaceVariant, fontSize = 15.sp, modifier = Modifier.padding(20.dp))
                         else -> SelectionContainer {
                             Text(shown, color = cs.onSurface, fontSize = settings.fontSize.sp,
                                 modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())
@@ -859,7 +896,9 @@ fun EditorScreen(
                     val aiAvailable = settings.useAI || settings.localAi
                     // «Обновить» — переобработать текущим движком/моделью (нужно, например,
                     // чтобы переделать старую заметку новой моделью после её выбора).
-                    val showUpdate = canReupdate || (level != Level.VERBATIM && smyslyReady && aiAvailable)
+                    // + в смыслах, когда текущий вариант НЕ рассчитан и расчёт не идёт (сбой/отмена) — чтобы можно было запустить снова.
+                    val showUpdate = canReupdate || (level != Level.VERBATIM && aiAvailable &&
+                        (smyslyReady || (original.isNotBlank() && !processor.isActive(note.id))))
                     val showAiBtn = original.isNotBlank() && aiAvailable && !settings.autoAi && !smyslyReady
 
                     Row(
@@ -873,6 +912,12 @@ fun EditorScreen(
                             Surface(color = Palette.Ink, shape = RoundedCornerShape(16.dp),
                                 shadowElevation = 6.dp, modifier = Modifier.height(56.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
+                                    // «2/4 · облако» — какая версия и каким движком сделана
+                                    val vLabel = note.versionLabel(level, tone)
+                                    if (vLabel.isNotBlank()) {
+                                        Text(vLabel, color = Color.White.copy(alpha = 0.8f), fontSize = 10.sp,
+                                            modifier = Modifier.padding(start = 10.dp, end = 2.dp))
+                                    }
                                     Box(Modifier.size(width = 40.dp, height = 56.dp)
                                         .clickable(enabled = note.canGoBack(level, tone)) {
                                             note.goBack(level, tone); onChanged(); refreshTick++ },
@@ -892,11 +937,15 @@ fun EditorScreen(
                         }
                         // «Обновить» — переосмыслить/перераспознать текущее (переливается при работе)
                         if (showUpdate) {
-                            val busy = aiRunning || voskRerunning
+                            // Пока идёт пакетный расчёт вариантов — не даём запустить второй
+                            // поток поверх (результаты налезали друг на друга).
+                            val batchActive = processor.isActive(note.id)
+                            val busy = aiRunning || voskRerunning || batchActive
                             FloatingActionButton(
                                 onClick = {
-                                    Diagnostics.action("Тап Обновить: busy=$busy (aiRunning=$aiRunning, vosk=$voskRerunning)")
+                                    Diagnostics.action("Тап Обновить: busy=$busy (aiRunning=$aiRunning, vosk=$voskRerunning, пакет=$batchActive)")
                                     if (!busy) updateCurrent()
+                                    else if (batchActive) status = "Идёт расчёт вариантов, подождите…"
                                 },
                                 containerColor = if (busy) Palette.Amber else Palette.Ink,
                                 contentColor = Color.White
@@ -917,6 +966,7 @@ fun EditorScreen(
                         if (level == Level.VERBATIM) {
                             FloatingActionButton(
                                 onClick = {
+                                    Diagnostics.action("Тап микрофон: разрешение=$hasPermission, идёт запись=$isListening, речь=${if (isOnline) "онл" else "офл"}")
                                     if (!hasPermission) permLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                     else if (isListening) stopRecording()
                                     else startRecording()

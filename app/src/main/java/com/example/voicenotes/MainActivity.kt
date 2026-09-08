@@ -12,6 +12,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Чёрный ящик: открыть живой лог на диске, подшить хвост прошлой сессии.
+        Diagnostics.init(this)
         // Перехватчик крашей: пишем причину в диагностику ПЕРЕД падением.
         val prev = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
@@ -26,6 +28,18 @@ class MainActivity : ComponentActivity() {
             prev?.uncaughtException(t, e)
         }
         setContent { App() }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // Отметка «живой» точки: если после неё лог оборвётся без END-марки — это вылет.
+        Diagnostics.info("Приложение ушло в фон (onStop)")
+    }
+
+    override fun onDestroy() {
+        // Нормальное завершение (система закрыла Activity штатно).
+        Diagnostics.markNormalExit()
+        super.onDestroy()
     }
 }
 

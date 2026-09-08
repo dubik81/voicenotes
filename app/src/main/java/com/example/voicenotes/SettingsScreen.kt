@@ -305,14 +305,20 @@ fun SettingsScreen(
                         DownloadManager.errors[localKey]?.let { Text("✗ $it", color = Palette.Red, fontSize = 11.sp) }
                         Spacer(Modifier.height(8.dp))
                         val localReady = LocalAiModelManager.isReady(context, localAiModel)
+                        // Токенизатор — свой у каждой модели (v116). Если модель есть, а его нет —
+                        // кнопка докачивает только токенизатор.
+                        val tokReady = LocalAiModelManager.hasTokenizer(context, localAiModel)
                         Button(
                             onClick = { DownloadManager.downloadLocalAi(appScope, context, localAiModel) },
-                            enabled = localDlP < 0 && !localReady,
+                            enabled = localDlP < 0 && (!localReady || !tokReady),
                             colors = ButtonDefaults.buttonColors(containerColor = Palette.Ink),
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text(if (localReady) "Модель ИИ скачана" else "Скачать модель ИИ",
+                            Text(when {
+                                localReady && tokReady -> "Модель ИИ скачана"
+                                localReady -> "Докачать токенизатор модели"
+                                else -> "Скачать модель ИИ" },
                                 color = Color.White, fontSize = 13.sp)
                         }
                         Spacer(Modifier.height(6.dp))

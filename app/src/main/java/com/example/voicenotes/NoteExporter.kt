@@ -48,7 +48,14 @@ object NoteExporter {
             val hist = JSONObject()
             note.history.forEach { (key, list) ->
                 val arr = org.json.JSONArray()
-                list.forEach { arr.put(it) }
+                val engines = note.historyEngine[key]
+                list.forEachIndexed { i, text ->
+                    arr.put(JSONObject().apply {
+                        put("engine", engines?.getOrNull(i).orEmpty())
+                        put("length", text.length)
+                        put("text", text)
+                    })
+                }
                 hist.put(key, arr)
             }
             put("history", hist)
@@ -86,7 +93,7 @@ object NoteExporter {
             }
             // Диагностический лог («чёрный ящик») — для отладки.
             zos.putNextEntry(ZipEntry("diagnostics.txt"))
-            zos.write(Diagnostics.dump().toByteArray(Charsets.UTF_8))
+            zos.write(Diagnostics.dumpForExport().toByteArray(Charsets.UTF_8))
             zos.closeEntry()
         }
         return zipFile

@@ -45,6 +45,12 @@ class VariantProcessor(
         private set
 
     fun isActive(noteId: Long): Boolean = activeNote[noteId] == true
+    // Каким движком РЕАЛЬНО идёт пакетный расчёт ("local"/"cloud"/"rules"/"").
+    private val activeEngineOf = mutableStateMapOf<Long, String>()
+    fun activeEngine(noteId: Long): String = activeEngineOf[noteId] ?: ""
+    // Текущий этап пакетной обработки для экрана ожидания («Чисто: часть 3 из 7»).
+    private val stageOf = mutableStateMapOf<Long, String>()
+    fun stage(noteId: Long): String = stageOf[noteId] ?: ""
     fun doneCount(noteId: Long): Int = progressDone[noteId] ?: 0
     fun totalCount(noteId: Long): Int = progressTotal[noteId] ?: 0
 
@@ -64,91 +70,137 @@ class VariantProcessor(
     }
 
     // Роутинг: локальный ИИ (если выбран и модель готова) или облачный.
-    private suspend fun processAllRouted(text: String): Map<String, String> {
+    private suspend fun processAllRouted(note: Note, text: String): Map<String, String> {
         if (settings.localAi) {
             if (!LocalAiModelManager.isReady(context, settings.localAiModel)) {
                 // Модели нет — работаем на надёжных правилах (без ИИ, но всегда результат).
                 Diagnostics.engine("Офлайн без модели: обработка правилами")
-                return rulesBasedAll(text)
+                lastEngine = "правила"
+                return rulesBasedAll(text, note.recordMode == "google")
             }
             Diagnostics.engine("Обработка вариантов: ЛОКАЛЬНЫЙ ИИ (+ правила как запас)")
-            return localProcessAll(text)  // внутри есть fallback на правила
+            return localProcessAll(note, text)  // внутри есть fallback на правила
         }
         Diagnostics.engine("Обработка вариантов: ОБЛАЧНЫЙ ИИ")
+        lastEngine = "облако"
+        stageOf[note.id] = "Запрос облаку (все 9 вариантов одним запросом)…"
         return AiClient.processAll(text, settings.apiKey)
     }
 
+    // Метка движка, которым получен последний результат (для истории версий).
+    @Volatile private var lastEngine: String = ""
+    private fun localLabel() = "на устройстве (${settings.localAiModel})"
+
+    // ── Промпты локальной модели: КОРОТКИЕ и КОНКРЕТНЫЕ (1.5B теряется в длинных).
+    private val LOCAL_CLEAN = "Исправь текст: расставь точки и запятые по смыслу, исправь ошибки распознавания. Все слова и смысл сохрани. Выведи только текст."
+    private val LOCAL_BRIEF_CHUNK = "Перескажи коротко, в 1-2 предложениях, сохранив факты:"
+    private val LOCAL_BRIEF = "Кратко перескажи этот текст в 2-3 предложениях. Факты не заменяй общими словами:"
+    private val LOCAL_GIST = "О чём этот текст? Ответь одним-двумя предложениями, не искажая смысл:"
+    private val LOCAL_LECTURE_BRIEF = "Это лекция. Кратко изложи её содержание в 3-4 предложениях:"
+    private val LOCAL_LECTURE_GIST = "Это лекция. Одним-двумя предложениями: о чём она?"
+
+    /** Локальное «Чисто»: модель по кускам; кусок, который модель исказила, — правилами. */
+    private suspend fun localClean(note: Note, text: String, prompt: String = LOCAL_CLEAN): String {
+        val googleCaps = note.recordMode == "google"
+        stageOf[note.id] = "Чисто: модель на устройстве…"
+        val res = LocalAiEngine.processLong(context, prompt, text, settings.localAiModel,
+            onProgress = { d, t, _ -> progressDone[note.id] = d; progressTotal[note.id] = t
+                stageOf[note.id] = "Чисто: часть $d из $t" },
+            chunkOk = { chunk, r -> !tooDistorted(r, chunk) && !isCopyOrTruncation(r, chunk) })
+        return if (!res.isNullOrBlank() && res != text) {
+            // финальная косметика правилами (двойная пунктуация, заглавные)
+            Diagnostics.engine("Чисто: локальная модель (${res.length} симв из ${text.length})")
+            lastEngine = localLabel()
+            Punctuator.capitalizeSentences(CleanProcessor.normalizePunct(res))
+        } else {
+            Diagnostics.engine("Чисто: модель не справилась → правила")
+            lastEngine = "правила"
+            CleanProcessor.clean(text, googleCaps)
+        }
+    }
+
+    /** Локальная суммаризация (Кратко/Суть) с картой-свёрткой для длинного текста. */
+    private suspend fun localSummary(note: Note, text: String, l: Level, lecture: Boolean): String {
+        val finalPrompt = when {
+            lecture && l == Level.BRIEF -> LOCAL_LECTURE_BRIEF
+            lecture -> LOCAL_LECTURE_GIST
+            l == Level.BRIEF -> LOCAL_BRIEF
+            else -> LOCAL_GIST
+        }
+        val name = if (l == Level.BRIEF) "Кратко" else "Суть"
+        stageOf[note.id] = "$name: модель на устройстве…"
+        val r = LocalAiEngine.summarize(context, LOCAL_BRIEF_CHUNK, finalPrompt, text, settings.localAiModel,
+            onProgress = { d, t, _ -> progressDone[note.id] = d; progressTotal[note.id] = t
+                stageOf[note.id] = "$name: часть $d из $t" })
+        val ok = !r.isNullOrBlank() && !isLoopy(r) && r.length >= (if (l == Level.BRIEF) 10 else 5) &&
+            r.length < text.length
+        return if (ok) {
+            val limited = limitSentences(r!!, if (l == Level.GIST) 2 else 4)
+            Diagnostics.engine("$l: локальный ИИ (суммаризация), ${limited.length} симв")
+            lastEngine = localLabel()
+            limited
+        } else {
+            Diagnostics.engine("$l: локальный ИИ не дал результат → правила (${LocalAiEngine.lastStatus})")
+            lastEngine = "правила"
+            TextCondenser.condense(text, l)
+        }
+    }
+
     // Полностью офлайн-обработка на правилах (без ИИ) — гарантированный результат.
-    private fun rulesBasedAll(text: String): Map<String, String> {
+    private fun rulesBasedAll(text: String, googleCaps: Boolean): Map<String, String> {
         val result = mutableMapOf<String, String>()
-        val t = Tone.NEUTRAL.ordinal
-        result["${Level.CLEAN.ordinal}:$t"] = CleanProcessor.clean(text)
-        result["${Level.BRIEF.ordinal}:$t"] = TextCondenser.condense(text, Level.BRIEF)
-        result["${Level.GIST.ordinal}:$t"] = TextCondenser.condense(text, Level.GIST)
+        val c = CleanProcessor.clean(text, googleCaps)
+        val b = TextCondenser.condense(text, Level.BRIEF)
+        val g = TextCondenser.condense(text, Level.GIST)
+        // все тоны одинаково (правила тон не различают) — иначе Формально/Живой оставались пустыми
+        for (tn in Tone.entries) {
+            result["${Level.CLEAN.ordinal}:${tn.ordinal}"] = c
+            result["${Level.BRIEF.ordinal}:${tn.ordinal}"] = b
+            result["${Level.GIST.ordinal}:${tn.ordinal}"] = g
+        }
         return result
     }
 
-    private suspend fun processLectureRouted(text: String): Map<String, String> {
+    private suspend fun processLectureRouted(note: Note, text: String): Map<String, String> {
         if (settings.localAi) {
             if (!LocalAiModelManager.isReady(context, settings.localAiModel)) {
                 Diagnostics.error("Локальный ИИ (лекция): модель не скачана")
                 throw RuntimeException("Локальный ИИ: модель не скачана")
             }
             Diagnostics.engine("Стенограмма: ЛОКАЛЬНЫЙ ИИ")
-            val res = localProcessLecture(text)
+            val res = localProcessLecture(note, text)
             if (res.isNotEmpty()) { Diagnostics.engine("Локальный ИИ (лекция) вернул ${res.size}"); return res }
             Diagnostics.error("Локальный ИИ (лекция) не дал результат (${LocalAiEngine.lastStatus})")
             throw RuntimeException("Локальный ИИ не дал результат (${LocalAiEngine.lastStatus})")
         }
         Diagnostics.engine("Стенограмма: ОБЛАЧНЫЙ ИИ")
+        lastEngine = "облако"
         return AiClient.processLecture(text, settings.apiKey)
     }
 
-    // Локальная обработка: маленькой модели проще делать по одному варианту,
-    // чем большой JSON. Генерируем ключевые варианты по отдельности.
-    private suspend fun localProcessAll(text: String): Map<String, String> {
-        val model = settings.localAiModel
-        val result = mutableMapOf<String, String>()
-        fun okRes(r: String?, minLen: Int) = !r.isNullOrBlank() && !isLoopy(r) && r.length >= minLen
-        // Дословно — как есть.
-        for (tn in Tone.entries) result["${Level.VERBATIM.ordinal}:${tn.ordinal}"] = text
-        // КРАТКО и СУТЬ — РОДНАЯ задача модели (суммаризация, для чего Meta её создала).
-        val b = LocalAiEngine.generate(context,
-            "Кратко перескажи этот текст в 2-3 предложениях. Не заменяй конкретные факты общими словами:", text, model)
-        val bRes = if (okRes(b, 10)) limitSentences(b!!, 4) else TextCondenser.condense(text, Level.BRIEF)
-        val g = LocalAiEngine.generate(context,
-            "О чём этот текст? Ответь кратко, не искажая смысл:", text, model)
-        val gRes = if (okRes(g, 5)) limitSentences(g!!, 2) else TextCondenser.condense(text, Level.GIST)
-        // Заполняем ВСЕ тоны одинаково (локальная модель тон не различает).
-        for (tn in Tone.entries) {
-            result["${Level.CLEAN.ordinal}:${tn.ordinal}"] = CleanProcessor.clean(text)
-            result["${Level.BRIEF.ordinal}:${tn.ordinal}"] = bRes
-            result["${Level.GIST.ordinal}:${tn.ordinal}"] = gRes
-        }
-        return result
-    }
+    // Локальная обработка: по одному варианту (маленькой модели проще).
+    // Чисто — модель по кускам (при искажении куска — правила), Кратко/Суть — суммаризация.
+    // Уровни, где все тоны уже есть, НЕ пересчитываем (фон добирает только недостающее).
+    private suspend fun localProcessAll(note: Note, text: String): Map<String, String> =
+        localBatch(note, text, lecture = false)
 
-    private suspend fun localProcessLecture(text: String): Map<String, String> {
-        val model = settings.localAiModel
+    private suspend fun localProcessLecture(note: Note, text: String): Map<String, String> =
+        localBatch(note, text, lecture = true)
+
+    private suspend fun localBatch(note: Note, text: String, lecture: Boolean): Map<String, String> {
         val result = mutableMapOf<String, String>()
-        fun okRes(r: String?, minLen: Int) = !r.isNullOrBlank() && !isLoopy(r) && r.length >= minLen
-        // По назначению модели: Чисто (стенограмма) — правила (модель выдумывает).
-        // Кратко/Суть (конспект лекции) — суммаризация, родная задача модели.
-        val cleanText = CleanProcessor.clean(text)
-        val b = LocalAiEngine.generate(context,
-            "Это лекция. Кратко изложи её содержание в 3-4 предложениях (конспект):", text, model)
-        val bRes = if (okRes(b, 10)) limitSentences(b!!, 5) else TextCondenser.condense(text, Level.BRIEF)
-        val g = LocalAiEngine.generate(context,
-            "Это лекция. Одним предложением: о чём она?", text, model)
-        val gRes = if (okRes(g, 5)) limitSentences(g!!, 2) else TextCondenser.condense(text, Level.GIST)
-        // Все тоны одинаково.
-        for (tn in Tone.entries) {
-            result["${Level.CLEAN.ordinal}:${tn.ordinal}"] = cleanText
-            result["${Level.BRIEF.ordinal}:${tn.ordinal}"] = bRes
-            result["${Level.GIST.ordinal}:${tn.ordinal}"] = gRes
+        fun missing(l: Level) = Tone.entries.any { note.getVariant(l, it) == null }
+        for (l in listOf(Level.CLEAN, Level.BRIEF, Level.GIST)) {
+            if (!missing(l)) continue
+            val r = if (l == Level.CLEAN) localClean(note, text) else localSummary(note, text, l, lecture)
+            // Заполняем ВСЕ тоны одинаково (локальная модель тон не различает).
+            for (tn in Tone.entries) result["${l.ordinal}:${tn.ordinal}"] = r
+            engineOf["${l.ordinal}"] = lastEngine
         }
         return result
     }
+    // Метка движка по уровню для последнего пакетного результата (локальный режим).
+    private val engineOf = HashMap<String, String>()
 
     /** Запускает/продолжает расчёт недостающих вариантов заметки. */
     fun ensureAll(note: Note, priorityLevel: Level, priorityTone: Tone) {
@@ -164,9 +216,14 @@ class VariantProcessor(
         }
         progressTotal[note.id] = combos.size
         progressDone[note.id] = combos.count { (l, t) -> note.getVariant(l, t) != null }
+        // Всё уже есть — ничего не запускаем. (Раньше при каждом открытии заметки шёл
+        // полный повторный запрос и его результат ложился ПОВЕРХ готовых вариантов.)
+        if (combos.all { (l, t) -> note.getVariant(l, t) != null }) return
         activeNote[note.id] = true
 
+        engineOf.clear()
         jobs[note.id] = scope.launch {
+          try {
             if (settings.useAI) {
                 // Лекция: отдельный запрос стенограммы; иначе умный запрос всех вариантов.
                 var attempt = 0
@@ -177,24 +234,36 @@ class VariantProcessor(
                         if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.RUNNING
                     }
                     try {
+                        val srcText = note.refinedText ?: note.original
+                        Diagnostics.info("В обработку ушёл текст (${srcText.length} симв): \"${srcText.take(50)}...\"")
                         val all = if (note.isLecture)
-                            processLectureRouted(note.refinedText ?: note.original)
+                            processLectureRouted(note, srcText)
                         else
-                            processAllRouted(note.refinedText ?: note.original)
-                        Diagnostics.info("В обработку ушёл текст (${note.original.length} симв): \"${note.original.take(50)}...\"")
+                            processAllRouted(note, srcText)
                         // Умный заголовок стенограммы от ИИ.
                         all["TITLE"]?.takeIf { it.isNotBlank() }?.let { note.title = it }
+                        var filled = 0; var skipped = 0
                         for ((l, t) in combos) {
                             val key = "${l.ordinal}:${t.ordinal}"
                             val text = all[key]
                             if (text != null && text.isNotBlank()) {
-                                note.putVariant(l, t, text)
+                                // НЕ перезаписываем вариант, который появился, пока шёл пакетный
+                                // запрос (например, пользователь нажал «Обновить» и получил
+                                // результат раньше) — иначе хороший текст уезжает в историю.
+                                if (note.getVariant(l, t) == null) {
+                                    val eng = engineOf["${l.ordinal}"] ?: lastEngine
+                                    note.putVariant(l, t, text, eng)
+                                    filled++
+                                } else skipped++
                                 states[k(note.id, l, t)] = State.DONE
                             }
                         }
+                        Diagnostics.engine("Пакет вариантов записан: $filled${if (skipped > 0) ", пропущено уже готовых: $skipped" else ""} (движок: $lastEngine)")
                         // «Дословно» (VERBATIM) НЕ трогаем — оно всегда исходный текст,
                         // не меняется после ИИ (требование пользователя).
+                        progressTotal[note.id] = combos.size
                         progressDone[note.id] = combos.count { (l, t) -> note.getVariant(l, t) != null }
+                        stageOf.remove(note.id)
                         persist()
                         val allDone = combos.all { (l, t) -> note.getVariant(l, t) != null }
                         if (allDone) break
@@ -204,6 +273,7 @@ class VariantProcessor(
                             if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.QUEUED
                         }
                     } catch (e: Exception) {
+                        if (e is kotlinx.coroutines.CancellationException) throw e   // отмена — не ошибка
                         for ((l, t) in combos) {
                             if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.FAILED
                         }
@@ -222,14 +292,17 @@ class VariantProcessor(
                 // Бесплатные правила: считаем каждый локально (мгновенно, без лимитов).
                 for ((l, t) in combos) {
                     if (note.getVariant(l, t) == null) {
-                        note.putVariant(l, t, TextCondenser.condense(note.original, l))
+                        note.putVariant(l, t, TextCondenser.condense(note.original, l), "правила")
                         states[k(note.id, l, t)] = State.DONE
                     }
                 }
                 progressDone[note.id] = combos.size
                 persist()
             }
-            activeNote[note.id] = false
+          } finally {
+            activeNote[note.id] = false   // и при отмене тоже (иначе «идёт обработка» навсегда)
+            activeEngineOf.remove(note.id); stageOf.remove(note.id)
+          }
         }
     }
 
@@ -241,16 +314,17 @@ class VariantProcessor(
             var ok = false
             try {
                 val text = computeOne(note, l, t, vary = true)
-                note.putVariant(l, t, text)
+                note.putVariant(l, t, text, lastEngine)
                 states[k(note.id, l, t)] = State.DONE
                 persist()
                 ok = true
-                Diagnostics.engine("Обновлён вариант ($l): ${text.length} симв")
+                Diagnostics.engine("Обновлён вариант ($l/$t): ${text.length} симв, движок: $lastEngine")
             } catch (e: Exception) {
                 states[k(note.id, l, t)] = State.FAILED
                 lastAiError = e.message?.take(50)
                 Diagnostics.error("Обновление варианта ($l) не удалось: ${e.message?.take(50)}")
             }
+            stageOf.remove(note.id)
             onDone(ok)
         }
     }
@@ -261,55 +335,65 @@ class VariantProcessor(
         // Роутинг: локальный ИИ (если выбран офлайн) или облачный.
         if (settings.useAI && settings.localAi &&
             LocalAiModelManager.isReady(context, settings.localAiModel)) {
-            // По назначению модели Meta: суммаризация (Кратко/Суть) — её задача,
-            // дословное редактирование (Чисто) — НЕ её (выдумывает) → правила.
-            when (l) {
+            return when (l) {
                 Level.CLEAN -> {
-                    // Простые промпты работают лучше сложных (модель 1.5B теряется в условиях).
+                    // «Обновить» = другая формулировка задачи → другой результат.
                     val prompts = listOf(
-                        "Это распознанная речь, пунктуация в ней автоматическая и часто ошибочна. Расставь правильные знаки препинания по смыслу и исправь ошибки распознавания:",
-                        "Исходная пунктуация ненадёжна. Переосмысли знаки препинания по смыслу, исправь окончания слов:",
-                        "Оформи текст грамотно: раздели на предложения по смыслу, поставь правильные точки и запятые:"
+                        LOCAL_CLEAN,
+                        "Расставь знаки препинания по смыслу и исправь ошибки распознавания. Не убирай слова. Выведи только текст.",
+                        "Раздели текст на предложения по смыслу, поставь точки и запятые, исправь окончания слов. Выведи только текст."
                     )
-                    val prompt = if (vary) prompts.random() else prompts[0]
-                    val res = LocalAiEngine.generate(context, prompt, orig, settings.localAiModel)
-                    if (!res.isNullOrBlank() && !isLoopy(res) && !tooDistorted(res, orig) &&
-                        res.length <= orig.length * 2) {
-                        Diagnostics.engine("Чисто: локальная модель (${res.length} симв)")
-                        return res
-                    }
-                    Diagnostics.engine("Чисто: модель исказила → правила")
-                    return CleanProcessor.clean(orig)
+                    localClean(note, orig, if (vary) prompts.random() else prompts[0])
                 }
-                Level.VERBATIM -> return Punctuator.punctuate(orig)
-                else -> {
-                    val prompt = if (l == Level.BRIEF)
-                        "Кратко перескажи этот текст в 2-3 предложениях. Не заменяй конкретные факты общими словами:"
-                    else "О чём этот текст? Ответь кратко, не искажая смысл:"
-                    val res = LocalAiEngine.generate(context, prompt, orig, settings.localAiModel)
-                    if (!res.isNullOrBlank() && !isLoopy(res)) {
-                        // Ограничиваем длину: Суть — до 1-2 предложений, Кратко — до 3-4.
-                        val limited = limitSentences(res, if (l == Level.GIST) 2 else 4)
-                        Diagnostics.engine("$l: локальный ИИ (суммаризация), ${limited.length} симв")
-                        return limited
-                    }
-                    return TextCondenser.condense(orig, l)
-                }
+                Level.VERBATIM -> { lastEngine = "правила"; Punctuator.punctuate(orig) }
+                else -> localSummary(note, orig, l, note.isLecture)
             }
         }
-        val result = if (settings.useAI)
+        val result = if (settings.useAI) {
+            lastEngine = "облако"
             AiClient.process(orig, l, t, settings.apiKey, vary)
-        else TextCondenser.condense(orig, l)
+        } else { lastEngine = "правила"; TextCondenser.condense(orig, l) }
 
         if (l != Level.VERBATIM && result.length > orig.length) {
             return if (settings.useAI) {
                 try {
                     val shorter = AiClient.process(orig, l, t, settings.apiKey, vary = true)
-                    if (shorter.length <= orig.length) shorter else TextCondenser.condense(orig, l)
+                    if (shorter.length <= orig.length) capLength(shorter, orig, l) else TextCondenser.condense(orig, l)
                 } catch (_: Exception) { TextCondenser.condense(orig, l) }
             } else TextCondenser.condense(orig, l)
         }
-        return result
+        return capLength(result, orig, l)
+    }
+
+    /**
+     * Жёсткий потолок длины для Кратко/Суть (облако при «Обновить» с высокой температурой
+     * иногда выдавало для «Суть» два абзаца на 566 символов): Суть ≤ 3 предложений и
+     * ≤ 35% оригинала, Кратко ≤ 65% оригинала (лишние предложения отрезаем с конца).
+     */
+    private fun capLength(result: String, orig: String, l: Level): String {
+        if (l != Level.BRIEF && l != Level.GIST) return result
+        val maxChars = (orig.length * (if (l == Level.GIST) 0.35 else 0.65)).toInt().coerceAtLeast(120)
+        var r = if (l == Level.GIST) limitSentences(result, 3) else result
+        if (r.length > maxChars) {
+            val parts = r.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
+            val sb = StringBuilder()
+            for (p in parts) { if (sb.isNotEmpty() && sb.length + p.length > maxChars) break; sb.append(p).append(" ") }
+            if (sb.isNotBlank()) r = sb.toString().trim()
+        }
+        if (r != result) Diagnostics.engine("$l: результат укорочен ${result.length} → ${r.length} симв (потолок $maxChars)")
+        return r
+    }
+
+    // Модель просто скопировала/обрезала вход — это не обработка (v115: «жилых» без «домов.»).
+    private fun isCopyOrTruncation(result: String, source: String): Boolean {
+        val r = result.trim(); val s = source.trim()
+        if (r == s) return true
+        if (r.length < s.length * 0.9 && s.startsWith(r.take(minOf(r.length, 40)))) {
+            // начало совпадает, а конец потерян → обрезка
+            val lostWords = s.split(Regex("\\s+")).size - r.split(Regex("\\s+")).size
+            if (lostWords >= 2) return true
+        }
+        return false
     }
 
     // Оставляет первые N предложений (для ограничения длины суммаризации).
@@ -351,15 +435,6 @@ class VariantProcessor(
         return false
     }
 
-    // Короткий промпт для одного варианта (локальный ИИ).
-    // Чёткие промпты: инструкция в system, текст в user — модель понимает границу.
-    private fun localPromptFor(l: Level, lecture: Boolean): String = when (l) {
-        Level.VERBATIM -> "Ты редактор. Добавь в текст пользователя знаки препинания и заглавные буквы. Сохрани все слова. Выведи только исправленный текст, без пояснений."
-        Level.CLEAN -> "Ты редактор. Перепиши текст пользователя грамотно и связно: убери слова-паразиты и повторы, исправь ошибки, сохрани весь смысл. Выведи только результат, без пояснений."
-        Level.BRIEF -> "Ты редактор. Кратко перескажи главное из текста пользователя в 2-3 предложениях. Выведи только пересказ, без пояснений."
-        Level.GIST -> "Ты редактор. Одним предложением напиши, о чём текст пользователя. Выведи только это предложение."
-    }
-
     /** Продолжить обработку ВСЕХ заметок, где есть недосчитанное (вызывать периодически). */
     fun resumeAll() {
         if (!settings.autoAi) return  // при ручном режиме фон не досчитывает сам
@@ -380,5 +455,6 @@ class VariantProcessor(
         progressDone.remove(noteId)
         progressTotal.remove(noteId)
         activeNote.remove(noteId)
+        activeEngineOf.remove(noteId); stageOf.remove(noteId)
     }
 }

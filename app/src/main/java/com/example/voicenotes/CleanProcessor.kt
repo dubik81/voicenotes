@@ -31,10 +31,23 @@ object CleanProcessor {
         "первый", "второй", "третий", "первое", "второе", "третье"
     )
 
-    /** Главный метод: сырой текст → чистый читаемый текст. */
-    fun clean(raw: String): String {
+    // Предлоги: заглавное слово после них — скорее имя собственное («в Москве»), не начало фразы.
+    private val prepositions = setOf(
+        "в", "во", "на", "к", "ко", "из", "у", "о", "об", "обо", "с", "со", "по", "за", "под",
+        "при", "от", "до", "для", "про", "над", "перед", "между", "через", "без", "около", "у"
+    )
+
+    /**
+     * Главный метод: сырой текст → чистый читаемый текст.
+     * googleCaps = true для текста из онлайн-распознавания Google: оно ставит заглавную
+     * букву в начале каждой распознанной фразы, но часто НЕ ставит точку перед ней
+     * («…дом построить Нарисуем будем жить Так.»). Такие заглавные считаем границей
+     * предложения (кроме имён после предлогов).
+     */
+    fun clean(raw: String, googleCaps: Boolean = false): String {
         if (raw.isBlank()) return ""
         var t = raw.trim().replace(Regex("\\s+"), " ")
+        if (googleCaps) t = splitByCapitals(t)
         // Нормализуем протяжные междометия с дефисами/повторами букв: «э-э», «э-э-э», «ааа».
         t = t.replace(Regex("(?i)\\bэ+([-\\s]*э+)*\\b"), " ")
         t = t.replace(Regex("(?i)\\bа{2,}\\b"), " ")
@@ -84,6 +97,65 @@ object CleanProcessor {
         res = res.replace(Regex(",{2,}"), ",")
         res = res.replace(Regex("([.!?])\\s*,"), "$1")
         return capitalizeSentences(res)
+    }
+
+    // Заглавные слова, которые почти всегда начинают предложение (не имена).
+    private val capStarters = setOf(
+        "я", "мы", "ты", "вы", "он", "она", "они", "оно", "это", "этот", "эта", "эти", "так", "итак",
+        "затем", "потом", "далее", "сегодня", "вчера", "завтра", "теперь", "здесь", "там", "тут",
+        "если", "когда", "что", "как", "где", "почему", "зачем", "поэтому", "например", "также",
+        "кстати", "может", "можно", "нужно", "надо", "есть", "нет", "да", "ну", "вот", "но", "а", "и",
+        "хорошо", "ладно", "спасибо", "конечно", "значит", "первое", "второе", "третье", "все", "всё",
+        "ещё", "еще", "давай", "давайте", "пусть", "пока", "потому", "хотя", "однако", "короче",
+        "в", "во", "на", "к", "с", "у", "о", "по", "за", "для", "при", "от", "до", "про", "из"
+    )
+    // Окончания глаголов — «Нарисуем», «Видит», «Была»: такое слово с заглавной — начало фразы.
+    private val verbEndings = listOf("ем", "ём", "им", "ешь", "ёшь", "ишь", "ет", "ёт", "ит", "ут",
+        "ют", "ат", "ят", "йте", "ите", "ать", "ять", "ить", "ти", "ся", "сь", "ал", "ил", "ла", "ло", "ли", "ел", "ел")
+
+    private fun looksLikeSentenceStart(word: String): Boolean {
+        val bare = word.lowercase().trim(',', '.', '!', '?', ':', ';', '«', '»', '"')
+        if (bare in capStarters) return true
+        if (bare.length >= 4 && verbEndings.any { bare.endsWith(it) }) return true
+        return false
+    }
+
+    /**
+     * Точка перед заглавным словом посреди фразы (см. clean/googleCaps).
+     * Чтобы не рубить перед именами («встретил Ивана»), делим ТОЛЬКО если заглавное
+     * слово похоже на начало фразы: местоимение/союз/наречие или глагол по окончанию.
+     */
+    fun splitByCapitals(text: String): String {
+        val words = text.split(" ").filter { it.isNotBlank() }
+        val out = StringBuilder()
+        for ((i, w) in words.withIndex()) {
+            if (i > 0) {
+                val prev = words[i - 1]
+                val prevBare = prev.lowercase().trim(',', '.', '!', '?', ':', ';', '«', '»', '"')
+                val first = w.firstOrNull { it.isLetter() }
+                val isCap = first != null && first.isUpperCase() && w.drop(1).any { it.isLowerCase() }
+                val prevEndsSentence = prev.endsWith(".") || prev.endsWith("!") || prev.endsWith("?")
+                if (isCap && !prevEndsSentence && prevBare !in prepositions && !prev.endsWith(",") &&
+                    looksLikeSentenceStart(w)) {
+                    trimTrailingSpace(out); out.append(". ")
+                }
+            }
+            out.append(w).append(" ")
+        }
+        return out.toString().trim()
+    }
+
+    /** Нормализация пунктуации после модели: пробелы перед знаками, «,.», «..», заглавные. */
+    fun normalizePunct(text: String): String {
+        var res = text.trim().replace(Regex("\\s+"), " ")
+        res = res.replace(Regex("\\s+([,.!?;:])"), "$1")
+        res = res.replace(Regex(",\\s*\\."), ".")
+        res = res.replace(Regex("\\.{2,}"), ".")
+        res = res.replace(Regex(",{2,}"), ",")
+        res = res.replace(Regex("([.!?])\\s*,"), "$1")
+        res = res.replace(Regex("([,.!?;:])(?=[^\\s\\d»\"\\)])"), "$1 ")
+        if (res.isNotEmpty() && res.last() !in charArrayOf('.', '!', '?')) res += "."
+        return res
     }
 
     private fun trimTrailingSpace(sb: StringBuilder) {

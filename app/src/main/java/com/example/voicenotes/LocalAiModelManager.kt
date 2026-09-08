@@ -34,14 +34,49 @@ object LocalAiModelManager {
         else -> "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8-ET/resolve/main/tokenizer.model"
     }
 
-    // Токенизатор (нужен вместе с моделью для работы).
-    const val TOKENIZER_URL =
-        "https://huggingface.co/executorch-community/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8-ET/resolve/main/tokenizer.model"
+    // Токенизатор — СВОЙ у каждой модели (Qwen: tokenizer.json, Llama: tokenizer.model).
+    // v115 и раньше был один общий файл tokenizer.model: какой скачался первым, тот и
+    // использовался для ВСЕХ моделей. Модель с чужим токенизатором = мусор на выходе.
+    private fun tokenizerName(modelId: String) =
+        if (modelId.startsWith("qwen")) "tokenizer_qwen.json" else "tokenizer_llama.model"
 
-    fun tokenizerFile(context: Context): File {
+    fun tokenizerFile(context: Context, modelId: String): File {
         val dir = File(context.filesDir, "localai").apply { mkdirs() }
-        return File(dir, "tokenizer.model")
+        val f = File(dir, tokenizerName(modelId))
+        if (!f.exists()) migrateLegacyTokenizer(dir, modelId, f)
+        return f
     }
+
+    /** Старый общий tokenizer.model: по содержимому определяем, чей он, и переносим. */
+    private fun migrateLegacyTokenizer(dir: File, modelId: String, target: File) {
+        try {
+            val legacy = File(dir, "tokenizer.model")
+            if (!legacy.exists() || legacy.length() < 1000) return
+            val head = legacy.inputStream().use { val b = ByteArray(64); val n = it.read(b); String(b, 0, maxOf(n, 0)) }.trimStart()
+            val isJson = head.startsWith("{")   // HF tokenizer.json (Qwen) — текстовый JSON
+            val wantQwen = modelId.startsWith("qwen")
+            if (isJson == wantQwen) {
+                legacy.copyTo(target, overwrite = true)
+                Diagnostics.info("Токенизатор: старый общий файл распознан как ${if (isJson) "Qwen(json)" else "Llama(model)"} → ${target.name}")
+            }
+        } catch (_: Throwable) {}
+    }
+
+    /** Докачать токенизатор для модели (если модель есть, а токенизатора нет). */
+    fun ensureTokenizer(context: Context, modelId: String) {
+        val tok = tokenizerFile(context, modelId)
+        if (tok.exists() && tok.length() > 1000) return
+        val tc = (URL(tokenizerUrlFor(modelId)).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 20000; readTimeout = 60000; instanceFollowRedirects = true
+        }
+        if (tc.responseCode !in 200..299) throw RuntimeException("токенизатор: HTTP ${tc.responseCode}")
+        tc.inputStream.use { inp -> tok.outputStream().use { it.write(inp.readBytes()) } }
+        tc.disconnect()
+        Diagnostics.info("Токенизатор скачан: ${tok.name} (${tok.length()} б)")
+    }
+
+    fun hasTokenizer(context: Context, modelId: String): Boolean =
+        tokenizerFile(context, modelId).let { it.exists() && it.length() > 1000 }
 
     fun modelFile(context: Context, modelId: String): File {
         val info = MODELS[modelId] ?: MODELS["small"]!!
@@ -57,6 +92,10 @@ object LocalAiModelManager {
     fun download(context: Context, modelId: String, onProgress: (Int) -> Unit) {
         val info = MODELS[modelId] ?: MODELS["small"]!!
         val target = modelFile(context, modelId)
+        if (isReady(context, modelId)) {
+            // Модель уже есть — докачиваем только токенизатор (если его нет).
+            ensureTokenizer(context, modelId); onProgress(100); return
+        }
         val tmp = File(target.absolutePath + ".part")
         val conn = (URL(info.url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 20000; readTimeout = 60000; instanceFollowRedirects = true
@@ -79,18 +118,9 @@ object LocalAiModelManager {
         conn.disconnect()
         if (tmp.length() < 100_000_000) { tmp.delete(); throw RuntimeException("Модель скачалась не полностью") }
         tmp.renameTo(target)
-        // Скачиваем токенизатор (нужен для работы модели), если ещё нет.
-        val tok = tokenizerFile(context)
-        if (!tok.exists() || tok.length() < 1000) {
-            try {
-                val tc = (URL(tokenizerUrlFor(modelId)).openConnection() as HttpURLConnection).apply {
-                    connectTimeout = 20000; readTimeout = 60000; instanceFollowRedirects = true
-                }
-                if (tc.responseCode in 200..299) {
-                    tc.inputStream.use { inp -> tok.outputStream().use { it.write(inp.readBytes()) } }
-                }
-                tc.disconnect()
-            } catch (_: Exception) { /* токенизатор опционален для скачивания, проверим при запуске */ }
+        // Токенизатор своей модели (без него модель не работает).
+        try { ensureTokenizer(context, modelId) } catch (e: Exception) {
+            Diagnostics.error("Токенизатор не скачался: ${e.message?.take(60)} — докачаю при первом запуске ИИ")
         }
         onProgress(100)
     }
