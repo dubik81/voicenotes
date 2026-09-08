@@ -25,6 +25,13 @@ class VariantProcessor(
 
     private val states = mutableStateMapOf<String, State>()
     private val jobs = mutableMapOf<Long, Job>()
+
+    /** Отменяет обработку заметки (кнопка отмены). */
+    fun cancel(noteId: Long) {
+        jobs[noteId]?.cancel()
+        jobs.remove(noteId)
+        Diagnostics.action("Обработка ИИ отменена пользователем")
+    }
     private val progressDone = mutableStateMapOf<Long, Int>()
     private val progressTotal = mutableStateMapOf<Long, Int>()
     private val activeNote = mutableStateMapOf<Long, Boolean>()

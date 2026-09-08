@@ -269,6 +269,9 @@ fun EditorScreen(
     var voskRerunning by remember { mutableStateOf(false) }        // идёт перераспознавание Vosk
     // Индикатор в углу: "vosk"/"whisper"/"ai-cloud"/"ai-local"/"" — что сейчас работает.
     var cornerIndicator by remember { mutableStateOf("") }
+    // Каким движком РЕАЛЬНО идёт обработка (фиксируется при старте, не меняется при
+    // переключении тумблера во время работы). "" = не идёт, "local"/"cloud".
+    var activeEngine by remember { mutableStateOf("") }
 
     LaunchedEffect(isListening, settings.pauseSeconds) {
         val pauseMs = settings.pauseSeconds * 1000L
@@ -287,6 +290,13 @@ fun EditorScreen(
 
     fun startVosk() {
         scope.launch {
+            // Если выбрана большая модель, но не скачана — используем маленькую
+            // (не заставляем молча качать 1.8 ГБ, микрофон должен работать сразу).
+            if (VoskModelManager.useBig && !VoskModelManager.isReadySize(context, true)
+                && VoskModelManager.isReadySize(context, false)) {
+                VoskModelManager.useBig = false
+                Diagnostics.info("Большая Vosk не скачана → использую маленькую")
+            }
             if (!VoskModelManager.isReady(context)) {
                 status = "Скачиваю модель…"; downloadProgress = 0
                 try { VoskModelManager.download(context) { p -> downloadProgress = p } }
@@ -294,8 +304,11 @@ fun EditorScreen(
                 downloadProgress = -1
             }
             status = "Готовлю распознавание…"
+            Diagnostics.info("Vosk: модель готова, загружаю (big=${VoskModelManager.useBig})")
             val model = try { VoskHolder.getModel(context) }
-            catch (e: Exception) { status = "Ошибка модели: ${e.message}"; return@launch }
+            catch (e: Exception) { status = "Ошибка модели: ${e.message}"
+                Diagnostics.error("Vosk загрузка модели упала: ${e.message?.take(80)}"); return@launch }
+            Diagnostics.info("Vosk: модель загружена, старт записи")
             val audioFile = if (settings.saveAudio)
                 File(context.filesDir, "audio_${note.id}.wav").also { note.audioPath = it.absolutePath }
             else null
@@ -362,6 +375,7 @@ fun EditorScreen(
                 return
             }
             aiRunning = true
+            activeEngine = if (settings.localAi) "local" else "cloud"
             cornerIndicator = if (settings.localAi) "ai-local" else "ai-cloud"
             val tUpd = System.currentTimeMillis()
             Diagnostics.action("Обновить смысл ($level), движок=${if (settings.localAi) "локальный" else "облачный"}")
@@ -369,7 +383,7 @@ fun EditorScreen(
             val watchdog = scope.launch {
                 kotlinx.coroutines.delay(90000)
                 if (aiRunning) {
-                    aiRunning = false; cornerIndicator = ""
+                    aiRunning = false; activeEngine = ""; cornerIndicator = ""
                     status = "Обработка прервана (слишком долго)"
                     Diagnostics.error("Обновление $level: таймаут 90с")
                 }
@@ -377,7 +391,7 @@ fun EditorScreen(
             processor.regenerateOne(note, level, tone) { ok ->
                 watchdog.cancel()
                 onChanged(); refreshTick++
-                aiRunning = false; cornerIndicator = ""
+                aiRunning = false; activeEngine = ""; cornerIndicator = ""
                 Diagnostics.event("Обновление $level заняло ${System.currentTimeMillis() - tUpd} мс")
                 status = if (ok) "Готово" else "ИИ не смог обработать"
             }
@@ -412,6 +426,7 @@ fun EditorScreen(
         Diagnostics.action("Кнопка ИИ / автозапуск (движок смысла=${if (settings.localAi) "локальный" else "облачный"})")
         val voskText = original
         aiRunning = true
+        activeEngine = if (settings.localAi) "local" else "cloud"
         cornerIndicator = if (settings.localAi) "ai-local" else "ai-cloud"
         scope.launch {
             try {
@@ -447,7 +462,7 @@ fun EditorScreen(
             } catch (e: Exception) {
                 status = "Ошибка: ${e.message}"
             } finally {
-                aiRunning = false; cornerIndicator = ""
+                aiRunning = false; activeEngine = ""; cornerIndicator = ""
                 Diagnostics.event("Обработка ИИ заняла ${System.currentTimeMillis() - tStart} мс")
             }
         }
@@ -786,12 +801,17 @@ fun EditorScreen(
                                 seconds = progressSeconds,
                                 percent = if (tot > 0) (d * 100 / tot).coerceIn(0, 100) else -1,
                                 label = when {
-                                    settings.localAi -> "ИИ на устройстве работает…"
-                                    settings.useAI -> "Облачный ИИ обрабатывает…"
+                                    activeEngine == "local" -> "ИИ на устройстве работает…"
+                                    activeEngine == "cloud" -> "Облачный ИИ обрабатывает…"
                                     else -> "Обрабатываю по правилам…"
                                 },
                                 detail = if (tot > 0) "Готово вариантов: $d из $tot" else "",
-                                preview = original  // текст заметки, над которым работает ИИ
+                                preview = original,
+                                onCancel = {
+                                    processor.cancel(note.id)
+                                    aiRunning = false; activeEngine = ""; cornerIndicator = ""
+                                    status = "Обработка отменена"
+                                }
                             )
                         }
                         shown.isBlank() -> Text("Текст появится здесь.", color = cs.onSurfaceVariant,
@@ -1066,7 +1086,8 @@ private fun WaitingScreen(
     percent: Int,
     label: String,
     detail: String,
-    preview: String
+    preview: String,
+    onCancel: () -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
     // Пульсирующая точка-индикатор.
@@ -1106,6 +1127,8 @@ private fun WaitingScreen(
         Spacer(Modifier.height(10.dp))
         // Счётчик времени + детали.
         Text("прошло ${seconds} сек", color = cs.onSurfaceVariant, fontSize = 12.sp)
+        Spacer(Modifier.height(16.dp))
+        OutlinedButton(onClick = onCancel) { Text("Отменить обработку") }
         if (detail.isNotBlank()) {
             Text(detail, color = cs.onSurfaceVariant, fontSize = 12.sp)
         }
