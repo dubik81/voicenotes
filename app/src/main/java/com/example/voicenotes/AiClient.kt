@@ -1,4 +1,4 @@
-package com.example.voicenotes
+﻿package com.example.voicenotes
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -206,8 +206,19 @@ object AiClient {
                 put(JSONObject().put("role", "system").put("content", allVariantsPrompt()))
                 put(JSONObject().put("role", "user").put("content", rawText))
             }
-            val (text, _) = request(messages, apiKey, temperature = 0.4)
-            parseAllVariants(text, rawText)
+            // Пакетный ответ должен быть JSON с вариантами. Если модель ответила текстом,
+            // который не разбирается, это провал ИМЕННО ЭТОЙ модели — пробуем следующую,
+            // а не уходим на общий повтор через 6 секунд (так и набегали минуты ожидания).
+            var lastErr = "облако не дало разбираемый ответ"
+            repeat(2) { attempt ->
+                val (text, model) = request(messages, apiKey, temperature = 0.4,
+                    budgetMs = if (attempt == 0) 120_000 else 60_000)
+                val parsed = parseAllVariants(text, rawText)
+                if (parsed.isNotEmpty()) return@withContext parsed
+                lastErr = "модель $model вернула неразбираемый ответ (${text.length} симв)"
+                Diagnostics.error("Облако (пакет): $lastErr → пробую другую модель")
+            }
+            throw RuntimeException(lastErr)
         }
 
     private fun allVariantsPrompt(): String {
@@ -223,7 +234,10 @@ object AiClient {
         sb.append("Ступени обработки идут ЦЕПОЧКОЙ — каждая следующая работает с результатом предыдущей:\n")
         sb.append("- CLEAN («Чисто») ← из входного текста: ").append(CLEAN_RULE).append("\n")
         sb.append("- BRIEF («Кратко») ← ИЗ СВОЕГО ЖЕ CLEAN, а не из входного текста: изложи то же самое ")
-        sb.append("примерно вдвое короче. Сохрани подачу: то же лицо («я», «мы»), тот же порядок мыслей, тот же тон. ")
+        sb.append("примерно вдвое короче. ПОЛНЫМИ предложениями обычной речью, не телеграфным стилем: ")
+        sb.append("нельзя «куплен чай бергамотом и виолончель дочка» — надо «купил чай с бергамотом и ")
+        sb.append("виолончель для дочки». Не переписывай фразы дословно — скажи то же своими словами. ")
+        sb.append("Сохрани подачу: то же лицо («я», «мы»), тот же порядок мыслей, тот же тон. ")
         sb.append("Слова менять можно, смысл менять нельзя. ВСЕ темы, затронутые в тексте, должны остаться — ")
         sb.append("ни одну не выбрасывай. Числа, имена и названия сохраняй точно. НЕ заменяй конкретные факты ")
         sb.append("обобщениями («замечательная погода» нельзя менять на «красиво» — это разный смысл). ")
@@ -315,28 +329,44 @@ object AiClient {
         messages: JSONArray,
         apiKey: String,
         temperature: Double,
-        maxTokens: Int? = null
+        maxTokens: Int? = null,
+        // Общий предел на ВСЮ операцию, включая перебор моделей. Без него перебор
+        // «2 попытки роутера + 3 запасные модели» по 90 с каждая давал до 450 секунд
+        // ожидания — в логе пользователя обработка висела 708 с, и он ждал вручную.
+        budgetMs: Long = 150_000
     ): Pair<String, String> {
+        val deadline = System.currentTimeMillis() + budgetMs
         var lastError = "Не удалось получить ответ ИИ"
+        val tried = ArrayList<String>()
+        fun left() = deadline - System.currentTimeMillis()
+
         // 1) основные (openrouter/free): при 404 роутер иногда «прогревается» —
         // делаем до 2 попыток, чтобы успех был с первого нажатия пользователя.
-        repeat(2) { attempt ->
-            try {
-                return requestOnce(FREE_MODELS, messages, apiKey, temperature, maxTokens)
-            } catch (e: Exception) {
-                lastError = e.message ?: lastError
-                // если это не 404 — нет смысла повторять, сразу к запасным
-                if (lastError.contains("404").not()) return@repeat
+        repeat(2) {
+            if (left() > 5_000) {
+                try {
+                    return requestOnce(FREE_MODELS, messages, apiKey, temperature, maxTokens, left())
+                } catch (e: Exception) {
+                    lastError = e.message ?: lastError
+                    tried.add("openrouter/free: $lastError")
+                    if (!lastError.contains("404")) return@repeat
+                }
             }
         }
-        // 2) запасные — по одной
+        // 2) запасные — по одной, пока не вышло общее время
         for (m in BACKUP_MODELS) {
+            if (left() <= 5_000) break
             try {
-                return requestOnce(listOf(m), messages, apiKey, temperature, maxTokens)
+                return requestOnce(listOf(m), messages, apiKey, temperature, maxTokens, left())
             } catch (e: Exception) {
                 lastError = e.message ?: lastError
+                tried.add("$m: $lastError")
             }
         }
+        // Честный отчёт: какие модели пробовали и что ответили. Раньше в лог уходила
+        // только последняя ошибка, и понять «почему так долго» было нельзя.
+        Diagnostics.error("Облако: ни одна модель не ответила за ${(budgetMs - left()) / 1000} с. " +
+            tried.joinToString(" | ").take(300))
         throw RuntimeException(lastError)
     }
 
@@ -345,7 +375,9 @@ object AiClient {
         messages: JSONArray,
         apiKey: String,
         temperature: Double,
-        maxTokens: Int?
+        maxTokens: Int?,
+        // Сколько времени осталось на ВСЮ операцию: одна модель не должна съедать всё.
+        timeLeftMs: Long = 90_000
     ): Pair<String, String> {
         val body = JSONObject().apply {
             if (models.size > 1) put("models", JSONArray(models))
@@ -358,7 +390,9 @@ object AiClient {
         val conn = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 15000
-            readTimeout = 90000
+            // Ждём не дольше, чем осталось на всю операцию (и не дольше 75 с на модель:
+            // бесплатная модель, молчащая больше минуты, обычно уже не ответит).
+            readTimeout = timeLeftMs.coerceIn(10_000, 75_000).toInt()
             doOutput = true
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("Authorization", "Bearer ${apiKey.trim()}")
@@ -386,6 +420,13 @@ object AiClient {
             val text = choices.getJSONObject(0).optJSONObject("message")
                 ?.optString("content", "")?.trim().orEmpty()
             if (text.isBlank()) throw RuntimeException("ИИ вернул пустой текст")
+            // ОТВЕТ-ПУСТЫШКА. Модель отвечает HTTP 200, а в содержимом — «null».
+            // Раньше это считалось успехом: разбор падал («пакетный ответ не JSON: null»),
+            // обработка уходила на повтор, и всё вместе висело больше 10 минут.
+            // Теперь это провал ЭТОЙ модели — сразу берём следующую.
+            if (maxTokens == null && isUselessAnswer(text)) {
+                throw RuntimeException("Модель вернула пустышку («${text.take(20)}»)")
+            }
             // Фильтр вердикта модерации: некоторые модели вместо обработки возвращают
             // «User Safety: unsafe / Safety Categories: ...». Это не результат — отказ.
             val low = text.lowercase()
@@ -407,6 +448,53 @@ object AiClient {
             conn.disconnect()
         }
     }
+
+    // Кавычки и обратные апострофы, в которые модель иногда заворачивает ответ.
+    private val QUOTE_CHARS = charArrayOf('\u0022', '\u0027', '\u0060')
+
+    /** Ответ формально есть, а толку нет: «null», «none», «-», пара символов. */
+    private fun isUselessAnswer(text: String): Boolean {
+        val t = text.trim().trim { it.isWhitespace() || it in QUOTE_CHARS }.lowercase()
+        return t in listOf("null", "none", "nil", "n/a", "-", "—", "{}", "[]", "undefined") || t.length < 3
+    }
+
+    /**
+     * БЫСТРАЯ ПРОВЕРКА ДОСТУПНОСТИ (v122).
+     *
+     * Идея пользователя: спрашивать у облака «жив ли ты» ДО того, как отправлять текст,
+     * — при открытии заметки в режиме «Смысл Онл» или при переключении на Онл. Тогда о
+     * проблеме он узнаёт сразу, а не после десяти минут ожидания.
+     *
+     * Запрос крошечный (одно слово, ответ в 1 токен) и с коротким временем ожидания,
+     * поэтому проверка почти ничего не стоит. Результат кэшируется на 2 минуты, чтобы
+     * не дёргать сервер при каждом открытии заметки.
+     */
+    @Volatile private var lastCheckAt = 0L
+    @Volatile private var lastCheckResult: Pair<Boolean, String>? = null
+
+    suspend fun quickCheck(apiKey: String, force: Boolean = false): Pair<Boolean, String> =
+        withContext(Dispatchers.IO) {
+            if (apiKey.isBlank()) return@withContext false to "Ключ OpenRouter не задан (настройки)"
+            val cached = lastCheckResult
+            if (!force && cached != null && System.currentTimeMillis() - lastCheckAt < 120_000) {
+                return@withContext cached
+            }
+            val t0 = System.currentTimeMillis()
+            val res = try {
+                val messages = JSONArray().apply {
+                    put(JSONObject().put("role", "user").put("content", "ping"))
+                }
+                val (_, model) = requestOnce(FREE_MODELS, messages, apiKey, 0.0, 1, timeLeftMs = 12_000)
+                true to "облачный ИИ отвечает ($model, ${System.currentTimeMillis() - t0} мс)"
+            } catch (e: Exception) {
+                false to (e.message ?: "облако не отвечает")
+            }
+            lastCheckAt = System.currentTimeMillis(); lastCheckResult = res
+            val verdict = if (res.first) "OK" else "ПРОБЛЕМА"
+            val ms = System.currentTimeMillis() - t0
+            Diagnostics.info("Проверка облака: $verdict — ${res.second} [$ms мс]")
+            res
+        }
 
     /** Разбор ошибки в понятный текст, с подсказкой что делать. */
     private fun explainError(code: Int, response: String): String {
@@ -437,7 +525,11 @@ object AiClient {
             // в VariantProcessor.sourceFor), поэтому чинить распознавание здесь не нужно:
             // задача только изложить короче, той же подачей.
             Level.BRIEF ->
-                "Изложи этот текст примерно вдвое короче. Сохрани подачу: то же лицо («я», «мы»), " +
+                "Изложи этот текст примерно вдвое короче. Пиши ПОЛНЫМИ предложениями обычной речью — " +
+                "не телеграфным стилем, не выбрасывай предлоги и связки (нельзя «куплен чай бергамотом " +
+                "и виолончель дочка» — надо «купил чай с бергамотом и виолончель для дочки»). " +
+                "Не переписывай исходные фразы дословно — скажи то же своими словами. " +
+                "Сохрани подачу: то же лицо («я», «мы»), " +
                 "тот же порядок мыслей, тот же тон. Слова менять можно, смысл менять нельзя. " +
                 "ВСЕ темы, затронутые в тексте, должны остаться — ни одну не выбрасывай. " +
                 "Числа, имена и названия сохраняй точно, не заменяй факты обобщениями " +

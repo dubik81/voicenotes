@@ -109,6 +109,9 @@ object Diagnostics {
         info("устройство: ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}, Android ${android.os.Build.VERSION.RELEASE}")
         info("память: свободно ${availMemMb(context)} МБ")
         info("движок речи: ${if (settings.useVosk) "Vosk(офл)" else "Google(онл)"}, Vosk большая=${settings.voskBig} (скачана: big=${VoskModelManager.isReadySize(context, true)}, small=${VoskModelManager.isReadySize(context, false)}), Whisper=${settings.useWhisper}(${settings.whisperModel})")
+        // Маркер незавершённой загрузки большой Vosk — прямая улика вылета по памяти.
+        info("Vosk большая: нужно ~${VoskModelManager.bigNeedsMb(context)} МБ памяти; " +
+             "метка оборванной загрузки: ${if (VoskModelManager.bigLoadCrashed(context)) "ЕСТЬ (был вылет)" else "нет"}")
         info("движок смысла: ${if (settings.localAi) "локальный(${settings.localAiModel})" else "облачный"}, автозапуск ИИ=${settings.autoAi}")
         info("ключ OpenRouter: ${if (settings.apiKey.isNotBlank()) "есть" else "нет"}")
         info("Whisper скачан: ${WhisperModelManager.isReady(context, settings.whisperModel)}")

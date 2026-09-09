@@ -26,11 +26,27 @@ class VariantProcessor(
     private val states = mutableStateMapOf<String, State>()
     private val jobs = mutableMapOf<Long, Job>()
 
-    /** Отменяет обработку заметки (кнопка отмены). */
+    /**
+     * Отменяет обработку заметки (кнопка отмены).
+     *
+     * Отмена срабатывала «через несколько секунд»: экран продолжал показывать работу, пока
+     * не завершится текущий вызов модели (нативную генерацию прервать нельзя). Теперь все
+     * признаки работы гаснут СРАЗУ — интерфейс отвечает мгновенно, а фоновая корутина
+     * доигрывает текущий кусок и выходит на ближайшей проверке отмены.
+     */
     fun cancel(noteId: Long) {
         jobs[noteId]?.cancel()
         jobs.remove(noteId)
-        Diagnostics.action("Обработка ИИ отменена пользователем")
+        activeNote[noteId] = false
+        activeEngineOf.remove(noteId); stageOf.remove(noteId)
+        partDone.remove(noteId); partTotal.remove(noteId)
+        val prefix = "$noteId:"
+        oneJobs.keys.filter { it.startsWith(prefix) }.toList()
+            .forEach { oneJobs.remove(it)?.cancel() }
+        updating.keys.filter { it.startsWith(prefix) }.toList().forEach { updating.remove(it) }
+        states.keys.filter { it.startsWith(prefix) && states[it] == State.RUNNING }.toList()
+            .forEach { states[it] = State.QUEUED }
+        Diagnostics.action("Обработка ИИ отменена пользователем (индикация снята сразу)")
     }
     // ПРОГРЕСС в два уровня (v118). Раньше и «готово вариантов», и «кусок N из M»
     // писались в ОДНУ пару счётчиков и затирали друг друга: куски добегали до 100%,
@@ -106,8 +122,10 @@ class VariantProcessor(
         for ((k2, v) in src) {
             val lvl = k2.substringBefore(':').toIntOrNull()
             val isSummary = lvl == Level.BRIEF.ordinal || lvl == Level.GIST.ordinal
-            val nv = if (isSummary) stripMetaPreamble(v) else v
-            if (nv !== v && nv != v) cut++
+            // Для Кратко/Суть: убираем зачин-предисловие и «второй вариант» пересказа
+            // (облако по лекции выдало два пересказа подряд — «…Второй вариант: Лекция про…»).
+            val nv = if (isSummary) LocalAiEngine.cutSecondVariant(stripMetaPreamble(v)) else v
+            if (nv != v) cut++
             out[k2] = nv
         }
         if (cut > 0) Diagnostics.info("Облако: убран зачин-предисловие в $cut вариант(ах)")
@@ -125,21 +143,41 @@ class VariantProcessor(
     // слова («робуста»→«работа», «Машу и Петю»→«какой машине и плетью») и расставила знаки
     // формально. Модель должна восстановить, что человек сказал на самом деле, и разбить
     // на предложения ПО СМЫСЛУ, а не по машинным точкам.
+    // v120: добавлена одна фраза про происхождение точек. Пользователь: «Он как будто бы не
+    // понимает, что исходная пунктуация — это предложение от программы, которая глупее ИИ».
+    // Формулировка короткая намеренно: на длинных инструкциях Qwen 1.5B теряется (урок v106).
     private val LOCAL_CLEAN = "Программа распознала речь с ошибками. Восстанови, что человек сказал. " +
+        "Точки в тексте поставила программа — не верь им, расставь заново по смыслу речи. " +
         "Бессмысленное слово замени похожим по звучанию. Понятные слова не трогай. " +
-        "Точки и запятые ставь по смыслу. Ничего не сокращай и не добавляй. В ответе только текст."
+        "Ничего не сокращай и не добавляй. В ответе только текст."
     // «Кратко» — то же самое вдвое короче, БЕЗ анализа и пересказа со стороны.
-    private val LOCAL_BRIEF = "Изложи этот текст примерно вдвое короче. От того же лица, в том же порядке. " +
+    // v122: добавлены два запрета по итогам теста — «не переписывай теми же словами»
+    // (модель копировала вход вместо пересказа) и «пиши полными предложениями»
+    // (облако выдавало телеграф: «куплен чай бергамотом и виолончель дочка»).
+    private val LOCAL_BRIEF = "Перескажи этот текст СВОИМИ словами вдвое короче. " +
+        "Не переписывай теми же словами. Полными предложениями, от того же лица, в том же порядке. " +
         "Не анализируй и не объясняй. Смысл не меняй. В ответе только текст."
-    private val LOCAL_GIST = "Изложи самое главное из этого текста, коротко. " +
-        "Не анализируй и не объясняй, не пиши «в тексте говорится». В ответе только текст."
-    private val LOCAL_LECTURE_BRIEF = "Это запись лекции. Изложи её примерно вдвое короче, " +
-        "сохранив все темы и порядок изложения. Не анализируй. В ответе только текст."
-    private val LOCAL_LECTURE_GIST = "Это запись лекции. Изложи самое главное по всем её темам, коротко. " +
-        "Не анализируй. В ответе только текст."
+    private val LOCAL_GIST = "Скажи своими словами, о чём главное в этом тексте — одним-двумя предложениями. " +
+        "Полными предложениями, от того же лица. Не пиши «в тексте говорится». В ответе только текст."
+    private val LOCAL_LECTURE_BRIEF = "Это запись лекции. Перескажи её своими словами вдвое короче, " +
+        "сохранив все темы и их порядок. Полными предложениями. Не анализируй. В ответе только текст."
+    private val LOCAL_LECTURE_GIST = "Это запись лекции. Назови своими словами главное по каждой её теме, " +
+        "коротко и полными предложениями. Не анализируй. В ответе только текст."
 
-    // Доля от исходной длины: Кратко ≈ половина, Суть ≈ четверть.
-    private fun ratioOf(l: Level) = if (l == Level.GIST) 0.25 else 0.5
+    /**
+     * Доля от длины источника: Кратко ≈ половина, Суть ≈ четверть.
+     *
+     * v122: для «Сути» доля зависит от длины входа. Источник «Сути» — уже сжатое «Кратко»,
+     * и на короткой заметке выходило «сожми 148 символов до 37» — невыполнимая задача, из
+     * которой рождался слипшийся мусор. Если входа мало, сжимаем мягче: одно-два
+     * нормальных предложения полезнее обрубка.
+     */
+    private fun ratioOf(l: Level, srcLen: Int = 0): Double = when {
+        l != Level.GIST -> 0.5
+        srcLen in 1 until 250 -> 0.6
+        srcLen in 250 until 600 -> 0.4
+        else -> 0.25
+    }
 
     /** Локальное «Чисто»: модель по кускам; кусок, который модель исказила, — правилами. */
     private suspend fun localClean(note: Note, text: String, prompt: String = LOCAL_CLEAN): String {
@@ -186,7 +224,8 @@ class VariantProcessor(
         }
         val name = if (l == Level.BRIEF) "Кратко" else "Суть"
         stageOf[note.id] = "$name: модель на устройстве…"
-        val raw = LocalAiEngine.condense(context, prompt, text, settings.localAiModel, ratioOf(l), note.id,
+        val ratio = ratioOf(l, text.length)
+        val raw = LocalAiEngine.condense(context, prompt, text, settings.localAiModel, ratio, note.id,
             onProgress = { d, t, _ -> partDone[note.id] = d; partTotal[note.id] = t
                 stageOf[note.id] = "$name: часть $d из $t" })
         // Срезаем зачин «Вот краткий пересказ:» — сам текст после него обычно годный.
@@ -196,7 +235,7 @@ class VariantProcessor(
         val ok = r.isNotBlank() && !isLoopy(r) && !meta &&
             r.length >= (if (l == Level.BRIEF) 10 else 5) && r.length < text.length
         return if (ok) {
-            Diagnostics.engine("$l: локальный ИИ, ${text.length}→${r.length} симв (цель ${(ratioOf(l) * 100).toInt()}%)")
+            Diagnostics.engine("$l: локальный ИИ, ${text.length}→${r.length} симв (цель ${(ratio * 100).toInt()}%)")
             lastEngine = localLabel()
             r
         } else {
@@ -261,15 +300,25 @@ class VariantProcessor(
         fun missing(l: Level) = Tone.entries.any { note.getVariant(l, it) == null }
         val combos = allCombos(lecture)
         // Локальная модель тон не различает — заполняем все тоны одинаково.
+        //
+        // ВАЖНО (v119): ступень записывается в заметку и сохраняется СРАЗУ, как только
+        // готова. Раньше все три уровня отдавались одной пачкой в самом конце, и человек
+        // ждал «Суть», хотя «Чисто» было готово минуту назад. Теперь «Чисто» можно читать,
+        // пока считаются «Кратко» и «Суть».
         fun put(l: Level, v: String) {
-            for (tn in Tone.entries) result["${l.ordinal}:${tn.ordinal}"] = v
+            for (tn in Tone.entries) {
+                result["${l.ordinal}:${tn.ordinal}"] = v
+                if (note.getVariant(l, tn) == null) note.putVariant(l, tn, v, lastEngine)
+                states[k(note.id, l, tn)] = State.DONE
+            }
             engineOf["${l.ordinal}"] = lastEngine
             // Ступень закрыта — двигаем ОБЩИЙ прогресс (полоса растёт только здесь и
             // потому не откатывается), счётчик кусков обнуляем под следующую ступень.
             progressTotal[note.id] = combos.size
-            progressDone[note.id] = combos.count { (lv, tn) ->
-                note.getVariant(lv, tn) != null || result.containsKey("${lv.ordinal}:${tn.ordinal}") }
+            progressDone[note.id] = combos.count { (lv, tn) -> note.getVariant(lv, tn) != null }
             partDone.remove(note.id); partTotal.remove(note.id)
+            persist()
+            Diagnostics.engine("Ступень $l готова и показана (${v.length} симв, движок: $lastEngine)")
         }
 
         val readyClean = note.getVariant(Level.CLEAN, Tone.NEUTRAL).orEmpty()
@@ -379,11 +428,40 @@ class VariantProcessor(
                         Diagnostics.error("ИИ обработка: ${e.message?.take(60)}")
                         // Локальный ИИ детерминирован: повтор даст тот же результат — не повторяем.
                         if (settings.localAi) { Diagnostics.info("Локальный ИИ: повторы отключены"); break }
+                        // Облако: повторять есть смысл не всегда. Нет интернета, отклонённый
+                        // ключ, исчерпанный лимит — повтор через 6 секунд ничего не изменит,
+                        // а пользователь ждёт. Такие случаи прекращаем сразу.
+                        if (isHopeless(lastAiError)) {
+                            Diagnostics.error("Облако: повторы бессмысленны ($lastAiError) — прекращаю")
+                            break
+                        }
                     }
                     attempt++
                     if (attempt < maxRetries &&
                         combos.any { (l, t) -> note.getVariant(l, t) == null }) {
                         delay(6000)
+                    }
+                }
+                // Облако не справилось совсем — не оставляем человека с пустым экраном.
+                // Считаем правилами и ЧЕСТНО подписываем движок: пользователь видит, что
+                // это запасной вариант, а не работа ИИ (в истории версий метка «правила»).
+                if (!settings.localAi && combos.any { (l, t) -> note.getVariant(l, t) == null }) {
+                    val src = note.refinedText ?: note.original
+                    var n = 0
+                    for ((l, t) in combos) {
+                        if (note.getVariant(l, t) == null) {
+                            val txt = if (l == Level.CLEAN) CleanProcessor.clean(src, note.recordMode == "google")
+                                      else TextCondenser.condense(src, l)
+                            note.putVariant(l, t, txt, "правила (облако не ответило)")
+                            states[k(note.id, l, t)] = State.DONE
+                            n++
+                        }
+                    }
+                    if (n > 0) {
+                        progressDone[note.id] = combos.count { (l, t) -> note.getVariant(l, t) != null }
+                        persist()
+                        Diagnostics.engine("Облако не ответило → $n вариант(ов) заполнено правилами " +
+                            "(причина: $lastAiError)")
                     }
                 }
             } else {
@@ -404,40 +482,81 @@ class VariantProcessor(
         }
     }
 
+    /** Ошибки, при которых повтор через 6 секунд заведомо бесполезен. */
+    private fun isHopeless(msg: String?): Boolean {
+        val m = (msg ?: "").lowercase()
+        return listOf("нет интернета", "ключ отклонён", "закончились бесплатные",
+            "сеть недоступна", "ключ openrouter не задан", "защищённого соединения")
+            .any { m.contains(it) }
+    }
+
+    // Идущие пересчёты одного варианта. Раньше признак «идёт обновление» жил В ЭКРАНЕ
+    // (aiRunning в EditorScreen) и терялся при выходе из заметки: индикация гасла, кнопка
+    // снова становилась доступной, второй тап запускал ВТОРУЮ обработку поверх первой
+    // (в логе 13:42:43 и 13:43:04 — два параллельных запроса к облаку), а сама работа
+    // обрывалась вместе с экраном. Теперь состояние живёт здесь, на уровне приложения.
+    private val updating = mutableStateMapOf<String, Boolean>()
+    private val oneJobs = mutableMapOf<String, Job>()   // корутины пересчёта одного варианта
+    fun isUpdating(noteId: Long, l: Level, t: Tone): Boolean = updating[k(noteId, l, t)] == true
+    /** Идёт ли пересчёт ЛЮБОГО варианта этой заметки (для индикации в шапке). */
+    fun isUpdatingAny(noteId: Long): Boolean = updating.any { (key, v) -> v && key.startsWith("$noteId:") }
+
     /** Пересчитать ОДИН вариант заново («другой вариант» / не понравился). */
     fun regenerateOne(note: Note, l: Level, t: Tone, onDone: (Boolean) -> Unit) {
         if (note.original.isBlank() || l == Level.VERBATIM) return
-        scope.launch {
-            states[k(note.id, l, t)] = State.RUNNING
+        val key = k(note.id, l, t)
+        // Повторный тап, пока идёт пересчёт этого же варианта, — игнорируем.
+        if (updating[key] == true) {
+            Diagnostics.action("Обновить ($l/$t): пересчёт уже идёт, повторный запуск отклонён")
+            return
+        }
+        updating[key] = true
+        oneJobs[key] = scope.launch {
+            states[key] = State.RUNNING
             var ok = false
             try {
                 LocalAiEngine.beginNote(note.id, note.refinedText ?: note.original)
                 val text = computeOne(note, l, t, vary = true)
                 note.putVariant(l, t, text, lastEngine)
                 states[k(note.id, l, t)] = State.DONE
-                // Каскад: пересчитали «Чисто» — значит «Кратко» и «Суть» построены на
-                // устаревшем источнике. Сбрасываем их, фон пересчитает от нового «Чисто».
-                if (l == Level.CLEAN) invalidateBelow(note, Level.CLEAN)
-                if (l == Level.BRIEF) invalidateBelow(note, Level.BRIEF)
+                clearStale(note.id, l, t)
+                // Каскад: пересчитали «Чисто» — «Кратко» и «Суть» построены на прежнем
+                // источнике. Помечаем их устаревшими, но НЕ трогаем: текст остаётся виден,
+                // пересчитает пользователь кнопкой «Обновить» на нужном уровне.
+                if (l == Level.CLEAN || l == Level.BRIEF) markStaleBelow(note, l)
                 persist()
                 ok = true
                 Diagnostics.engine("Обновлён вариант ($l/$t): ${text.length} симв, движок: $lastEngine")
             } catch (e: Exception) {
-                states[k(note.id, l, t)] = State.FAILED
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                states[key] = State.FAILED
                 lastAiError = e.message?.take(50)
                 Diagnostics.error("Обновление варианта ($l) не удалось: ${e.message?.take(50)}")
+            } finally {
+                // Снимаем признак ТОЛЬКО после того, как текст записан и сохранён —
+                // иначе индикация гаснет раньше, чем пользователь видит новый текст.
+                updating.remove(key)
+                oneJobs.remove(key)
+                stageOf.remove(note.id)
             }
-            stageOf.remove(note.id)
             onDone(ok)
         }
     }
 
+    // Ступени, чей ИСТОЧНИК изменился: текст остаётся на месте и виден пользователю,
+    // но помечен как «построен на прежнем Чисто». Пересчёт — только по кнопке «Обновить».
+    private val staleSet = mutableStateMapOf<String, Boolean>()
+    fun isStale(noteId: Long, l: Level, t: Tone): Boolean = staleSet[k(noteId, l, t)] == true
+
     /**
-     * Сбрасывает ступени НИЖЕ указанной: их источник изменился, значит они устарели.
-     * История версий сохраняется (стрелки ‹ › по-прежнему показывают прошлые редакции),
-     * убирается только текущее значение — фон пересчитает его от нового источника.
+     * Помечает ступени НИЖЕ указанной устаревшими — НЕ удаляя их (v119).
+     *
+     * В v118 они удалялись, и после «Обновить» в «Чисто» текст в «Кратко» и «Суть»
+     * пропадал: пользователь не мог его увидеть, пока не нажмёт «Обновить» там же.
+     * Требование пользователя: кнопка «Обновить» работает ТОЛЬКО со своим уровнем,
+     * прежний вариант остаётся видимым и обновляется по желанию.
      */
-    private fun invalidateBelow(note: Note, l: Level) {
+    private fun markStaleBelow(note: Note, l: Level) {
         val below = when (l) {
             Level.CLEAN -> listOf(Level.BRIEF, Level.GIST)
             Level.BRIEF -> listOf(Level.GIST)
@@ -445,11 +564,13 @@ class VariantProcessor(
         }
         var n = 0
         for (lv in below) for (tn in Tone.entries) {
-            if (note.variants.remove(note.variantKey(lv, tn)) != null) n++
-            states.remove(k(note.id, lv, tn))
+            if (note.getVariant(lv, tn) != null) { staleSet[k(note.id, lv, tn)] = true; n++ }
         }
-        if (n > 0) Diagnostics.info("Каскад: сброшено $n вариант(ов) ниже $l — источник изменился")
+        if (n > 0) Diagnostics.info("Каскад: $n вариант(ов) ниже $l помечены устаревшими (текст сохранён)")
     }
+
+    /** Снять пометку «устарело» — вызывается, когда уровень пересчитан. */
+    private fun clearStale(noteId: Long, l: Level, t: Tone) { staleSet.remove(k(noteId, l, t)) }
 
     /**
      * Источник уровня по КАСКАДУ: Чисто ← Дословно, Кратко ← Чисто, Суть ← Кратко.
@@ -493,7 +614,8 @@ class VariantProcessor(
         val result = if (settings.useAI) {
             lastEngine = "облако"
             val r0 = AiClient.process(src, l, t, settings.apiKey, vary)
-            if (l == Level.BRIEF || l == Level.GIST) stripMetaPreamble(r0) else r0
+            if (l == Level.BRIEF || l == Level.GIST)
+                LocalAiEngine.cutSecondVariant(stripMetaPreamble(r0)) else r0
         } else { lastEngine = "правила"; TextCondenser.condense(src, l) }
 
         if (l != Level.VERBATIM && result.length > src.length) {

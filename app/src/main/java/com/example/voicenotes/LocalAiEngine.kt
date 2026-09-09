@@ -119,6 +119,8 @@ object LocalAiEngine {
     private const val CHARS_PER_TOKEN = 3.5          // оценка для русского в Qwen (по логам ~4)
     private const val DEFAULT_SEQ_LEN = 128          // лимит 2-арг вызова (LlmModule.DEFAULT_SEQ_LEN)
     private const val WANT_SEQ_LEN = 640             // просим при явном seqLen (в рамках max_context)
+    private const val SAFETY = 0.75                  // запас на неточность оценки «символов в токене»
+    private const val CONDENSE_CHUNK = 350           // кусок для сжатия: мелкий кусок модель осиливает
     /** Какой вызов generate реально работает: "" (не известно), "4arg", "cfg", "2arg". */
     @Volatile var workingCall: String = ""
         private set
@@ -236,13 +238,22 @@ object LocalAiEngine {
      * Сколько символов ТЕКСТА можно отдать модели за один вызов, чтобы ответ поместился.
      * outRatio — во сколько раз ответ длиннее входа (Чисто ≈ 1.0, суммаризация ≈ 0.5).
      */
+    /**
+     * @param outRatio во сколько раз ответ длиннее входа (Чисто ≈ 1.0, сжатие ≈ 0.5)
+     *
+     * v120: добавлен запас SAFETY. Оценка «3.5 символа на токен» усреднённая — на
+     * отдельных фрагментах (много цифр, редкие слова, латиница) токенов выходит больше,
+     * и кусок, посчитанный «впритык», перестаёт помещаться вместе с ответом. Лишние
+     * 25% запаса стоят одного дополнительного вызова, а без них весь уровень уходил
+     * на правила — то есть модель не работала вообще.
+     */
     fun chunkChars(systemPrompt: String, outRatio: Double): Int {
         val budget = seqBudget()
         val overheadTok = 24 + (systemPrompt.length / CHARS_PER_TOKEN).toInt()   // шаблон чата + инструкция
         val freeTok = (budget - overheadTok - 6).coerceAtLeast(20)
         // вход + ответ = freeTok;  вход*(1+outRatio) = freeTok
         val inTok = (freeTok / (1.0 + outRatio)).toInt()
-        return (inTok * CHARS_PER_TOKEN).toInt().coerceIn(60, 900)
+        return (inTok * CHARS_PER_TOKEN * SAFETY).toInt().coerceIn(60, 700)
     }
 
     suspend fun generate(context: Context, systemPrompt: String, userText: String, modelId: String,
@@ -550,6 +561,55 @@ object LocalAiEngine {
     }
 
     /**
+     * Обрабатывает ОДИН кусок «Чисто». Если результат не годится — делит кусок пополам и
+     * пробует половинки по отдельности (меньший кусок надёжнее влезает в бюджет модели).
+     * Возвращает текст и признак «сделано моделью».
+     *
+     * Причина отказа пишется в чёрный ящик — раньше в логе было только слово «откат», и
+     * было не понять, модель промолчала, обрезала ответ или исказила текст.
+     */
+    private suspend fun processPiece(
+        context: Context, systemPrompt: String, chunk: String, modelId: String, noteId: Long,
+        chunkOk: ((chunk: String, result: String) -> Boolean)?,
+        chunkFix: ((chunk: String, result: String) -> String)?,
+        depth: Int
+    ): Pair<String, Boolean> {
+        if (!currentCoroutineContext().isActive) return chunk to false
+        // «Чисто» = восстановление того же текста: ответ примерно равен входу.
+        val wantOut = ((chunk.length * 1.15) / CHARS_PER_TOKEN).toInt() + 16
+        val raw = generate(context, systemPrompt, chunk, modelId, maxNewTok = wantOut, noteId = noteId)
+        // Пословная защита: несозвучные замены откатываются к исходным словам.
+        val r = if (!raw.isNullOrBlank() && chunkFix != null) chunkFix(chunk, raw) else raw
+        val reason = when {
+            r.isNullOrBlank() -> "модель ничего не вернула"
+            r.length > chunk.length * 2 -> "разбухание (${r.length} из ${chunk.length})"
+            r.length < chunk.length / 2 -> "ответ оборван (${r.length} из ${chunk.length})"
+            isLoopyLocal(r) -> "зацикливание"
+            looksGarbled(r) -> "слипшийся текст или латиница в словах"
+            chunkOk?.invoke(chunk, r) == false -> "искажение или обрезка"
+            else -> null
+        }
+        if (reason == null) return r!! to true
+        Diagnostics.info("Кусок ${chunk.length} симв не принят: $reason" +
+            if (depth < 2 && chunk.length > 160) " → делю пополам" else " → оставляю как есть")
+        // Делим пополам по границе слова и пробуем половинки.
+        if (depth < 2 && chunk.length > 160) {
+            val mid = chunk.length / 2
+            var cut = chunk.lastIndexOf(' ', mid)
+            if (cut <= 0) cut = mid
+            val a = chunk.substring(0, cut).trim()
+            val b = chunk.substring(cut).trim()
+            if (a.isNotBlank() && b.isNotBlank()) {
+                val ra = processPiece(context, systemPrompt, a, modelId, noteId, chunkOk, chunkFix, depth + 1)
+                val rb = processPiece(context, systemPrompt, b, modelId, noteId, chunkOk, chunkFix, depth + 1)
+                // Успехом считаем, если хотя бы одна половина обработана моделью.
+                return ("${ra.first} ${rb.first}").trim() to (ra.second || rb.second)
+            }
+        }
+        return chunk to false
+    }
+
+    /**
      * ЧАНКИНГ для «Чисто»: длинный текст режем на куски ПОД БЮДЖЕТ ТОКЕНОВ модели
      * и обрабатываем по отдельности. Каждый кусок — свежая загрузка модели (generate).
      * Кусок, который модель испортила/не вернула, остаётся как был (текст не теряется).
@@ -578,19 +638,15 @@ object LocalAiEngine {
                 val total = i + 1 + (rest.length + target - 1) / target
                 i++
                 val t0 = System.currentTimeMillis()
-                // «Чисто» = восстановление того же текста: ответ примерно равен входу.
-                // Раньше просили вход×1.4 — лишние токены модель тратила на «продолжение
-                // разговора за себя», а время генерации прямо пропорционально их числу.
-                val wantOut = ((chunk.length * 1.15) / CHARS_PER_TOKEN).toInt() + 16
-                val raw = generate(context, systemPrompt, chunk, modelId, maxNewTok = wantOut, noteId = noteId)
-                // Пословная защита: несозвучные замены откатываются к исходным словам.
-                val r = if (!raw.isNullOrBlank() && chunkFix != null) chunkFix(chunk, raw) else raw
-                val good = !r.isNullOrBlank() && r.length <= chunk.length * 2 && r.length >= chunk.length / 2 &&
-                    !isLoopyLocal(r) && (chunkOk?.invoke(chunk, r) ?: true)
-                val piece = if (good) r!! else chunk
-                if (good) okCount++
-                results.add(piece)
-                Diagnostics.event("Кусок $i/$total (${chunk.length} симв): ${if (good) "ОК" else "откат (оставлен как был)"} (${System.currentTimeMillis()-t0} мс)")
+                // Кусок, который не дался, ДЕЛИМ ПОПОЛАМ и пробуем половинки (до 2 уровней).
+                // Раньше неудача куска означала откат всего куска к исходнику, а если не
+                // далось ни одного — весь уровень уходил на правила, и «Чисто» выглядело
+                // как необработанный текст с машинной пунктуацией.
+                val piece = processPiece(context, systemPrompt, chunk, modelId, noteId, chunkOk, chunkFix, depth = 0)
+                if (piece.second) okCount++
+                results.add(piece.first)
+                Diagnostics.event("Кусок $i/$total (${chunk.length} симв): " +
+                    "${if (piece.second) "ОК" else "откат (оставлен как был)"} (${System.currentTimeMillis()-t0} мс)")
                 onProgress?.invoke(i, total, results.joinToString(" "))
             }
             // если прервали — дописываем необработанный остаток как есть
@@ -619,7 +675,13 @@ object LocalAiEngine {
                          onProgress: ((done: Int, total: Int, partial: String) -> Unit)? = null): String? =
         withContext(Dispatchers.IO) {
             val start = System.currentTimeMillis()
-            val target = chunkChars(prompt, outRatio = ratio)
+            // Куски для СЖАТИЯ мельче, чем позволяет бюджет (v122). На куске в 700 символов
+            // Qwen 1.5B не сжимает, а переписывает вход и упирается в лимит — в архиве
+            // «Кратко» оказалось началом исходного текста, обрезанным на полуслове.
+            // На куске в 300-350 символов задача «скажи то же короче» ей по силам.
+            // Порядок и темы при этом сохраняются по построению: каждый кусок ужимается
+            // на своём месте, соседние никогда не смешиваются.
+            val target = minOf(chunkChars(prompt, outRatio = ratio), CONDENSE_CHUNK)
             val chunks = if (text.length <= target) listOf(text.trim()) else splitIntoChunks(text, target)
             Diagnostics.info("Сжатие до ${(ratio * 100).toInt()}%: текст ${text.length} симв, ${chunks.size} кусков по ~$target")
             val parts = ArrayList<String>()
@@ -627,12 +689,26 @@ object LocalAiEngine {
             for ((i, ch) in chunks.withIndex()) {
                 if (!currentCoroutineContext().isActive) { Diagnostics.info("Сжатие прервано (отмена)"); break }
                 val t0 = System.currentTimeMillis()
-                // Просим ровно столько токенов, сколько нужно на долю ratio (+запас 20%).
-                val wantOut = ((ch.length * ratio * 1.2) / CHARS_PER_TOKEN).toInt().coerceAtLeast(24)
-                val r = generate(context, prompt, ch, modelId, maxNewTok = wantOut, noteId = noteId)
-                // Годится, если модель реально сжала (не длиннее входа) и не зациклилась.
-                val good = !r.isNullOrBlank() && !isLoopyLocal(r) && r.length <= ch.length &&
-                    r.length >= minOf(20, ch.length / 4)
+                // Запас 1.6: при 1.2 модель упиралась в лимит и ответ рвался на полуслове
+                // («…и новую виолончель для д»). Лишние токены дешевле обрыва.
+                val wantOut = ((ch.length * ratio * 1.6) / CHARS_PER_TOKEN).toInt().coerceAtLeast(32)
+                val raw0 = generate(context, prompt, ch, modelId, maxNewTok = wantOut, noteId = noteId)
+                // Модель иногда выдаёт несколько пересказов подряд («Второй вариант: …») —
+                // такое было в облачном «Кратко» по лекции. Берём только первый.
+                val raw = raw0?.let { cutSecondVariant(it) }
+                // Хвост до последнего законченного предложения: огрызок показывать нельзя.
+                val r = raw?.let { trimToSentence(it) }
+                val copied = !r.isNullOrBlank() && isCopyNotSummary(ch, r)
+                val good = !r.isNullOrBlank() && !isLoopyLocal(r) && !looksGarbled(r) && !copied &&
+                    r.length <= ch.length && r.length >= minOf(20, ch.length / 4)
+                if (!good && !raw0.isNullOrBlank()) Diagnostics.info(
+                    "Сжатие: кусок не принят (" + when {
+                        r.isNullOrBlank() -> "оборван на полуслове"
+                        copied -> "не сжатие, а переписанный вход"
+                        looksGarbled(r) -> "слипшийся текст/латиница"
+                        isLoopyLocal(r) -> "зацикливание"
+                        else -> "длина ${r.length} при входе ${ch.length}"
+                    } + ")")
                 parts.add(if (good) r!!.trim() else TextCondenser.condense(ch, Level.BRIEF))
                 if (good) okCount++
                 Diagnostics.event("Сжатие, кусок ${i + 1}/${chunks.size} (${ch.length}→${parts.last().length} симв): " +
@@ -649,6 +725,86 @@ object LocalAiEngine {
     /** Принудительная выгрузка модели — следующая генерация с чистого состояния. */
     fun forceReload() { releaseCurrent() }
 
+    /**
+     * НЕ СЖАТИЕ, А ПЕРЕПИСАННЫЙ ВХОД (v122).
+     *
+     * Главная беда «Кратко» на слабой модели: вместо пересказа она переписывает исходный
+     * текст слово в слово, пока не кончится лимит токенов. В архиве это выглядело как
+     * «Кратко», совпадающее с началом «Чисто» и обрезанное на полуслове. Формальные
+     * проверки такое пропускали: длина ведь меньше входа.
+     *
+     * Меряем долей ЧЕТВЁРОК СЛОВ подряд, которые дословно есть в источнике. Сравнение
+     * «совпадает ли начало» не годится: в реальном случае модель выбросила одно слово
+     * («три сегодня в Пятигорске» → «три в пятигорске»), и посимвольное сравнение с
+     * начала сразу расходилось, хотя дальше шла дословная копия.
+     *
+     * Проверено на выдачах из архива:
+     *   копия из архива      доля 0.86  → отклоняем
+     *   дословная выдержка   доля 1.00  → отклоняем
+     *   настоящий пересказ   доля 0.00  → принимаем
+     *   телеграфный стиль    доля 0.07  → принимаем (это вопрос стиля, а не копирования)
+     */
+    fun isCopyNotSummary(source: String, result: String): Boolean {
+        fun words(s: String) = s.lowercase().split(Regex("[^а-яёa-z0-9]+")).filter { it.isNotBlank() }
+        val a = words(source); val b = words(result)
+        if (a.size < 10 || b.size < 6) return false
+        val src = HashSet<String>()
+        for (i in 0..a.size - 4) src.add(a.subList(i, i + 4).joinToString(" "))
+        var total = 0; var hit = 0
+        for (i in 0..b.size - 4) {
+            total++
+            if (b.subList(i, i + 4).joinToString(" ") in src) hit++
+        }
+        if (total == 0) return false
+        return hit.toDouble() / total >= 0.7
+    }
+
+    /** Модель выдала несколько пересказов подряд — оставляем первый. */
+    fun cutSecondVariant(t: String): String {
+        val markers = listOf("второй вариант", "вариант 2", "вариант второй",
+            "другой вариант", "или так:", "альтернатива:")
+        val low = t.lowercase()
+        var cut = -1
+        for (m in markers) {
+            val i = low.indexOf(m)
+            if (i > 40 && (cut < 0 || i < cut)) cut = i
+        }
+        return if (cut > 0) t.substring(0, cut).trim().trimEnd(':', '-', '—') else t
+    }
+
+    /**
+     * Обрезает хвост до последнего законченного предложения (v120).
+     *
+     * Модель не всегда останавливается сама и упирается в лимит токенов — ответ рвётся
+     * на полуслове: «…и новую виолончель для д». Показывать такое нельзя. Если после
+     * обрезки остаётся меньше 60% ответа, значит оборвано слишком рано — тогда лучше
+     * признать попытку неудачной (вызывающий уйдёт на правила), чем показать огрызок.
+     */
+    fun trimToSentence(t: String): String? {
+        val s = t.trim()
+        if (s.isEmpty()) return null
+        if (s.last() in ".!?…") return s
+        val cut = s.indexOfLast { it in ".!?…" }
+        if (cut < 0) return null
+        val res = s.substring(0, cut + 1).trim()
+        return if (res.length >= s.length * 0.6) res else null
+    }
+
+    /**
+     * Явный мусор от модели: слипшиеся слова и смесь кириллицы с латиницей внутри слова
+     * («СегоднявПятигорске:ветerpятнадцатьм/с» — реальный ответ из теста). Прежняя проверка
+     * ловила только «больше половины латиницы» и такое пропускала.
+     */
+    fun looksGarbled(text: String): Boolean {
+        for (w in text.split(Regex("\\s+"))) {
+            if (w.length > 30) return true                       // слова без пробелов
+            val cyr = w.count { it in 'а'..'я' || it in 'А'..'Я' || it == 'ё' || it == 'Ё' }
+            val lat = w.count { it in 'a'..'z' || it in 'A'..'Z' }
+            if (cyr >= 2 && lat >= 2) return true                // «ветerpятнадцать»
+        }
+        return false
+    }
+
     // Детект зацикливания (фраза повторяется).
     private fun isLoopyLocal(text: String): Boolean {
         val w = text.split(Regex("\\s+")).filter { it.length > 1 }
@@ -663,17 +819,28 @@ object LocalAiEngine {
     }
 
     /** Отрезает от текста первый кусок ~target символов по границе предложения/слова. */
+    /**
+     * Отрезает следующий кусок, НЕ ПРЕВЫШАЯ target (v120).
+     *
+     * Было: `if (t.length <= target * 1.3) return t to ""` и поиск границы в окне до
+     * target*1.3 — то есть разбивка сознательно вылезала за цель на 30%. При цели 896
+     * это давало кусок 1158 символов; вместе с инструкцией он занимал почти весь бюджет
+     * в 640 токенов, ответу места не оставалось, он обрывался, срабатывала защита от
+     * обрезки — и «Чисто» уходило на правила. Ровно это видно в логе лекции:
+     *     Кусок 1/2 (1158 симв): откат … Чисто: модель не справилась → правила
+     * Теперь target — жёсткий потолок: граница предложения ищется ВНУТРИ окна, а если
+     * её там нет — режем по слову, но не дальше target.
+     */
     private fun nextChunk(text: String, target: Int): Pair<String, String> {
         val t = text.trim()
-        if (t.length <= target * 1.3) return t to ""
-        // граница предложения в окне [target/2, target*1.3]
-        val hi = (target * 1.3).toInt().coerceAtMost(t.length - 1)
-        val lo = target / 2
+        if (t.length <= target) return t to ""
+        val hi = target.coerceAtMost(t.length - 1)
+        val lo = (target * 0.55).toInt()
         var cut = -1
         for (j in hi downTo lo) { if (t[j] == '.' || t[j] == '!' || t[j] == '?') { cut = j + 1; break } }
-        if (cut < 0) { // по слову
-            val sp = t.lastIndexOf(' ', target)
-            cut = if (sp > lo) sp else target
+        if (cut < 0) {
+            val sp = t.lastIndexOf(' ', hi)
+            cut = if (sp > lo) sp else hi
         }
         return t.substring(0, cut).trim() to t.substring(cut).trim()
     }

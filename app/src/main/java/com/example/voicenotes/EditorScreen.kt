@@ -79,6 +79,10 @@ fun EditorScreen(
 
     var original by remember(note.id) { mutableStateOf(note.original) }
     var isListening by remember { mutableStateOf(false) }
+    // Подготовка распознавания (загрузка модели Vosk может занять секунды, а на большой
+    // модели — десятки). Без этого флага статус не показывался, и кнопка микрофона
+    // выглядела «не работающей»: пользователь жал её повторно.
+    var voskPreparing by remember { mutableStateOf(false) }
     var liveText by remember { mutableStateOf("") }
     var status by remember { mutableStateOf(if (note.original.isBlank()) "Нажмите «Запись»" else "Готово") }
     var showRename by remember { mutableStateOf(false) }
@@ -184,6 +188,25 @@ fun EditorScreen(
     // Работа со смыслом: локальный ИИ (офл) или облачный (онл). Состояние экрана
     // (иначе переключатель не перерисовывается сразу при нажатии).
     var localAi by remember { mutableStateOf(settings.localAi) }
+    // В офлайне ступени тона нет — держим выбор на «Обычно», иначе после переключения
+    // Онл→Офл экран показывал бы вариант скрытого тона (Формально/Живой).
+    LaunchedEffect(localAi) { if (localAi) toneIdx = 1 }
+
+    // ── ПРОВЕРКА ОБЛАКА (v122, идея пользователя) ────────────────────────────
+    // Спрашиваем облако «жив ли ты» ДО отправки текста: при открытии заметки в режиме
+    // «Смысл Онл» и при переключении на Онл. Раньше о недоступности узнавали только
+    // по факту — обработка висела минутами (в логе 708 с), а причина («модель вернула
+    // null») всплывала лишь потом. Проверка крошечная и кэшируется на 2 минуты.
+    var cloudProblem by remember { mutableStateOf("") }
+    fun checkCloud(force: Boolean = false) {
+        if (localAi || !settings.useAI) { cloudProblem = ""; return }
+        scope.launch {
+            val (ok, msg) = AiClient.quickCheck(settings.apiKey, force)
+            cloudProblem = if (ok) "" else msg
+            if (!ok) status = "Облачный ИИ недоступен: ${msg.take(70)}"
+        }
+    }
+    LaunchedEffect(Unit) { checkCloud() }
     var showMenu by remember { mutableStateOf(false) }
     var showInfo by remember { mutableStateOf(false) }
     var showLegend by remember { mutableStateOf(false) }
@@ -289,7 +312,15 @@ fun EditorScreen(
     }
 
     fun startVosk() {
+        // Повторное нажатие, пока модель ещё грузится, раньше запускало вторую загрузку
+        // поверх первой — вернейший способ добить память и получить вылет.
+        if (voskPreparing) {
+            Diagnostics.action("Тап микрофон: подготовка уже идёт, повторный запуск отклонён")
+            return
+        }
+        voskPreparing = true
         scope.launch {
+          try {
             // Если выбрана большая модель, но не скачана — используем маленькую
             // (не заставляем молча качать 1.8 ГБ, микрофон должен работать сразу).
             if (VoskModelManager.useBig && !VoskModelManager.isReadySize(context, true)
@@ -304,20 +335,33 @@ fun EditorScreen(
                 downloadProgress = -1
             }
             status = "Готовлю распознавание…"
-            // Большая Vosk (1.8 ГБ на диске) при загрузке в память требует несколько ГБ.
-            // Если свободной памяти мало — это верный путь к нативному вылету (его Java
-            // не перехватывает). Тогда берём маленькую и честно говорим об этом.
+            // ── Большая Vosk: три рубежа защиты от вылета (v118) ──────────────────
+            // Порог свободной памяти работал ненадёжно: у одного и того же телефона
+            // свободно то 2717 МБ, то 3698 — на границе приложение падало через раз.
             val freeMb = Diagnostics.availMemMb(context)
-            if (VoskModelManager.useBig && freeMb in 0..2999) {
+            val needMb = VoskModelManager.bigNeedsMb(context)
+            if (VoskModelManager.useBig && VoskModelManager.bigLoadCrashed(context)) {
+                // 1) Прошлая попытка не вернулась — процесс убили при загрузке.
                 VoskModelManager.useBig = false
-                Diagnostics.error("Большая Vosk: свободно только $freeMb МБ (<3000) → переключаюсь на маленькую")
+                settings.voskBig = false          // выключаем и в настройках, чтобы не повторялось
+                VoskModelManager.clearBigCrashMark(context)
+                Diagnostics.error("Большая Vosk: прошлая загрузка ОБОРВАЛАСЬ (вылет) → отключаю большую модель")
+                status = "Большая Vosk не влезает в память этого телефона — включена маленькая"
+            } else if (VoskModelManager.useBig && freeMb in 0 until needMb) {
+                // 2) Памяти заведомо не хватит (порог от реального размера модели).
+                VoskModelManager.useBig = false
+                Diagnostics.error("Большая Vosk: свободно $freeMb МБ, нужно ~$needMb МБ → маленькая")
                 status = "Мало памяти для большой Vosk — использую маленькую"
             }
-            Diagnostics.info("Vosk: модель готова, загружаю (big=${VoskModelManager.useBig}, свободно $freeMb МБ) — если лог оборвётся здесь, вылет при загрузке модели")
+            Diagnostics.info("Vosk: модель готова, загружаю (big=${VoskModelManager.useBig}, свободно $freeMb МБ, нужно ~$needMb МБ) — если лог оборвётся здесь, вылет при загрузке модели")
             val t0 = System.currentTimeMillis()
+            // 3) Маркер на диске: переживает даже убийство процесса (Java-перехватчик — нет).
+            if (VoskModelManager.useBig) VoskModelManager.markBigLoadStart(context)
             val model = try { VoskHolder.getModel(context) }
             catch (e: Throwable) { status = "Ошибка модели Vosk: ${e.message}"
-                Diagnostics.error("Vosk загрузка модели упала: ${e.javaClass.simpleName}: ${e.message?.take(80)}"); return@launch }
+                Diagnostics.error("Vosk загрузка модели упала: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
+                VoskModelManager.markBigLoadOk(context); return@launch }
+            VoskModelManager.markBigLoadOk(context)
             Diagnostics.info("Vosk: модель загружена за ${System.currentTimeMillis() - t0} мс, старт записи")
             val audioFile = if (settings.saveAudio)
                 File(context.filesDir, "audio_${note.id}.wav").also { note.audioPath = it.absolutePath }
@@ -339,6 +383,7 @@ fun EditorScreen(
                 status = "Не удалось начать запись: ${e.message}"
                 Diagnostics.error("Vosk start упал: ${e.javaClass.simpleName}: ${e.message?.take(80)}")
             }
+          } finally { voskPreparing = false }
         }
     }
 
@@ -387,28 +432,23 @@ fun EditorScreen(
             }
         } else {
             if (original.isBlank()) return
-            if (aiRunning) {
-                status = "Обработка уже идёт, подождите…"
+            // Блокировка — по состоянию ПРОЦЕССОРА (переживает выход из заметки), а не по
+            // экранному флагу: раньше он сбрасывался при возврате в заметку, и второй тап
+            // запускал вторую обработку поверх первой.
+            if (processor.isUpdating(note.id, level, tone)) {
+                status = "Этот вариант уже обновляется, подождите…"
+                Diagnostics.action("Обновить ($level): уже идёт — тап проигнорирован")
                 return
             }
-            aiRunning = true
             activeEngine = if (settings.localAi) "local" else "cloud"
             cornerIndicator = if (settings.localAi) "ai-local" else "ai-cloud"
             val tUpd = System.currentTimeMillis()
             Diagnostics.action("Обновить смысл ($level), движок=${if (settings.localAi) "локальный" else "облачный"}")
-            // Таймаут-страховка: если за 45 сек не завершилось — сбрасываем блокировку.
-            val watchdog = scope.launch {
-                kotlinx.coroutines.delay(90000)
-                if (aiRunning) {
-                    aiRunning = false; activeEngine = ""; cornerIndicator = ""
-                    status = "Обработка прервана (слишком долго)"
-                    Diagnostics.error("Обновление $level: таймаут 90с")
-                }
-            }
+            // Сторожа на корутине экрана больше нет: он умирал вместе с экраном и снимал
+            // блокировку раньше времени. Ограничение по времени теперь внутри запроса.
             processor.regenerateOne(note, level, tone) { ok ->
-                watchdog.cancel()
                 onChanged(); refreshTick++
-                aiRunning = false; activeEngine = ""; cornerIndicator = ""
+                activeEngine = ""; cornerIndicator = ""
                 Diagnostics.event("Обновление $level заняло ${System.currentTimeMillis() - tUpd} мс")
                 status = if (ok) "Готово" else "ИИ не смог обработать"
             }
@@ -706,7 +746,14 @@ fun EditorScreen(
     // не должен висеть вечно — вместо него подсказка и кнопка ↻)
     refreshTick
     val batchRunning = processor.isActive(note.id)
-    val processing = (aiRunning || voskRerunning || whisperRunning) ||
+    // Признак «идёт пересчёт» берём У ПРОЦЕССОРА, а не из состояния экрана: экранное
+    // состояние терялось при выходе из заметки, индикация гасла раньше времени, а текст
+    // обновлялся молча через десяток секунд (жалоба «нажал обновить — ничего не менялось,
+    // потом само обновилось»). Процессор живёт на уровне приложения и знает правду.
+    // (updating внутри процессора — mutableStateMap, чтение здесь само подписывает
+    //  экран на изменения, отдельный «тик» перерисовки не нужен.)
+    val updatingNow = processor.isUpdatingAny(note.id)
+    val processing = (aiRunning || updatingNow || voskRerunning || whisperRunning) ||
         (!isListening && original.isNotBlank() && !currentReady && settings.useAI && batchRunning)
 
     // Счётчик секунд — тикает весь процесс обработки (не сбрасывается между вызовами).
@@ -803,16 +850,17 @@ fun EditorScreen(
                         offSelected = localAi,
                         onOff = {
                             if (localAi) return@SegOffOn
-                            if (aiRunning) { status = "Дождитесь завершения обновления"; return@SegOffOn }
+                            if (aiRunning || updatingNow) { status = "Дождитесь завершения обновления"; return@SegOffOn }
                             localAi = true; settings.localAi = true
                             Diagnostics.action("Смысл → Офлайн (локальный ИИ) — пересчёт смыслов")
                             if (original.isNotBlank() && settings.useAI && settings.autoAi) startProcessingAll()
                         },
                         onOn = {
                             if (!localAi) return@SegOffOn
-                            if (aiRunning) { status = "Дождитесь завершения обновления"; return@SegOffOn }
+                            if (aiRunning || updatingNow) { status = "Дождитесь завершения обновления"; return@SegOffOn }
                             localAi = false; settings.localAi = false
                             Diagnostics.action("Смысл → Онлайн (облачный ИИ) — пересчёт смыслов")
+                            checkCloud(force = true)
                             if (original.isNotBlank() && settings.useAI && settings.autoAi) startProcessingAll()
                         }
                     )
@@ -903,8 +951,12 @@ fun EditorScreen(
                         }
                     }
                     // Готовы ли смыслы (хоть один вариант CLEAN/BRIEF/GIST)?
+                    // Смотрим по тону «Обычно», а не по текущему: иначе при переключении
+                    // тона на «Формально», который ещё не посчитан, кнопка «ИИ» появлялась
+                    // снова, будто смыслов вообще нет. Недостающий тон добирается кнопкой
+                    // «Обновить» — она считает ровно текущий уровень и тон.
                     val smyslyReady = Level.entries.any { l ->
-                        l != Level.VERBATIM && note.getVariant(l, tone) != null
+                        l != Level.VERBATIM && note.getVariant(l, Tone.NEUTRAL) != null
                     }
                     // «Обновить» показывается:
                     //  - в Дословно (офлайн, есть аудио) — перераспознать;
@@ -916,9 +968,18 @@ fun EditorScreen(
                     // «Обновить» — переобработать текущим движком/моделью (нужно, например,
                     // чтобы переделать старую заметку новой моделью после её выбора).
                     // + в смыслах, когда текущий вариант НЕ рассчитан и расчёт не идёт (сбой/отмена) — чтобы можно было запустить снова.
-                    val showUpdate = canReupdate || (level != Level.VERBATIM && aiAvailable &&
-                        (smyslyReady || (original.isNotBlank() && !processor.isActive(note.id))))
+                    // РЕВИЗИЯ КНОПОК (v124, задача 8 из большого разбора).
+                    // Правило проекта: «ИИ» и «Обновить» НЕ показываются вместе. Оно
+                    // нарушалось: когда смыслы ещё не посчитаны и расчёт не идёт, обе
+                    // кнопки выводились рядом и делали почти одно и то же.
+                    // Теперь роли разведены строго:
+                    //   «ИИ» (✦) — ПЕРВИЧНЫЙ запуск, когда смыслов ещё нет;
+                    //   «Обновить» (↻) — переделать то, что уже посчитано, ИЛИ
+                    //                     повторить после сбоя, когда кнопки «ИИ» нет.
                     val showAiBtn = original.isNotBlank() && aiAvailable && !settings.autoAi && !smyslyReady
+                    val canRetryAfterFail = original.isNotBlank() && !processor.isActive(note.id) && !showAiBtn
+                    val showUpdate = canReupdate ||
+                        (level != Level.VERBATIM && aiAvailable && (smyslyReady || canRetryAfterFail))
 
                     Row(
                         Modifier.align(Alignment.BottomEnd).padding(12.dp),
@@ -937,19 +998,25 @@ fun EditorScreen(
                                         Text(vLabel, color = Color.White.copy(alpha = 0.8f), fontSize = 10.sp,
                                             modifier = Modifier.padding(start = 10.dp, end = 2.dp))
                                     }
+                                    // Пока этот вариант пересчитывается, листать историю нельзя:
+                                    // новая версия допишется в историю и сдвинет позицию —
+                                    // пользователь оказался бы не на той версии, что выбрал.
+                                    val histBusy = processor.isUpdating(note.id, level, tone)
+                                    val canBack = note.canGoBack(level, tone) && !histBusy
+                                    val canFwd = note.canGoForward(level, tone) && !histBusy
                                     Box(Modifier.size(width = 40.dp, height = 56.dp)
-                                        .clickable(enabled = note.canGoBack(level, tone)) {
+                                        .clickable(enabled = canBack) {
                                             note.goBack(level, tone); onChanged(); refreshTick++ },
                                         contentAlignment = Alignment.Center) {
                                         Icon(Icons.Filled.ChevronLeft, "Назад",
-                                            tint = if (note.canGoBack(level, tone)) Color.White else Color.White.copy(alpha = 0.3f))
+                                            tint = if (canBack) Color.White else Color.White.copy(alpha = 0.3f))
                                     }
                                     Box(Modifier.size(width = 40.dp, height = 56.dp)
-                                        .clickable(enabled = note.canGoForward(level, tone)) {
+                                        .clickable(enabled = canFwd) {
                                             note.goForward(level, tone); onChanged(); refreshTick++ },
                                         contentAlignment = Alignment.Center) {
                                         Icon(Icons.Filled.ChevronRight, "Вперёд",
-                                            tint = if (note.canGoForward(level, tone)) Color.White else Color.White.copy(alpha = 0.3f))
+                                            tint = if (canFwd) Color.White else Color.White.copy(alpha = 0.3f))
                                     }
                                 }
                             }
@@ -959,11 +1026,16 @@ fun EditorScreen(
                             // Пока идёт пакетный расчёт вариантов — не даём запустить второй
                             // поток поверх (результаты налезали друг на друга).
                             val batchActive = processor.isActive(note.id)
-                            val busy = aiRunning || voskRerunning || batchActive
+                            // Признак «этот вариант уже обновляется» — из процессора: он
+                            // переживает выход из заметки, в отличие от экранного aiRunning.
+                            val thisUpdating = processor.isUpdating(note.id, level, tone)
+                            val busy = aiRunning || thisUpdating || voskRerunning || batchActive
                             FloatingActionButton(
                                 onClick = {
-                                    Diagnostics.action("Тап Обновить: busy=$busy (aiRunning=$aiRunning, vosk=$voskRerunning, пакет=$batchActive)")
+                                    Diagnostics.action("Тап Обновить: busy=$busy (aiRunning=$aiRunning, " +
+                                        "этот вариант=$thisUpdating, vosk=$voskRerunning, пакет=$batchActive)")
                                     if (!busy) updateCurrent()
+                                    else if (thisUpdating) status = "Этот вариант уже обновляется…"
                                     else if (batchActive) status = "Идёт расчёт вариантов, подождите…"
                                 },
                                 containerColor = if (busy) Palette.Amber else Palette.Ink,
@@ -986,8 +1058,16 @@ fun EditorScreen(
                             FloatingActionButton(
                                 onClick = {
                                     Diagnostics.action("Тап микрофон: разрешение=$hasPermission, идёт запись=$isListening, речь=${if (isOnline) "онл" else "офл"}")
+                                    // Запись переписывает «Дословно», а ИИ в это время считает
+                                    // по СТАРОМУ тексту — его результат лёг бы поверх новой
+                                    // записи. Пока идёт обработка, запись не начинаем и говорим,
+                                    // что делать (отмена — на экране ожидания).
                                     if (!hasPermission) permLauncher.launch(Manifest.permission.RECORD_AUDIO)
                                     else if (isListening) stopRecording()
+                                    else if (processing) {
+                                        status = "Идёт обработка ИИ — отмените её, чтобы записывать"
+                                        Diagnostics.action("Микрофон: запись отклонена, идёт обработка ИИ")
+                                    }
                                     else startRecording()
                                 },
                                 containerColor = if (isListening) Palette.Red else Palette.Ink,
@@ -1017,19 +1097,16 @@ fun EditorScreen(
                     Spacer(Modifier.height(8.dp))
 
                     // Тон: скрыт в режиме лекции, неактивен при «Дословно».
-                    if (!note.isLecture) {
-                        // Тон различает только облако: локальная модель даёт один текст на все
-                        // тоны, поэтому в режиме «Смысл Офл» ступень тона выключена (иначе
-                        // кнопки «работают», но ничего не меняют).
+                    // Тон различает только облако: локальная модель выдаёт один текст на все
+                    // тоны. В режиме «Смысл Офл» ступень тона раньше показывалась выключенной
+                    // с подписью-пояснением — она просто занимала место. Теперь её нет вовсе,
+                    // и она появляется сама при переключении «Смысл» на Онл.
+                    if (!note.isLecture && !localAi) {
                         ToneStepper(
                             selected = toneIdx,
-                            enabled = level != Level.VERBATIM && !localAi,
-                            readyState = { i -> tick; variantStateFor(note, processor, level, Tone.fromIndex(i)) }
+                            enabled = level != Level.VERBATIM,
+                            readyState = { i -> variantStateFor(note, processor, level, Tone.fromIndex(i)) }
                         ) { toneIdx = it }
-                        if (localAi && level != Level.VERBATIM) {
-                            Text("Тон — только в режиме «Смысл Онл»", fontSize = 10.sp,
-                                color = cs.onSurfaceVariant, modifier = Modifier.padding(start = 16.dp))
-                        }
                         Spacer(Modifier.height(6.dp))
                     }
 
@@ -1039,6 +1116,9 @@ fun EditorScreen(
                     val active = processor.isActive(note.id)
                     val liveStatus = when {
                         isListening -> status
+                        // Подготовка модели: без этой строки статус не показывался и кнопка
+                        // микрофона выглядела мёртвой — жали ещё раз, память добивалась.
+                        voskPreparing -> status
                         downloadProgress in 0..100 -> status
                         original.isBlank() -> "Нажмите «Запись»"
                         active && total > 0 -> "Обрабатываю варианты: $done из $total"
@@ -1050,6 +1130,25 @@ fun EditorScreen(
                     }
                     refreshTick // подписка на обновления
                     Text(liveStatus, color = cs.onSurfaceVariant, fontSize = 11.sp, maxLines = 1)
+                    // «Чисто» пересчитали — этот вариант построен на прежнем тексте. Не
+                    // стираем его (пользователь должен видеть прошлый результат), но честно
+                    // говорим об этом и предлагаем обновить, когда он сам захочет.
+                    if (processor.isStale(note.id, level, tone) && level != Level.VERBATIM) {
+                        Text("Построено на прежнем «Чисто» — нажмите ↻, чтобы пересчитать",
+                            color = Palette.Amber, fontSize = 10.sp, maxLines = 2)
+                    }
+                    // Облако не отвечает — говорим сразу, до отправки текста, и даём
+                    // перепроверить одним касанием (проверка занимает секунду).
+                    if (cloudProblem.isNotBlank() && !localAi) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("⚠ Облачный ИИ: ${cloudProblem.take(80)}",
+                                color = Palette.Amber, fontSize = 10.sp, maxLines = 2,
+                                modifier = Modifier.weight(1f))
+                            TextButton(onClick = { checkCloud(force = true) }) {
+                                Text("Проверить", fontSize = 10.sp)
+                            }
+                        }
+                    }
                     if (downloadProgress in 0..100) {
                         Spacer(Modifier.height(4.dp))
                         LinearProgressIndicator(

@@ -74,6 +74,15 @@ fun App() {
     val settings = remember { Settings(context) }
     LaunchedEffect(Unit) {
         RecognitionDictionary.load(context)
+        // Маркер незавершённой загрузки большой Vosk = прошлый запуск убили при загрузке
+        // модели (нативная смерть, Java-перехватчик её не видит). Отключаем большую сразу
+        // при старте, не дожидаясь второго вылета, и пишем причину в чёрный ящик.
+        if (settings.voskBig && VoskModelManager.bigLoadCrashed(context)) {
+            settings.voskBig = false
+            VoskModelManager.clearBigCrashMark(context)
+            Diagnostics.error("ПРИЧИНА ПРОШЛОГО ВЫЛЕТА: обрыв на загрузке большой Vosk " +
+                "(1.8 ГБ не влезли в память) → большая модель ОТКЛЮЧЕНА, включена маленькая")
+        }
         VoskModelManager.useBig = settings.voskBig
     }
     val store = remember { NoteStore(context) }

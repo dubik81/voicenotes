@@ -1,11 +1,11 @@
-plugins {
+﻿plugins {
     id 'com.android.application'
     id 'org.jetbrains.kotlin.android'
 }
 
 android {
-    // Разрешение конфликта нативных библиотек: Whisper и ExecuTorch несут
-    // одинаковый libc++_shared.so — берём первый (они идентичны).
+    // Р Р°Р·СЂРµС€РµРЅРёРµ РєРѕРЅС„Р»РёРєС‚Р° РЅР°С‚РёРІРЅС‹С… Р±РёР±Р»РёРѕС‚РµРє: Whisper Рё ExecuTorch РЅРµСЃСѓС‚
+    // РѕРґРёРЅР°РєРѕРІС‹Р№ libc++_shared.so вЂ” Р±РµСЂС‘Рј РїРµСЂРІС‹Р№ (РѕРЅРё РёРґРµРЅС‚РёС‡РЅС‹).
     packaging {
         jniLibs {
             pickFirsts += ['**/libc++_shared.so']
@@ -18,11 +18,11 @@ android {
         applicationId "com.example.voicenotes"
         minSdk 24
         targetSdk 34
-        versionCode 118
-        versionName "118.0"
+        versionCode 124
+        versionName "124.0"
         ndk {
-            // Whisper работает только на arm64-v8a (покрывает все современные телефоны,
-            // включая Samsung S25). Ограничение упрощает и ускоряет сборку.
+            // Whisper СЂР°Р±РѕС‚Р°РµС‚ С‚РѕР»СЊРєРѕ РЅР° arm64-v8a (РїРѕРєСЂС‹РІР°РµС‚ РІСЃРµ СЃРѕРІСЂРµРјРµРЅРЅС‹Рµ С‚РµР»РµС„РѕРЅС‹,
+            // РІРєР»СЋС‡Р°СЏ Samsung S25). РћРіСЂР°РЅРёС‡РµРЅРёРµ СѓРїСЂРѕС‰Р°РµС‚ Рё СѓСЃРєРѕСЂСЏРµС‚ СЃР±РѕСЂРєСѓ.
             abiFilters 'arm64-v8a'
         }
     }
@@ -39,7 +39,7 @@ android {
     }
     buildTypes {
         debug {
-            // подписываем debug тем же постоянным ключом, если он задан
+            // РїРѕРґРїРёСЃС‹РІР°РµРј debug С‚РµРј Р¶Рµ РїРѕСЃС‚РѕСЏРЅРЅС‹Рј РєР»СЋС‡РѕРј, РµСЃР»Рё РѕРЅ Р·Р°РґР°РЅ
             if (System.getenv("KEYSTORE_FILE") != null) {
                 signingConfig signingConfigs.release
             }
@@ -71,14 +71,20 @@ dependencies {
     implementation 'androidx.activity:activity-compose:1.9.2'
     implementation 'androidx.core:core-ktx:1.13.1'
     implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
-    // Офлайн-распознавание Vosk (аудио + текст из одного потока)
+    // РћС„Р»Р°Р№РЅ-СЂР°СЃРїРѕР·РЅР°РІР°РЅРёРµ Vosk (Р°СѓРґРёРѕ + С‚РµРєСЃС‚ РёР· РѕРґРЅРѕРіРѕ РїРѕС‚РѕРєР°)
     implementation 'net.java.dev.jna:jna:5.13.0@aar'
     implementation 'com.alphacephei:vosk-android:0.3.47@aar'
-    // Офлайн-распознавание Whisper (точное, по записанному файлу, arm64)
+    // РћС„Р»Р°Р№РЅ-СЂР°СЃРїРѕР·РЅР°РІР°РЅРёРµ Whisper (С‚РѕС‡РЅРѕРµ, РїРѕ Р·Р°РїРёСЃР°РЅРЅРѕРјСѓ С„Р°Р№Р»Сѓ, arm64)
     implementation 'dev.ffmpegkit-maintained:whisper-android:1.0.0'
-    // Локальный ИИ на устройстве (ExecuTorch, LLaMA/Gemma, arm64)
+    // Р›РѕРєР°Р»СЊРЅС‹Р№ РР РЅР° СѓСЃС‚СЂРѕР№СЃС‚РІРµ (ExecuTorch, LLaMA/Gemma, arm64)
     implementation 'org.pytorch:executorch-android:1.0.0'
-    // Обязательные зависимости ExecuTorch (иначе нативная библиотека не загрузится).
+    // РћР±СЏР·Р°С‚РµР»СЊРЅС‹Рµ Р·Р°РІРёСЃРёРјРѕСЃС‚Рё ExecuTorch (РёРЅР°С‡Рµ РЅР°С‚РёРІРЅР°СЏ Р±РёР±Р»РёРѕС‚РµРєР° РЅРµ Р·Р°РіСЂСѓР·РёС‚СЃСЏ).
     implementation 'com.facebook.soloader:soloader:0.10.5'
     implementation 'com.facebook.fbjni:fbjni:0.7.0'
 }
+
+
+
+
+
+

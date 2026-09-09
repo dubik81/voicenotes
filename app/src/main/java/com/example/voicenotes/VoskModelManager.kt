@@ -32,6 +32,48 @@ object VoskModelManager {
 
     fun modelDir(context: Context): File = File(context.filesDir, dirName())
 
+    // ══ ЗАЩИТА ОТ ВЫЛЕТА НА БОЛЬШОЙ МОДЕЛИ (v118) ═════════════════════════════
+    // Большая Vosk (1.8 ГБ на диске) при загрузке разворачивается в памяти и на
+    // телефоне с занятой памятью Android просто УБИВАЕТ процесс. Это не исключение
+    // Java — перехватчик крашей такое поймать не может, в логе просто обрыв.
+    //
+    // Проверки «сколько свободно памяти» недостаточно: в снимках окружения у одного
+    // и того же телефона свободно то 2717 МБ, то 3698 — порог угадать нельзя, и на
+    // границе приложение падает через раз.
+    //
+    // Поэтому МАРКЕР НА ДИСКЕ: перед загрузкой создаём файл, после успешной загрузки
+    // удаляем. Если при следующем запуске файл на месте — прошлая попытка не
+    // вернулась, то есть процесс убили. Тогда большая модель отключается насовсем
+    // (до ручного включения в настройках). Это работает независимо от того, каким
+    // образом приложение умерло.
+    private fun bigMarker(context: Context) = File(context.filesDir, "vosk_big_loading.marker")
+
+    /** Пометить начало загрузки большой модели (маркер живёт до успешного конца). */
+    fun markBigLoadStart(context: Context) {
+        try { bigMarker(context).writeText(System.currentTimeMillis().toString()) } catch (_: Throwable) {}
+    }
+
+    /** Загрузка прошла — снимаем маркер. */
+    fun markBigLoadOk(context: Context) {
+        try { bigMarker(context).delete() } catch (_: Throwable) {}
+    }
+
+    /** Осталась ли метка незавершённой загрузки (значит, в прошлый раз был вылет). */
+    fun bigLoadCrashed(context: Context): Boolean = try { bigMarker(context).exists() } catch (_: Throwable) { false }
+
+    fun clearBigCrashMark(context: Context) = markBigLoadOk(context)
+
+    /**
+     * Сколько памяти нужно, чтобы браться за большую модель. Считаем от РЕАЛЬНОГО
+     * размера скачанной модели на диске, а не от константы: при загрузке нужен запас
+     * примерно вдвое плюс место самому приложению.
+     */
+    fun bigNeedsMb(context: Context): Long {
+        val dir = File(context.filesDir, BIG_DIR)
+        val onDisk = try { dir.walkTopDown().filter { it.isFile }.sumOf { it.length() } / (1024 * 1024) } catch (_: Throwable) { 1800L }
+        return onDisk * 2 + 700
+    }
+
     fun isReady(context: Context): Boolean {
         val d = modelDir(context)
         return d.exists() && File(d, "am").exists()
