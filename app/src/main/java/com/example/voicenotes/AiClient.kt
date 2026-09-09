@@ -1,4 +1,4 @@
-﻿package com.example.voicenotes
+package com.example.voicenotes
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -450,7 +450,7 @@ object AiClient {
     }
 
     // Кавычки и обратные апострофы, в которые модель иногда заворачивает ответ.
-    private val QUOTE_CHARS = charArrayOf('\u0022', '\u0027', '\u0060')
+    private const val QUOTE_CHARS = "\u0022\u0027\u0060"   // кавычка, апостроф, обратный апостроф
 
     /** Ответ формально есть, а толку нет: «null», «none», «-», пара символов. */
     private fun isUselessAnswer(text: String): Boolean {
