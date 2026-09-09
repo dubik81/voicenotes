@@ -149,19 +149,52 @@ fun SettingsScreen(
                         HorizontalDivider(Modifier.padding(vertical = 10.dp))
                         // Большая модель Vosk — точнее.
                         var voskBig by remember { mutableStateOf(settings.voskBig) }
-                        ToggleRow("Большая модель Vosk (точнее, ~1.8 ГБ)", voskBig) {
+                        // Не даём включить то, что заведомо не запустится: иначе человек качает
+                        // 1.8 ГБ и получает молчаливую подмену на маленькую модель.
+                        val bigPossible = VoskModelManager.bigFeasible(context)
+                        ToggleRow("Большая модель Vosk (точнее, ~1.8 ГБ)", voskBig && bigPossible) {
+                            if (!bigPossible) return@ToggleRow
                             voskBig = it; settings.voskBig = it
                             VoskModelManager.useBig = it
                         }
                         Text("Более точное офлайн-распознавание. Скачается ~1.8 ГБ при первом " +
                              "использовании (нужен интернет). Маленькая модель (~45 МБ) быстрее, но проще.",
                             fontSize = 11.sp, color = cs.onSurfaceVariant)
-                        // Честное предупреждение: на этом телефоне большая модель может не влезть
-                        // в память — тогда Android убивает приложение прямо при загрузке.
-                        Text("⚠ Большой модели нужно ~${VoskModelManager.bigNeedsMb(context)} МБ свободной памяти " +
-                             "(сейчас свободно ${Diagnostics.availMemMb(context)} МБ). Если не хватит, приложение " +
-                             "закроется при включении микрофона — тогда большая модель отключится сама.",
-                            fontSize = 10.sp, color = cs.onSurfaceVariant)
+                        // ЧЕСТНЫЙ СТАТУС (v126). Раньше приложение молча подставляло маленькую
+                        // модель, и человек не понимал, почему скачанные 1.8 ГБ не работают.
+                        // Теперь прямо сказано: поместится, не хватает сейчас или не
+                        // поддерживается этим устройством вообще — и предложено освободить место.
+                        val bigDownloaded = VoskModelManager.isReadySize(context, true)
+                        val bigNeed = VoskModelManager.bigNeedsMb(context)
+                        val bigFits = VoskModelManager.bigFeasible(context)
+                        val freeNow = Diagnostics.availMemMb(context)
+                        if (bigDownloaded || voskBig) {
+                            Text(
+                                when {
+                                    !bigFits -> "✗ Это устройство не потянет большую модель: ей нужно ~$bigNeed МБ " +
+                                        "оперативной памяти, а Android не отдаёт приложению столько. Работает маленькая."
+                                    freeNow in 0 until bigNeed -> "⚠ Сейчас свободно $freeNow МБ, большой модели нужно " +
+                                        "~$bigNeed МБ. Пока используется маленькая — закройте другие приложения и попробуйте снова."
+                                    else -> "✓ Памяти достаточно ($freeNow МБ из нужных ~$bigNeed МБ)."
+                                },
+                                fontSize = 10.sp,
+                                color = if (!bigFits) Palette.Red else if (freeNow in 0 until bigNeed) Palette.Amber else Palette.Green
+                            )
+                        }
+                        // Если модель скачана, но работать не может — предлагаем вернуть место.
+                        if (bigDownloaded && !bigFits) {
+                            var freed by remember { mutableStateOf(-1L) }
+                            OutlinedButton(
+                                onClick = {
+                                    freed = VoskModelManager.deleteBig(context)
+                                    voskBig = false; settings.voskBig = false
+                                    VoskModelManager.useBig = false
+                                },
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("🗑 Удалить большую модель и освободить место", fontSize = 12.sp) }
+                            if (freed >= 0) Text("Освобождено ~$freed МБ", fontSize = 10.sp, color = Palette.Green)
+                        }
                         Text(if (VoskModelManager.isReadySize(context, true)) "✓ Большая модель скачана"
                              else "Большая модель ещё не скачана",
                             fontSize = 10.sp,

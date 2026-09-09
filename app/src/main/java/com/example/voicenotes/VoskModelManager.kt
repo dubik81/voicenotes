@@ -68,10 +68,44 @@ object VoskModelManager {
      * размера скачанной модели на диске, а не от константы: при загрузке нужен запас
      * примерно вдвое плюс место самому приложению.
      */
-    fun bigNeedsMb(context: Context): Long {
+    /** Сколько места на диске занимает распакованная большая модель, МБ. */
+    fun bigSizeMb(context: Context): Long {
         val dir = File(context.filesDir, BIG_DIR)
-        val onDisk = try { dir.walkTopDown().filter { it.isFile }.sumOf { it.length() } / (1024 * 1024) } catch (_: Throwable) { 1800L }
-        return onDisk * 2 + 700
+        return try { dir.walkTopDown().filter { it.isFile }.sumOf { it.length() } / (1024 * 1024) } catch (_: Throwable) { 0L }
+    }
+
+    /**
+     * Сколько памяти нужно, чтобы браться за большую модель.
+     * v126: было «размер × 2 + 700» — вдвое строже необходимого. Vosk держит модель в
+     * памяти примерно в размер файлов плюс рабочий запас, поэтому считаем честнее.
+     */
+    fun bigNeedsMb(context: Context): Long {
+        val onDisk = bigSizeMb(context).takeIf { it > 0 } ?: 1800L
+        return onDisk + 800
+    }
+
+    /**
+     * Способна ли большая модель ЗАПУСТИТЬСЯ на этом устройстве в принципе.
+     *
+     * Свободная память гуляет (у пользователя от 1786 до 3698 МБ), поэтому сравниваем не
+     * с ней, а с общим объёмом ОЗУ: Android не отдаёт одному приложению больше примерно
+     * половины. Если даже половины не хватает — модель не запустится никогда, и честнее
+     * сказать это прямо, чем каждый раз молча подставлять маленькую.
+     */
+    fun bigFeasible(context: Context): Boolean = try {
+        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+        val mi = android.app.ActivityManager.MemoryInfo(); am.getMemoryInfo(mi)
+        val totalMb = mi.totalMem / (1024 * 1024)
+        totalMb > 0 && bigNeedsMb(context) <= totalMb / 2
+    } catch (_: Throwable) { true }
+
+    /** Удалить скачанную большую модель (освободить место). */
+    fun deleteBig(context: Context): Long {
+        val dir = File(context.filesDir, BIG_DIR)
+        val mb = bigSizeMb(context)
+        try { dir.deleteRecursively() } catch (_: Throwable) {}
+        Diagnostics.info("Большая Vosk удалена, освобождено ~$mb МБ")
+        return mb
     }
 
     fun isReady(context: Context): Boolean {

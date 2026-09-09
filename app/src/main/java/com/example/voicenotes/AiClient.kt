@@ -100,7 +100,17 @@ object AiClient {
                 put(JSONObject().put("role", "system").put("content", sys))
                 put(JSONObject().put("role", "user").put("content", rawText))
             }
-            val temp = when { !vary -> 0.4; level == Level.CLEAN -> 0.6; else -> 0.85 }
+            // Температура. «Чисто» — задача ВОССТАНОВЛЕНИЯ, а не сочинения: чем ниже
+            // температура, тем меньше модель перефразирует и выдумывает. В архиве видно,
+            // к чему приводит высокая: одна модель начала «Итак начинаем. Сегодняшняя
+            // лекция посвящена…» переписала как «Сегодня началась лекция о…» — это уже
+            // не восстановление речи. Совсем в ноль не уводим: у Qwen-подобных моделей
+            // жадное декодирование склонно зацикливаться.
+            val temp = when {
+                level == Level.CLEAN || level == Level.VERBATIM -> if (vary) 0.35 else 0.15
+                !vary -> 0.4
+                else -> 0.85
+            }
             val (text, model) = request(messages, apiKey, temperature = temp)
             Diagnostics.engine("Облако ($level/$tone${if (vary) ", обновить" else ""}): модель $model, ответ ${text.length} симв")
             text

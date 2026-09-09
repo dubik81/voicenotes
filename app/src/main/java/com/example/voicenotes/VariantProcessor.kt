@@ -108,7 +108,72 @@ class VariantProcessor(
         Diagnostics.engine("Обработка вариантов: ОБЛАЧНЫЙ ИИ")
         lastEngine = "облако"
         stageOf[note.id] = "Запрос облаку (все 9 вариантов одним запросом)…"
-        return cleanupMeta(AiClient.processAll(text, settings.apiKey))
+        val all = cleanupMeta(AiClient.processAll(text, settings.apiKey)).toMutableMap()
+        // Облачные результаты проходят ТУ ЖЕ проверку, что и локальные: качество не
+        // должно зависеть от того, какую бесплатную модель выбрал роутер в этот раз.
+        for (tn in Tone.entries) {
+            val cKey = "${Level.CLEAN.ordinal}:${tn.ordinal}"
+            all[cKey]?.let { cand ->
+                val ok = verifyClean(text, cand, "облако")
+                all[cKey] = ok ?: CleanProcessor.clean(text, note.recordMode == "google")
+                if (ok == null) engineOf["${Level.CLEAN.ordinal}"] = "правила (облако исказило)"
+            }
+            val cleanSrc = all[cKey] ?: text
+            for (l in listOf(Level.BRIEF, Level.GIST)) {
+                val sKey = "${l.ordinal}:${tn.ordinal}"
+                all[sKey]?.let { cand ->
+                    val ok = verifySummary(cleanSrc, cand, "облако")
+                    all[sKey] = ok ?: TextCondenser.condense(cleanSrc, l)
+                    if (ok == null) engineOf["${l.ordinal}"] = "правила (облако не пересказало)"
+                }
+            }
+        }
+        return all
+    }
+
+    /**
+     * ВЕРИФИКАЦИЯ «ЧИСТО» — одна и та же для облака и для модели на устройстве (v127).
+     *
+     * Раньше защита слов и проверка потерь стояли только на локальном пути. Но облако
+     * ошибается ровно так же: в архиве одна бесплатная модель восстановила текст почти
+     * идеально, а другая на том же тексте перефразировала начало и выбросила слова.
+     * Какая модель ответит — лотерея, поэтому гарантии перенесены из промпта в КОД:
+     *   • несозвучные замены откатываются к исходным словам;
+     *   • выброшенный фрагмент (6+ слов подряд) — результат не принимается.
+     * Так качество перестаёт зависеть от того, кто именно ответил.
+     */
+    private fun verifyClean(source: String, candidate: String, who: String): String? {
+        val (fixed, rolled) = restoreWords(candidate, source)
+        if (rolled > 0) Diagnostics.info("Защита слов ($who): откачено $rolled замен(ы)")
+        val (lost, lostTxt) = longestLostRun(source, fixed)
+        if (lost >= 6) {
+            Diagnostics.error("Чисто ($who): выброшен фрагмент из $lost слов — «${lostTxt.take(60)}» → отклонено")
+            return null
+        }
+        return fixed
+    }
+
+    /**
+     * ВЕРИФИКАЦИЯ «КРАТКО»/«СУТЬ» — тоже общая для облака и модели на устройстве (v127).
+     *
+     * Измерение по архивам показало: детектор копирования и фильтр мета-речи стояли
+     * только на локальном пути, и облако их обходило. В последнем тесте облачное
+     * «Кратко» на короткой заметке оказалось дословной копией (совпадение 1.00), а на
+     * лекции начиналось с «Лекция охватывает две темы» — описание со стороны вместо
+     * изложения. Возвращает null, если результат не годится: вызывающий берёт правила.
+     */
+    private fun verifySummary(source: String, candidate: String, who: String): String? {
+        val t = LocalAiEngine.cutSecondVariant(stripMetaPreamble(candidate)).trim()
+        if (t.isBlank()) return null
+        if (isMetaTalk(t)) {
+            Diagnostics.error("Пересказ ($who): рассуждение О тексте («${t.take(40)}…») → отклонено")
+            return null
+        }
+        if (LocalAiEngine.isCopyNotSummary(source, t)) {
+            Diagnostics.error("Пересказ ($who): это копия источника, а не изложение → отклонено")
+            return null
+        }
+        return t
     }
 
     /**
@@ -187,7 +252,12 @@ class VariantProcessor(
         val res = LocalAiEngine.processLong(context, prompt, text, settings.localAiModel, noteId = note.id,
             onProgress = { d, t, _ -> partDone[note.id] = d; partTotal[note.id] = t
                 stageOf[note.id] = "Чисто: часть $d из $t" },
-            chunkOk = { chunk, r -> !tooDistorted(r, chunk) && !isCopyOrTruncation(r, chunk) },
+            chunkOk = { chunk, r ->
+                val (lost, lostTxt) = longestLostRun(chunk, r)
+                if (lost >= 6) Diagnostics.error(
+                    "Чисто: выброшен фрагмент из $lost слов подряд — «${lostTxt.take(60)}» → кусок не принят")
+                !tooDistorted(r, chunk) && !isCopyOrTruncation(r, chunk) && lost < 6
+            },
             chunkFix = { chunk, r ->
                 val (fixed, rolled) = restoreWords(r, chunk)
                 if (rolled > 0) {
@@ -629,8 +699,14 @@ class VariantProcessor(
         val result = if (settings.useAI) {
             lastEngine = "облако"
             val r0 = AiClient.process(src, l, t, settings.apiKey, vary)
-            if (l == Level.BRIEF || l == Level.GIST)
-                LocalAiEngine.cutSecondVariant(stripMetaPreamble(r0)) else r0
+            when (l) {
+                Level.BRIEF, Level.GIST -> verifySummary(src, r0, "облако")
+                    ?: run { lastEngine = "правила"; TextCondenser.condense(src, l) }
+                // «Чисто» из облака проходит ту же верификацию, что и локальное.
+                Level.CLEAN -> verifyClean(src, r0, "облако")
+                    ?: run { lastEngine = "правила"; CleanProcessor.clean(src, note.recordMode == "google") }
+                else -> r0
+            }
         } else { lastEngine = "правила"; TextCondenser.condense(src, l) }
 
         // Повтор «результат длиннее источника» — ТОЛЬКО для Кратко и Суть (v126).
@@ -805,6 +881,55 @@ class VariantProcessor(
         return sb.toString() to rolled
     }
 
+    /**
+     * ПОТЕРЯ ФРАГМЕНТА (v127) — сколько слов исходника выброшено ПОДРЯД.
+     *
+     * Это стадия «верификации» из практики исправления распознанной речи: сообщество
+     * специалистов сходится в том, что LLM, переписывая расшифровку целиком, склонна
+     * «переусердствовать» — не только чинить, но и выбрасывать куски. Ловить это надо
+     * не промптом, а проверкой результата.
+     *
+     * Меряем ВЫРАВНИВАНИЕМ с учётом порядка: простая проверка «есть ли слово где-то в
+     * ответе» не годится — в тестовом тексте пропало «Конец первой части. Повторяю ещё
+     * раз: объём от полутора до двух литров», но слова «конец», «части», «объём»
+     * встречались в других местах, и потеря пряталась.
+     *
+     * Замер на 12 реальных заметках из архивов пользователя:
+     *     нормальные результаты  — 0..3 слова подряд («то есть к», «со своими идеями»);
+     *     два испорченных        — 12 слов подряд (выброшено целое предложение).
+     * Между 3 и 12 огромный зазор, поэтому порог 6 устойчив, а не подогнан под тест.
+     */
+    private fun longestLostRun(source: String, result: String): Pair<Int, String> {
+        val src = wordRe.findAll(source).map { it.value }.toList()
+        val res = wordRe.findAll(result).map { it.value }.toList()
+        if (src.size < 8 || res.isEmpty() || src.size > 400 || res.size > 400) return 0 to ""
+        val a = src.map { skeleton(it) }
+        val b = res.map { skeleton(it) }
+        val n = a.size; val m = b.size
+        val d = Array(n + 1) { IntArray(m + 1) }
+        for (i in 0..n) d[i][0] = i
+        for (j in 0..m) d[0][j] = j
+        for (i in 1..n) for (j in 1..m) {
+            val c = if (a[i - 1] == b[j - 1]) 0 else 1
+            d[i][j] = minOf(d[i - 1][j - 1] + c, d[i - 1][j] + 1, d[i][j - 1] + 1)
+        }
+        var i = n; var j = m; var run = 0; var best = 0
+        val cur = ArrayList<String>(); var bestTxt = ""
+        while (i > 0 && j > 0) {
+            val c = if (a[i - 1] == b[j - 1]) 0 else 1
+            when {
+                d[i][j] == d[i - 1][j - 1] + c -> { run = 0; cur.clear(); i--; j-- }
+                d[i][j] == d[i - 1][j] + 1 -> {
+                    run++; cur.add(0, src[i - 1])
+                    if (run > best) { best = run; bestTxt = cur.joinToString(" ") }
+                    i--
+                }
+                else -> j--
+            }
+        }
+        return best to bestTxt
+    }
+
     // ══ ФИЛЬТР МЕТА-РЕЧИ (v118) ═══════════════════════════════════════════════
     // «Кратко» и «Суть» должны продолжать речь человека, а не рассказывать о ней.
     // В тесте «Умом Россию» модель выдала «Автор сравнивает Россию с умом и аршином…» —
@@ -813,7 +938,11 @@ class VariantProcessor(
         "этот текст", "это текст", "данный текст", "в тексте", "в данном тексте", "текст -", "текст —",
         "текст представляет", "текст является", "речь идёт", "речь идет", "здесь говорится",
         "автор ", "рассказчик", "говорящий", "в этом видео", "это сообщение", "это стихотворение",
-        "в лекции говорится", "лектор рассказывает")
+        "в лекции говорится", "лектор рассказывает",
+        // v127, найдено в архиве: облако выдало «Лекция охватывает две темы. Первая — …»
+        // и «Вот текст лекции:» — это описание материала со стороны, а не изложение.
+        "лекция охватывает", "лекция разбирает", "лекция посвящена", "в лекции рассматрив",
+        "вот текст", "текст лекции", "материал охватывает", "запись содержит")
     private val META_PREAMBLES = listOf("краткий пересказ", "короткий пересказ", "кратко:", "суть:", "пересказ:")
     // «Вот краткий пересказ:», «Вот краткое изложение:», «Вот суть:» — любая связка
     // «Вот …:» в начале. Отдельным списком все формы не перечислить (модель склоняет

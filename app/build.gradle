@@ -18,8 +18,8 @@ android {
         applicationId "com.example.voicenotes"
         minSdk 24
         targetSdk 34
-        versionCode 126
-        versionName "126.0"
+        versionCode 128
+        versionName "128.0"
         ndk {
             // Whisper СЂР°Р±РѕС‚Р°РµС‚ С‚РѕР»СЊРєРѕ РЅР° arm64-v8a (РїРѕРєСЂС‹РІР°РµС‚ РІСЃРµ СЃРѕРІСЂРµРјРµРЅРЅС‹Рµ С‚РµР»РµС„РѕРЅС‹,
             // РІРєР»СЋС‡Р°СЏ Samsung S25). РћРіСЂР°РЅРёС‡РµРЅРёРµ СѓРїСЂРѕС‰Р°РµС‚ Рё СѓСЃРєРѕСЂСЏРµС‚ СЃР±РѕСЂРєСѓ.

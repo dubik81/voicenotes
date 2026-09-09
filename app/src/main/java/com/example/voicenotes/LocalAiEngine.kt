@@ -121,6 +121,12 @@ object LocalAiEngine {
     private const val WANT_SEQ_LEN = 640             // просим при явном seqLen (в рамках max_context)
     private const val SAFETY = 0.75                  // запас на неточность оценки «символов в токене»
     private const val CONDENSE_CHUNK = 350           // кусок для сжатия: мелкий кусок модель осиливает
+    // Температура модели. Наша основная задача — ВОССТАНОВЛЕНИЕ речи, а не сочинение:
+    // чем ниже температура, тем меньше модель перефразирует и выдумывает. В ноль не
+    // уводим: у Qwen-подобных моделей жадное декодирование склонно зацикливаться
+    // (об этом прямо предупреждают сами разработчики моделей), а зацикливание мы уже
+    // ловили в ранних версиях. 0.2 — компромисс между точностью и устойчивостью.
+    private const val MODEL_TEMP = 0.2f
     /** Какой вызов generate реально работает: "" (не известно), "4arg", "cfg", "2arg". */
     @Volatile var workingCall: String = ""
         private set
@@ -415,12 +421,12 @@ object LocalAiEngine {
             Diagnostics.info("Токенизатор для загрузки: ${File(tok).name} (режим ${tokMode.ifBlank { "llama" }})")
             val m = try {
                 cls.getConstructor(String::class.java, String::class.java, Float::class.javaPrimitiveType)
-                    .newInstance(path, tok, 0.3f).also { Diagnostics.info("Конструктор: (model,tok,temp)") }
+                    .newInstance(path, tok, MODEL_TEMP).also { Diagnostics.info("Конструктор: (model,tok,temp)") }
             } catch (_: Throwable) {
                 try {
                     cls.getConstructor(Int::class.javaPrimitiveType, String::class.java,
                         String::class.java, Float::class.javaPrimitiveType)
-                        .newInstance(1, path, tok, 0.3f).also { Diagnostics.info("Конструктор: (int,model,tok,temp)") }
+                        .newInstance(1, path, tok, MODEL_TEMP).also { Diagnostics.info("Конструктор: (int,model,tok,temp)") }
                 } catch (_: Throwable) {
                     cls.getConstructor(String::class.java, String::class.java).newInstance(path, tok)
                         .also { Diagnostics.info("Конструктор: (model,tok)") }
