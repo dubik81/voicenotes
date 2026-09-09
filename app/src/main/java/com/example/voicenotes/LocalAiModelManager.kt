@@ -132,6 +132,82 @@ object LocalAiModelManager {
         return "словарь $count токенов, служебные с $minAdded"
     }
 
+    // ══ РАЗВЕДКА МОДЕЛЕЙ (v118) ═══════════════════════════════════════════════
+    // Скорость локального ИИ упирается в формат модели: сейчас стоит НЕквантованная
+    // Qwen 2.5 1.5B bf16 на 3,1 ГБ (~7 токенов/сек). Квантованная (int4/int8) обычно
+    // в 2-4 раза быстрее и грузится втрое быстрее. Но проверить, выложена ли такая
+    // в готовом .pte, можно только из интернета — а он есть у телефона, не у среды
+    // разработки. Поэтому разведку делает само приложение и пишет результат в ЧЯ.
+    //
+    // Спрашиваем СПИСОК ФАЙЛОВ у самого HuggingFace (а не угадываем ссылки): так видно
+    // и то, о чём мы не догадались бы, и размер каждого файла — по размеру сразу ясно,
+    // квантованная модель или нет.
+    private fun httpGetText(url: String, timeoutMs: Int = 15000): String {
+        val c = (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = timeoutMs; readTimeout = timeoutMs
+            instanceFollowRedirects = true
+            setRequestProperty("Accept", "application/json")
+        }
+        try {
+            if (c.responseCode !in 200..299) throw RuntimeException("HTTP ${c.responseCode}")
+            return c.inputStream.bufferedReader().use { it.readText() }
+        } finally { c.disconnect() }
+    }
+
+    /** Известные репозитории + поиск по HuggingFace. Результат — отчёт для ЧЯ и экрана. */
+    suspend fun discoverModels(context: Context): String =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val sb = StringBuilder("=== РАЗВЕДКА МОДЕЛЕЙ ===\n")
+            val installed = MODELS.values.filter { modelFile(context, it.id).exists() }.map { it.fileName }.toSet()
+            val repos = LinkedHashSet<String>()
+            repos.add("software-mansion/react-native-executorch-qwen-2.5")
+            repos.add("executorch-community/Qwen2.5-1.5B-Instruct-ET")
+            repos.add("executorch-community/Llama-3.2-1B-Instruct-SpinQuant_INT4_EO8-ET")
+            // Поиск — вдруг появились новые репозитории с .pte для Qwen.
+            for (q in listOf("executorch%20qwen", "qwen%20executorch%20pte")) {
+                try {
+                    val arr = org.json.JSONArray(httpGetText("https://huggingface.co/api/models?search=$q&limit=15"))
+                    for (i in 0 until arr.length())
+                        arr.optJSONObject(i)?.optString("id")?.takeIf { it.isNotBlank() }?.let { repos.add(it) }
+                } catch (e: Throwable) { sb.append("поиск: не удался (${e.message?.take(40)})\n") }
+            }
+            var pteCount = 0; var smaller = 0
+            val curMb = MODELS["qwen"]?.sizeMb ?: 3100
+            for (repo in repos) {
+                val lines = ArrayList<String>()
+                try {
+                    val arr = org.json.JSONArray(
+                        httpGetText("https://huggingface.co/api/models/$repo/tree/main?recursive=true"))
+                    for (i in 0 until arr.length()) {
+                        val o = arr.optJSONObject(i) ?: continue
+                        val path = o.optString("path")
+                        val isPte = path.endsWith(".pte")
+                        if (!isPte && !path.contains("tokenizer")) continue
+                        // у больших файлов реальный размер лежит в lfs.size
+                        val size = o.optJSONObject("lfs")?.optLong("size", 0L)?.takeIf { it > 0 }
+                            ?: o.optLong("size", 0L)
+                        val mb = (size / 1048576L).toInt()
+                        val mark = when {
+                            path.substringAfterLast('/') in installed -> "  [установлена]"
+                            isPte && mb in 1 until curMb -> "  ← кандидат (меньше текущей)"
+                            else -> ""
+                        }
+                        if (isPte) { pteCount++; if (mb in 1 until curMb) smaller++ }
+                        lines.add("  $path — $mb МБ$mark")
+                    }
+                } catch (e: Throwable) {
+                    sb.append("$repo — ${e.message?.take(50)}\n"); continue
+                }
+                if (lines.isEmpty()) continue
+                sb.append("$repo\n")
+                lines.take(20).forEach { sb.append(it).append('\n') }
+            }
+            sb.append("Итог: .pte файлов найдено $pteCount, из них меньше текущей ($curMb МБ): $smaller\n")
+            sb.append("Текущая модель: ${MODELS["qwen"]?.fileName} ($curMb МБ), токенизаторы проверены выше.")
+            Diagnostics.info(sb.toString())
+            sb.toString()
+        }
+
     fun hasTokenizer(context: Context, modelId: String): Boolean =
         tokenizerFile(context, modelId).let { it.exists() && it.length() > 1000 }
 

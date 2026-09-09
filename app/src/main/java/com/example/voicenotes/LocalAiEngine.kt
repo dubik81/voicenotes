@@ -42,6 +42,74 @@ object LocalAiEngine {
     @Volatile private var loadedId: String? = null
     @Volatile private var lastResetOk: Boolean = true
 
+    // ── v118: изоляция заметок вместо перезагрузки перед каждым вызовом ────────
+    // До v118 модель выгружалась ПЕРЕД КАЖДОЙ генерацией (v100) — это лечило «Qwen
+    // молчит на повторах», но настоящей причиной был сломанный токенизатор (модель не
+    // читала кириллицу). Цена: на лекции 40 перезагрузок × 3 с = 120 с и сильный нагрев
+    // (каждый раз читается файл модели на 3 ГБ).
+    // Теперь выгружаем только там, где это реально защищает:
+    //   • смена заметки — гарантия против утечки текста между заметками (задача №4, v75);
+    //   • resetContext не сработал;
+    //   • пустой ответ — один повтор с чистого состояния;
+    //   • сторож поймал утечку.
+    // Заметка, для которой модель генерировала ПОСЛЕДНИЙ раз. Сравнение идёт внутри
+    // genMutex по id, переданному вместе с запросом: фон может обрабатывать две заметки
+    // вперемешку, и глобальный «текущий id» тут был бы ненадёжен.
+    @Volatile private var lastGenNote: Long = Long.MIN_VALUE
+    // Текст ПРЕДЫДУЩЕЙ заметки — эталон для сторожа утечек (см. leakFragment).
+    @Volatile private var prevNoteText: String = ""
+    private val noteTexts = HashMap<Long, String>()
+    /** Сколько раз сторож поймал утечку за сессию (видно в снимке окружения). */
+    @Volatile var leaksCaught: Int = 0
+        private set
+    // Счётчики для контроля скорости по чёрному ящику: время генерации прямо
+    // пропорционально числу выданных символов, а перезагрузки — это по 3 с каждая.
+    @Volatile var reloads: Int = 0
+        private set
+    @Volatile var generations: Int = 0
+        private set
+    @Volatile var charsGenerated: Long = 0
+        private set
+    @Volatile var genMillis: Long = 0
+        private set
+
+    /**
+     * Запоминает исходный текст заметки — эталон для сторожа утечек. Сама перезагрузка
+     * модели при смене заметки происходит в generate() по переданному noteId.
+     */
+    @Synchronized
+    fun beginNote(noteId: Long, sourceText: String) {
+        if (sourceText.isNotBlank()) noteTexts[noteId] = sourceText
+        // не даём словарю расти бесконечно — эталон нужен только для соседних заметок
+        if (noteTexts.size > 8) {
+            val keep = noteTexts.entries.take(4).associate { it.key to it.value }
+            noteTexts.clear(); noteTexts.putAll(keep)
+        }
+    }
+
+    /**
+     * СТОРОЖ УТЕЧЕК. Если resetContext подведёт, модель может подмешать текст прошлой
+     * заметки. Признак: цепочка из 4+ слов подряд, которая ЕСТЬ в прошлой заметке и
+     * ОТСУТСТВУЕТ в текущем источнике. Случайное совпадение четырёх слов подряд
+     * практически невозможно, поэтому ложных срабатываний нет.
+     */
+    private fun leakFragment(result: String, source: String): String? {
+        if (prevNoteText.length < 40) return null
+        fun words(s: String) = s.lowercase().split(Regex("[^а-яёa-z0-9]+")).filter { it.isNotBlank() }
+        val prev = words(prevNoteText); if (prev.size < 4) return null
+        val prevSet = HashSet<String>()
+        for (i in 0..prev.size - 4) prevSet.add(prev.subList(i, i + 4).joinToString(" "))
+        val src = words(source)
+        val srcSet = HashSet<String>()
+        for (i in 0..maxOf(0, src.size - 4)) if (src.size >= 4) srcSet.add(src.subList(i, i + 4).joinToString(" "))
+        val res = words(result)
+        for (i in 0..res.size - 4) {
+            val key = res.subList(i, i + 4).joinToString(" ")
+            if (key in prevSet && key !in srcSet) return key
+        }
+        return null
+    }
+
     // ── v116: бюджет длины ─────────────────────────────────────────────────────
     // Разбор логов v115: 2-арг generate(prompt, cb) = generate(prompt, seqLen=128, ...).
     // 128 — это ОБЩИЙ лимит токенов (промпт + ответ). Промпт ~400 симв (~90 ток.)
@@ -59,6 +127,9 @@ object LocalAiEngine {
     // Один вызов модели в один момент: параллельные запуски (быстрое переключение
     // тумблера) раньше налезали друг на друга.
     private val genMutex = Mutex()
+    // Отдельный замок на пробу режима токенизатора (её могут запустить одновременно
+    // обработка и самопроверка — раньше модель гонялась дважды).
+    private val probeMutex = Mutex()
 
     // ── v117: режим промпта/токенизатора: "llama" (формат Llama 3, рабочий в v98–v102),
     //    "chatml" (родной Qwen), "tiktoken" (словарь конвертирован, ChatML через псевдонимы).
@@ -82,12 +153,23 @@ object LocalAiEngine {
             LocalAiModelManager.tiktokenFile(context, modelId).absolutePath
         else LocalAiModelManager.tokenizerFile(context, modelId).absolutePath
 
-    /** Ответ похож на отказ ассистента («Извините, я не могу…») — это не результат. */
+    /**
+     * Ответ похож на отказ ассистента («Извините, я не могу…») — это не результат.
+     * v118: раньше искали извинение ГДЕ УГОДНО в первых 120 символах — и забраковали
+     * хороший пересказ лекции, где слово «извините» произнёс сам лектор («…на этом конец
+     * лекции, извините, что…»). Теперь отказ = извинение В НАЧАЛЕ ответа И рядом отказная
+     * формула («не могу», "cannot"). Одно без другого отказом не считается.
+     */
     fun isRefusal(t: String): Boolean {
-        val l = t.trim().lowercase().take(120)
-        return listOf("извините", "простите", "к сожалению", "я не могу", "не могу помочь", "не могу понять",
-            "i apologize", "i'm sorry", "i am sorry", "i cannot", "i can't", "i'm not able", "as an ai")
-            .any { l.startsWith(it) || l.contains(" $it") }
+        val l = t.trim().lowercase().take(160)
+        val opensWithApology = listOf("извините", "простите", "к сожалению", "прошу прощения",
+            "i apologize", "i'm sorry", "i am sorry", "sorry,", "as an ai").any { l.startsWith(it) }
+        val opensWithRefusal = listOf("я не могу", "не могу помочь", "не могу понять", "не могу воспроизвести",
+            "i cannot", "i can't", "i'm not able", "i am not able").any { l.startsWith(it) }
+        if (opensWithRefusal) return true
+        if (!opensWithApology) return false
+        return listOf("не мог", "не в состоянии", "cannot", "can't", "not able", "unable")
+            .any { l.contains(it) }
     }
 
     /**
@@ -103,6 +185,16 @@ object LocalAiEngine {
     private suspend fun ensureTokMode(context: Context, modelId: String) {
         if (!modelId.startsWith("qwen")) { if (tokMode.isBlank()) tokMode = "llama"; return }
         if (loadTokMode(context, modelId).isNotBlank()) return
+        // v118: пробу запускали и generate, и самопроверка — они шли ПАРАЛЛЕЛЬНО и гоняли
+        // модель дважды (в логе v117 сдвоенные строки «Токенизатор для загрузки»). Один
+        // замок на пробу: второй вызов ждёт и уходит по готовому результату.
+        probeMutex.withLock {
+            if (loadTokMode(context, modelId).isNotBlank()) return
+            probeModes(context, modelId)
+        }
+    }
+
+    private suspend fun probeModes(context: Context, modelId: String) {
         Diagnostics.info("ПРОБА РЕЖИМА ПРОМПТА (один раз): llama → chatml → tiktoken; тест «яблоко»")
         for (mode in listOf("llama", "chatml", "tiktoken")) {
             try {
@@ -154,7 +246,7 @@ object LocalAiEngine {
     }
 
     suspend fun generate(context: Context, systemPrompt: String, userText: String, modelId: String,
-                         maxNewTok: Int = 0): String? =
+                         maxNewTok: Int = 0, noteId: Long = Long.MIN_VALUE): String? =
         withContext(Dispatchers.IO) {
           genMutex.withLock {
             if (!currentCoroutineContext().isActive) return@withContext null   // обработку отменили, пока ждали очередь
@@ -174,32 +266,67 @@ object LocalAiEngine {
                 if (moduleClass() == null) {
                     lastStatus = "класс ExecuTorch не найден"; return@withContext null
                 }
-                // Защита от утечки между заметками: если прошлый сброс контекста НЕ сработал,
-                // принудительно выгружаем модуль — следующая загрузка будет с чистым состоянием.
-                // ВСЕГДА выгружаем модель перед генерацией — каждый вызов "свежий",
-                // как первый. Иначе состояние копится → callback=0 (Qwen молчит на
-                // последующих вызовах). Это возвращает хорошее поведение Qwen.
-                releaseCurrent()
-                Diagnostics.info("Модель выгружена перед генерацией (свежий старт)")
+                // Перезагрузка модели ТОЛЬКО когда она защищает (см. блок про изоляцию
+                // заметок наверху файла). Внутри одной заметки модель остаётся в памяти,
+                // контекст чистится resetContext в runGenerate.
+                // Смена заметки определяется ЗДЕСЬ, под общим замком, по id самого запроса —
+                // тогда чередование фоновых обработок двух заметок не может обмануть проверку.
+                if (noteId != lastGenNote) {
+                    if (lastGenNote != Long.MIN_VALUE) {
+                        prevNoteText = noteTexts[lastGenNote].orEmpty()
+                        releaseCurrent()
+                        Diagnostics.info("Перезагрузка модели: смена заметки (было #$lastGenNote, стало #$noteId)")
+                    }
+                    lastGenNote = noteId
+                } else if (!lastResetOk && module != null) {
+                    releaseCurrent()
+                    Diagnostics.info("Перезагрузка модели: прошлый resetContext не сработал")
+                } else if (module != null) {
+                    Diagnostics.info("Модель уже в памяти, сброс контекста (без перезагрузки)")
+                }
                 val mod = loadModule(context, modelId)
                 if (mod == null) { lastStatus = "модель не загрузилась"; return@withContext null }
                 val fullPrompt = buildPrompt(modelId, systemPrompt, userText)
-                // Сколько токенов ответа просить: по длине входа (Чисто ≈ вход ×1.4) или подсказка.
+                // Сколько токенов ответа просить. Раньше всегда вход×1.4 — для суммаризации
+                // это втрое больше нужного, а время генерации прямо пропорционально длине
+                // ответа. Теперь уровень передаёт свой лимит (maxNewTok).
                 val wantOut = if (maxNewTok > 0) maxNewTok else ((userText.length / CHARS_PER_TOKEN) * 1.4).toInt() + 24
+                val tGen0 = System.currentTimeMillis()
                 var raw = runGenerate(mod, fullPrompt, wantOut)
                 // Qwen иногда молчит на первом вызове (callback=0). Повтор один раз.
                 if (raw.isNullOrBlank()) {
-                    Diagnostics.info("Пустой ответ — повтор генерации")
+                    Diagnostics.info("Пустой ответ — перезагрузка и повтор генерации")
                     releaseCurrent()
                     val mod2 = loadModule(context, modelId)
                     if (mod2 != null) raw = runGenerate(mod2, fullPrompt, wantOut)
                 }
                 // Очищаем ответ от эха промпта и JSON-статистики.
-                val cleaned = cleanResponse(raw, fullPrompt, systemPrompt, userText)
+                var cleaned = cleanResponse(raw, fullPrompt, systemPrompt, userText)
+                generations++
+                genMillis += System.currentTimeMillis() - tGen0
+                charsGenerated += (cleaned?.length ?: 0).toLong()
                 lastStatus = if (cleaned.isNullOrBlank()) "генерация пустая" else "работает"
                 if (!cleaned.isNullOrBlank()) Diagnostics.event("Ответ модели (${cleaned.length} симв): \"${cleaned.take(70).replace('\n', ' ')}…\"")
-                if (!cleaned.isNullOrBlank() && isRefusal(cleaned)) {
-                    Diagnostics.error("Ответ модели — ОТКАЗ («${cleaned.take(40)}…») → считаем провалом")
+                // СТОРОЖ УТЕЧЕК: текст из прошлой заметки в ответе → перезагрузка и один повтор.
+                if (!cleaned.isNullOrBlank()) {
+                    val leak = leakFragment(cleaned!!, userText)
+                    if (leak != null) {
+                        leaksCaught++
+                        Diagnostics.error("УТЕЧКА: в ответе фрагмент прошлой заметки «$leak» → перезагрузка, повтор")
+                        releaseCurrent()
+                        val mod3 = loadModule(context, modelId)
+                        cleaned = if (mod3 != null)
+                            cleanResponse(runGenerate(mod3, fullPrompt, wantOut), fullPrompt, systemPrompt, userText)
+                        else null
+                        if (cleaned != null && leakFragment(cleaned!!, userText) != null) {
+                            Diagnostics.error("УТЕЧКА повторилась → результат отброшен")
+                            lastStatus = "утечка контекста"
+                            return@withContext null
+                        }
+                    }
+                }
+                if (!cleaned.isNullOrBlank() && isRefusal(cleaned!!)) {
+                    Diagnostics.error("Ответ модели — ОТКАЗ («${cleaned!!.take(40)}…») → считаем провалом")
                     lastStatus = "модель отказалась"
                     return@withContext null
                 }
@@ -268,6 +395,7 @@ object LocalAiEngine {
         return try {
             if (module != null && loadedId == modelId) return module
             releaseCurrent()
+            reloads++          // реальная загрузка модели с диска (~3 с на файл 3 ГБ)
             val cls = moduleClass() ?: return null
             // Логируем доступные конструкторы.
             Diagnostics.info("Конструкторы LlmModule: ${cls.constructors.joinToString { c -> "(${c.parameterTypes.joinToString{p->p.simpleName}})" }}")
@@ -427,9 +555,12 @@ object LocalAiEngine {
      * Кусок, который модель испортила/не вернула, остаётся как был (текст не теряется).
      */
     suspend fun processLong(context: Context, systemPrompt: String, text: String,
-                            modelId: String,
+                            modelId: String, noteId: Long = Long.MIN_VALUE,
                             onProgress: ((done: Int, total: Int, partial: String) -> Unit)? = null,
-                            chunkOk: ((chunk: String, result: String) -> Boolean)? = null): String? =
+                            chunkOk: ((chunk: String, result: String) -> Boolean)? = null,
+                            // v118: правка результата куска ДО проверки — сюда подключена
+                            // пословная защита от порчи слов (см. VariantProcessor.restoreWords).
+                            chunkFix: ((chunk: String, result: String) -> String)? = null): String? =
         withContext(Dispatchers.IO) {
             val start = System.currentTimeMillis()
             var target = chunkChars(systemPrompt, outRatio = 1.1)
@@ -447,7 +578,13 @@ object LocalAiEngine {
                 val total = i + 1 + (rest.length + target - 1) / target
                 i++
                 val t0 = System.currentTimeMillis()
-                val r = generate(context, systemPrompt, chunk, modelId)
+                // «Чисто» = восстановление того же текста: ответ примерно равен входу.
+                // Раньше просили вход×1.4 — лишние токены модель тратила на «продолжение
+                // разговора за себя», а время генерации прямо пропорционально их числу.
+                val wantOut = ((chunk.length * 1.15) / CHARS_PER_TOKEN).toInt() + 16
+                val raw = generate(context, systemPrompt, chunk, modelId, maxNewTok = wantOut, noteId = noteId)
+                // Пословная защита: несозвучные замены откатываются к исходным словам.
+                val r = if (!raw.isNullOrBlank() && chunkFix != null) chunkFix(chunk, raw) else raw
                 val good = !r.isNullOrBlank() && r.length <= chunk.length * 2 && r.length >= chunk.length / 2 &&
                     !isLoopyLocal(r) && (chunkOk?.invoke(chunk, r) ?: true)
                 val piece = if (good) r!! else chunk
@@ -464,53 +601,49 @@ object LocalAiEngine {
         }
 
     /**
-     * СУММАРИЗАЦИЯ длинного текста (Кратко/Суть) по схеме «карта → свёртка»:
-     * каждый кусок → короткий пересказ; пересказы склеиваются; если склейка всё ещё
-     * не влезает в бюджет — повторяем раунд; в конце один финальный проход с itogPrompt.
-     * Для короткого текста — один вызов.
+     * СЖАТИЕ ТЕКСТА В ЗАДАННУЮ ДОЛЮ (v118) — для «Кратко» (≈50%) и «Суть» (≈25%).
+     *
+     * Почему не прежняя «карта → свёртка»: она сжимала КАЖДЫЙ кусок до 1-2 предложений
+     * (то есть раз в десять), потом склеивала и повторяла раундами. На многотемной
+     * лекции соседние куски сваривались в одну фразу — отсюда «в онлайн-лекциях
+     * пользователи формируют текст заголовками и пунками». Плюс 4 раунда генерации.
+     *
+     * Здесь сжатие ЛОКАЛЬНОЕ: каждый кусок ужимается на своём месте в ту же долю,
+     * порядок сохраняется, темы не перемешиваются, раундов нет. Один проход по тексту.
+     * Кусок, который модель не осилила, ужимается правилами — текст не теряется.
+     *
+     * @param ratio доля от исходной длины (0.5 = вдвое короче)
      */
-    suspend fun summarize(context: Context, chunkPrompt: String, finalPrompt: String, text: String,
-                          modelId: String,
-                          onProgress: ((done: Int, total: Int, partial: String) -> Unit)? = null): String? =
+    suspend fun condense(context: Context, prompt: String, text: String, modelId: String, ratio: Double,
+                         noteId: Long = Long.MIN_VALUE,
+                         onProgress: ((done: Int, total: Int, partial: String) -> Unit)? = null): String? =
         withContext(Dispatchers.IO) {
             val start = System.currentTimeMillis()
-            val target = chunkChars(finalPrompt, outRatio = 0.6)
-            if (text.length <= target) {
-                return@withContext generate(context, finalPrompt, text, modelId)?.takeIf { !isLoopyLocal(it) }
+            val target = chunkChars(prompt, outRatio = ratio)
+            val chunks = if (text.length <= target) listOf(text.trim()) else splitIntoChunks(text, target)
+            Diagnostics.info("Сжатие до ${(ratio * 100).toInt()}%: текст ${text.length} симв, ${chunks.size} кусков по ~$target")
+            val parts = ArrayList<String>()
+            var okCount = 0
+            for ((i, ch) in chunks.withIndex()) {
+                if (!currentCoroutineContext().isActive) { Diagnostics.info("Сжатие прервано (отмена)"); break }
+                val t0 = System.currentTimeMillis()
+                // Просим ровно столько токенов, сколько нужно на долю ratio (+запас 20%).
+                val wantOut = ((ch.length * ratio * 1.2) / CHARS_PER_TOKEN).toInt().coerceAtLeast(24)
+                val r = generate(context, prompt, ch, modelId, maxNewTok = wantOut, noteId = noteId)
+                // Годится, если модель реально сжала (не длиннее входа) и не зациклилась.
+                val good = !r.isNullOrBlank() && !isLoopyLocal(r) && r.length <= ch.length &&
+                    r.length >= minOf(20, ch.length / 4)
+                parts.add(if (good) r!!.trim() else TextCondenser.condense(ch, Level.BRIEF))
+                if (good) okCount++
+                Diagnostics.event("Сжатие, кусок ${i + 1}/${chunks.size} (${ch.length}→${parts.last().length} симв): " +
+                    "${if (good) "модель" else "правила"} (${System.currentTimeMillis() - t0} мс)")
+                onProgress?.invoke(i + 1, chunks.size, parts.joinToString(" "))
             }
-            var current = text
-            var round = 0
-            var totalCalls = 0
-            while (current.length > target && round < 4) {
-                round++
-                val chunks = splitIntoChunks(current, chunkChars(chunkPrompt, outRatio = 0.5))
-                Diagnostics.info("Суммаризация, раунд $round: ${chunks.size} кусков (текст ${current.length} симв)")
-                val parts = ArrayList<String>()
-                for ((i, ch) in chunks.withIndex()) {
-                    if (!currentCoroutineContext().isActive) { Diagnostics.info("Суммаризация прервана (отмена)"); return@withContext null }
-                    val r = generate(context, chunkPrompt, ch, modelId)
-                    totalCalls++
-                    val good = !r.isNullOrBlank() && !isLoopyLocal(r) && r.length < ch.length * 1.2
-                    // кусок, который модель не смогла пересказать, берём укороченным правилами
-                    parts.add(if (good) r!!.trim() else TextCondenser.condense(ch, Level.BRIEF))
-                    onProgress?.invoke(i + 1, chunks.size, parts.joinToString(" "))
-                }
-                val next = parts.joinToString(" ").replace(Regex("\\s+"), " ").trim()
-                if (next.isBlank() || next.length >= current.length) {
-                    // не сжимается — выходим с тем, что есть
-                    Diagnostics.info("Суммаризация: раунд не сжал текст, стоп")
-                    current = next.ifBlank { current }; break
-                }
-                current = next
-            }
-            if (!currentCoroutineContext().isActive) return@withContext null
-            // финальный проход: из склейки пересказов делаем итог
-            val fin = if (current.length <= target) generate(context, finalPrompt, current, modelId)
-                      else generate(context, finalPrompt, current.take(target), modelId)
-            totalCalls++
-            Diagnostics.info("Суммаризация завершена: $totalCalls вызовов, ${System.currentTimeMillis()-start} мс")
-            val res = fin?.takeIf { !isLoopyLocal(it) } ?: current
-            res.trim().ifBlank { null }
+            val res = parts.joinToString(" ").replace(Regex("\\s+"), " ").trim()
+            Diagnostics.info("Сжатие завершено: моделью $okCount из ${chunks.size} кусков, " +
+                "${text.length}→${res.length} симв за ${System.currentTimeMillis() - start} мс")
+            if (okCount == 0) return@withContext null
+            res.ifBlank { null }
         }
 
     /** Принудительная выгрузка модели — следующая генерация с чистого состояния. */
@@ -625,13 +758,25 @@ object LocalAiEngine {
         val sys = "Ответь одним словом."; val usr = "Скажи: привет"
         val fp = buildPrompt(modelId, sys, usr)
         val out = cleanResponse(runGenerate(mod, fp), fp, sys, usr)
+        // v118: раньше ЛЮБОЙ непустой ответ засчитывался как «РАБОТАЕТ» — и самопроверка
+        // писала «OK Локальный ИИ работает!», когда модель отвечала «I apologize, but I'm
+        // not able to understand…», то есть не читала русский вообще. Теперь проверяем,
+        // что модель ПОНЯЛА задание: в ответе должно быть само слово «привет».
         val genOk = !out.isNullOrBlank()
-        if (genOk) {
-            sb.append("5. Генерация: РАБОТАЕТ (${System.currentTimeMillis()-t1} мс)\n")
+        val understands = genOk && out!!.lowercase().contains("привет")
+        if (!genOk) sb.append("5. Генерация: пустой результат\n")
+        else {
+            sb.append("5. Генерация: ${if (understands) "РАБОТАЕТ" else "отвечает, но задание НЕ понято"} " +
+                "(${System.currentTimeMillis()-t1} мс)\n")
             sb.append("   ответ: ").append(out!!.take(60)).append("\n")
-        } else sb.append("5. Генерация: пустой результат\n")
-        sb.append("\nИтог: ").append(if (genOk) "OK Локальный ИИ работает!" else "Модель грузится, но не генерирует.")
-        lastStatus = if (genOk) "работает" else "генерация пустая"
+            if (!understands) sb.append("   ожидалось слово «привет» — похоже на проблему токенизатора\n")
+        }
+        sb.append("\nИтог: ").append(when {
+            understands -> "OK Локальный ИИ работает!"
+            genOk -> "Модель отвечает, но не понимает русский текст (режим токенизатора: $tokMode)."
+            else -> "Модель грузится, но не генерирует."
+        })
+        lastStatus = if (understands) "работает" else if (genOk) "не понимает русский" else "генерация пустая"
         Diagnostics.info("САМОПРОВЕРКА:\n$sb")
         sb.toString()
     }

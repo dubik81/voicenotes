@@ -32,8 +32,13 @@ class VariantProcessor(
         jobs.remove(noteId)
         Diagnostics.action("Обработка ИИ отменена пользователем")
     }
-    private val progressDone = mutableStateMapOf<Long, Int>()
+    // ПРОГРЕСС в два уровня (v118). Раньше и «готово вариантов», и «кусок N из M»
+    // писались в ОДНУ пару счётчиков и затирали друг друга: куски добегали до 100%,
+    // следом счётчик вариантов сбрасывал полосу к 20% — она мигала на каждом варианте.
+    private val progressDone = mutableStateMapOf<Long, Int>()    // готовых вариантов
     private val progressTotal = mutableStateMapOf<Long, Int>()
+    private val partDone = mutableStateMapOf<Long, Int>()        // кусков внутри текущей ступени
+    private val partTotal = mutableStateMapOf<Long, Int>()
     private val activeNote = mutableStateMapOf<Long, Boolean>()
 
     // Пауза между ИИ-запросами, чтобы не упереться в лимит (20/мин → ~3.2с).
@@ -53,6 +58,9 @@ class VariantProcessor(
     fun stage(noteId: Long): String = stageOf[noteId] ?: ""
     fun doneCount(noteId: Long): Int = progressDone[noteId] ?: 0
     fun totalCount(noteId: Long): Int = progressTotal[noteId] ?: 0
+    /** Кусков обработано / всего внутри текущей ступени (0 — ступень не делится). */
+    fun partDoneCount(noteId: Long): Int = partDone[noteId] ?: 0
+    fun partTotalCount(noteId: Long): Int = partTotal[noteId] ?: 0
 
     private fun k(noteId: Long, l: Level, t: Tone) = "$noteId:${l.ordinal}:${t.ordinal}"
     fun stateOf(noteId: Long, l: Level, t: Tone): State? = states[k(noteId, l, t)]
@@ -84,7 +92,26 @@ class VariantProcessor(
         Diagnostics.engine("Обработка вариантов: ОБЛАЧНЫЙ ИИ")
         lastEngine = "облако"
         stageOf[note.id] = "Запрос облаку (все 9 вариантов одним запросом)…"
-        return AiClient.processAll(text, settings.apiKey)
+        return cleanupMeta(AiClient.processAll(text, settings.apiKey))
+    }
+
+    /**
+     * Срезает у облачных Кратко/Суть зачины «Вот краткий пересказ:» (v118).
+     * Рассуждение О тексте («Автор сравнивает Россию с умом…») в облаке встречается реже,
+     * чем у локальной модели, но зачин-предисловие бывает — убираем его молча.
+     */
+    private fun cleanupMeta(src: Map<String, String>): Map<String, String> {
+        val out = HashMap<String, String>(src.size)
+        var cut = 0
+        for ((k2, v) in src) {
+            val lvl = k2.substringBefore(':').toIntOrNull()
+            val isSummary = lvl == Level.BRIEF.ordinal || lvl == Level.GIST.ordinal
+            val nv = if (isSummary) stripMetaPreamble(v) else v
+            if (nv !== v && nv != v) cut++
+            out[k2] = nv
+        }
+        if (cut > 0) Diagnostics.info("Облако: убран зачин-предисловие в $cut вариант(ах)")
+        return out
     }
 
     // Метка движка, которым получен последний результат (для истории версий).
@@ -92,21 +119,46 @@ class VariantProcessor(
     private fun localLabel() = "на устройстве (${settings.localAiModel})"
 
     // ── Промпты локальной модели: КОРОТКИЕ и КОНКРЕТНЫЕ (1.5B теряется в длинных).
-    private val LOCAL_CLEAN = "Исправь текст: расставь точки и запятые по смыслу, исправь ошибки распознавания. Все слова и смысл сохрани. Выведи только текст."
-    private val LOCAL_BRIEF_CHUNK = "Перескажи коротко, в 1-2 предложениях, сохранив факты:"
-    private val LOCAL_BRIEF = "Кратко перескажи этот текст в 2-3 предложениях. Факты не заменяй общими словами:"
-    private val LOCAL_GIST = "О чём этот текст? Ответь одним-двумя предложениями, не искажая смысл:"
-    private val LOCAL_LECTURE_BRIEF = "Это лекция. Кратко изложи её содержание в 3-4 предложениях:"
-    private val LOCAL_LECTURE_GIST = "Это лекция. Одним-двумя предложениями: о чём она?"
+    //
+    // «Чисто» — это НЕ улучшение текста, а ВОССТАНОВЛЕНИЕ речи. На вход приходит машинная
+    // расшифровка звука: программа разбирала запись слово за словом, подменяла созвучные
+    // слова («робуста»→«работа», «Машу и Петю»→«какой машине и плетью») и расставила знаки
+    // формально. Модель должна восстановить, что человек сказал на самом деле, и разбить
+    // на предложения ПО СМЫСЛУ, а не по машинным точкам.
+    private val LOCAL_CLEAN = "Программа распознала речь с ошибками. Восстанови, что человек сказал. " +
+        "Бессмысленное слово замени похожим по звучанию. Понятные слова не трогай. " +
+        "Точки и запятые ставь по смыслу. Ничего не сокращай и не добавляй. В ответе только текст."
+    // «Кратко» — то же самое вдвое короче, БЕЗ анализа и пересказа со стороны.
+    private val LOCAL_BRIEF = "Изложи этот текст примерно вдвое короче. От того же лица, в том же порядке. " +
+        "Не анализируй и не объясняй. Смысл не меняй. В ответе только текст."
+    private val LOCAL_GIST = "Изложи самое главное из этого текста, коротко. " +
+        "Не анализируй и не объясняй, не пиши «в тексте говорится». В ответе только текст."
+    private val LOCAL_LECTURE_BRIEF = "Это запись лекции. Изложи её примерно вдвое короче, " +
+        "сохранив все темы и порядок изложения. Не анализируй. В ответе только текст."
+    private val LOCAL_LECTURE_GIST = "Это запись лекции. Изложи самое главное по всем её темам, коротко. " +
+        "Не анализируй. В ответе только текст."
+
+    // Доля от исходной длины: Кратко ≈ половина, Суть ≈ четверть.
+    private fun ratioOf(l: Level) = if (l == Level.GIST) 0.25 else 0.5
 
     /** Локальное «Чисто»: модель по кускам; кусок, который модель исказила, — правилами. */
     private suspend fun localClean(note: Note, text: String, prompt: String = LOCAL_CLEAN): String {
         val googleCaps = note.recordMode == "google"
         stageOf[note.id] = "Чисто: модель на устройстве…"
-        val res = LocalAiEngine.processLong(context, prompt, text, settings.localAiModel,
-            onProgress = { d, t, _ -> progressDone[note.id] = d; progressTotal[note.id] = t
+        var rolledTotal = 0
+        val res = LocalAiEngine.processLong(context, prompt, text, settings.localAiModel, noteId = note.id,
+            onProgress = { d, t, _ -> partDone[note.id] = d; partTotal[note.id] = t
                 stageOf[note.id] = "Чисто: часть $d из $t" },
-            chunkOk = { chunk, r -> !tooDistorted(r, chunk) && !isCopyOrTruncation(r, chunk) })
+            chunkOk = { chunk, r -> !tooDistorted(r, chunk) && !isCopyOrTruncation(r, chunk) },
+            chunkFix = { chunk, r ->
+                val (fixed, rolled) = restoreWords(r, chunk)
+                if (rolled > 0) {
+                    rolledTotal += rolled
+                    Diagnostics.info("Защита слов: откачено $rolled замен(ы) к исходным словам")
+                }
+                fixed
+            })
+        if (rolledTotal > 0) Diagnostics.engine("Чисто: защита слов вернула $rolledTotal слов(а) из Дословно")
         return if (!res.isNullOrBlank() && res != text) {
             // финальная косметика правилами (двойная пунктуация, заглавные)
             Diagnostics.engine("Чисто: локальная модель (${res.length} симв из ${text.length})")
@@ -119,9 +171,14 @@ class VariantProcessor(
         }
     }
 
-    /** Локальная суммаризация (Кратко/Суть) с картой-свёрткой для длинного текста. */
+    /**
+     * Локальное сжатие (Кратко/Суть). Источник — уже ВОССТАНОВЛЕННЫЙ текст «Чисто»
+     * (каскад), а не сырая расшифровка: модели больше не приходится одновременно чинить
+     * распознавание и сокращать. Сжатие однопроходное, в заданную долю — темы не
+     * перемешиваются (см. LocalAiEngine.condense).
+     */
     private suspend fun localSummary(note: Note, text: String, l: Level, lecture: Boolean): String {
-        val finalPrompt = when {
+        val prompt = when {
             lecture && l == Level.BRIEF -> LOCAL_LECTURE_BRIEF
             lecture -> LOCAL_LECTURE_GIST
             l == Level.BRIEF -> LOCAL_BRIEF
@@ -129,16 +186,19 @@ class VariantProcessor(
         }
         val name = if (l == Level.BRIEF) "Кратко" else "Суть"
         stageOf[note.id] = "$name: модель на устройстве…"
-        val r = LocalAiEngine.summarize(context, LOCAL_BRIEF_CHUNK, finalPrompt, text, settings.localAiModel,
-            onProgress = { d, t, _ -> progressDone[note.id] = d; progressTotal[note.id] = t
+        val raw = LocalAiEngine.condense(context, prompt, text, settings.localAiModel, ratioOf(l), note.id,
+            onProgress = { d, t, _ -> partDone[note.id] = d; partTotal[note.id] = t
                 stageOf[note.id] = "$name: часть $d из $t" })
-        val ok = !r.isNullOrBlank() && !isLoopy(r) && r.length >= (if (l == Level.BRIEF) 10 else 5) &&
-            r.length < text.length
+        // Срезаем зачин «Вот краткий пересказ:» — сам текст после него обычно годный.
+        val r: String = raw?.let { stripMetaPreamble(it) }.orEmpty()
+        val meta = r.isNotBlank() && isMetaTalk(r)
+        if (meta) Diagnostics.error("$name: ответ — рассуждение О тексте («${r.take(45)}…») → правила")
+        val ok = r.isNotBlank() && !isLoopy(r) && !meta &&
+            r.length >= (if (l == Level.BRIEF) 10 else 5) && r.length < text.length
         return if (ok) {
-            val limited = limitSentences(r!!, if (l == Level.GIST) 2 else 4)
-            Diagnostics.engine("$l: локальный ИИ (суммаризация), ${limited.length} симв")
+            Diagnostics.engine("$l: локальный ИИ, ${text.length}→${r.length} симв (цель ${(ratioOf(l) * 100).toInt()}%)")
             lastEngine = localLabel()
-            limited
+            r
         } else {
             Diagnostics.engine("$l: локальный ИИ не дал результат → правила (${LocalAiEngine.lastStatus})")
             lastEngine = "правила"
@@ -175,7 +235,7 @@ class VariantProcessor(
         }
         Diagnostics.engine("Стенограмма: ОБЛАЧНЫЙ ИИ")
         lastEngine = "облако"
-        return AiClient.processLecture(text, settings.apiKey)
+        return cleanupMeta(AiClient.processLecture(text, settings.apiKey))
     }
 
     // Локальная обработка: по одному варианту (маленькой модели проще).
@@ -187,15 +247,51 @@ class VariantProcessor(
     private suspend fun localProcessLecture(note: Note, text: String): Map<String, String> =
         localBatch(note, text, lecture = true)
 
+    /**
+     * КАСКАД (v118): Дословно → Чисто → Кратко → Суть.
+     *
+     * Раньше все три уровня считались НЕЗАВИСИМО от сырой расшифровки — модель
+     * пересказывала кашу («какой машине и плетью»), да ещё каждый уровень с нуля.
+     * Теперь каждый следующий уровень работает с результатом предыдущего:
+     *   • качество — сокращается уже восстановленный текст;
+     *   • скорость — вместо ~19 800 символов генерации выходит ~10 300 (вдвое меньше).
+     */
     private suspend fun localBatch(note: Note, text: String, lecture: Boolean): Map<String, String> {
         val result = mutableMapOf<String, String>()
         fun missing(l: Level) = Tone.entries.any { note.getVariant(l, it) == null }
-        for (l in listOf(Level.CLEAN, Level.BRIEF, Level.GIST)) {
-            if (!missing(l)) continue
-            val r = if (l == Level.CLEAN) localClean(note, text) else localSummary(note, text, l, lecture)
-            // Заполняем ВСЕ тоны одинаково (локальная модель тон не различает).
-            for (tn in Tone.entries) result["${l.ordinal}:${tn.ordinal}"] = r
+        val combos = allCombos(lecture)
+        // Локальная модель тон не различает — заполняем все тоны одинаково.
+        fun put(l: Level, v: String) {
+            for (tn in Tone.entries) result["${l.ordinal}:${tn.ordinal}"] = v
             engineOf["${l.ordinal}"] = lastEngine
+            // Ступень закрыта — двигаем ОБЩИЙ прогресс (полоса растёт только здесь и
+            // потому не откатывается), счётчик кусков обнуляем под следующую ступень.
+            progressTotal[note.id] = combos.size
+            progressDone[note.id] = combos.count { (lv, tn) ->
+                note.getVariant(lv, tn) != null || result.containsKey("${lv.ordinal}:${tn.ordinal}") }
+            partDone.remove(note.id); partTotal.remove(note.id)
+        }
+
+        val readyClean = note.getVariant(Level.CLEAN, Tone.NEUTRAL).orEmpty()
+        val cleanText: String = if (missing(Level.CLEAN) || readyClean.isBlank()) {
+            val c = localClean(note, text)
+            put(Level.CLEAN, c)
+            Diagnostics.info("Каскад: Чисто ← Дословно (${text.length}→${c.length} симв)")
+            c
+        } else readyClean
+
+        val readyBrief = note.getVariant(Level.BRIEF, Tone.NEUTRAL).orEmpty()
+        val briefText: String = if (missing(Level.BRIEF) || readyBrief.isBlank()) {
+            val b = localSummary(note, cleanText, Level.BRIEF, lecture)
+            put(Level.BRIEF, b)
+            Diagnostics.info("Каскад: Кратко ← Чисто (${cleanText.length}→${b.length} симв)")
+            b
+        } else readyBrief
+
+        if (missing(Level.GIST)) {
+            val gist = localSummary(note, briefText, Level.GIST, lecture)
+            put(Level.GIST, gist)
+            Diagnostics.info("Каскад: Суть ← Кратко (${briefText.length}→${gist.length} симв)")
         }
         return result
     }
@@ -236,6 +332,8 @@ class VariantProcessor(
                     try {
                         val srcText = note.refinedText ?: note.original
                         Diagnostics.info("В обработку ушёл текст (${srcText.length} симв): \"${srcText.take(50)}...\"")
+                        // Смена заметки = принудительная перезагрузка модели (изоляция).
+                        LocalAiEngine.beginNote(note.id, srcText)
                         val all = if (note.isLecture)
                             processLectureRouted(note, srcText)
                         else
@@ -313,9 +411,14 @@ class VariantProcessor(
             states[k(note.id, l, t)] = State.RUNNING
             var ok = false
             try {
+                LocalAiEngine.beginNote(note.id, note.refinedText ?: note.original)
                 val text = computeOne(note, l, t, vary = true)
                 note.putVariant(l, t, text, lastEngine)
                 states[k(note.id, l, t)] = State.DONE
+                // Каскад: пересчитали «Чисто» — значит «Кратко» и «Суть» построены на
+                // устаревшем источнике. Сбрасываем их, фон пересчитает от нового «Чисто».
+                if (l == Level.CLEAN) invalidateBelow(note, Level.CLEAN)
+                if (l == Level.BRIEF) invalidateBelow(note, Level.BRIEF)
                 persist()
                 ok = true
                 Diagnostics.engine("Обновлён вариант ($l/$t): ${text.length} симв, движок: $lastEngine")
@@ -329,40 +432,79 @@ class VariantProcessor(
         }
     }
 
+    /**
+     * Сбрасывает ступени НИЖЕ указанной: их источник изменился, значит они устарели.
+     * История версий сохраняется (стрелки ‹ › по-прежнему показывают прошлые редакции),
+     * убирается только текущее значение — фон пересчитает его от нового источника.
+     */
+    private fun invalidateBelow(note: Note, l: Level) {
+        val below = when (l) {
+            Level.CLEAN -> listOf(Level.BRIEF, Level.GIST)
+            Level.BRIEF -> listOf(Level.GIST)
+            else -> emptyList()
+        }
+        var n = 0
+        for (lv in below) for (tn in Tone.entries) {
+            if (note.variants.remove(note.variantKey(lv, tn)) != null) n++
+            states.remove(k(note.id, lv, tn))
+        }
+        if (n > 0) Diagnostics.info("Каскад: сброшено $n вариант(ов) ниже $l — источник изменился")
+    }
+
+    /**
+     * Источник уровня по КАСКАДУ: Чисто ← Дословно, Кратко ← Чисто, Суть ← Кратко.
+     * Если предыдущая ступень ещё не посчитана, откатываемся к Дословно.
+     */
+    private fun sourceFor(note: Note, l: Level): String {
+        val orig = note.refinedText ?: note.original
+        fun v(lv: Level) = note.getVariant(lv, Tone.NEUTRAL)?.takeIf { it.isNotBlank() }
+        return when (l) {
+            Level.BRIEF -> v(Level.CLEAN) ?: orig
+            Level.GIST -> v(Level.BRIEF) ?: v(Level.CLEAN) ?: orig
+            else -> orig
+        }
+    }
+
     /** Вычисление одного варианта с проверкой длины. */
     private suspend fun computeOne(note: Note, l: Level, t: Tone, vary: Boolean = false): String {
         val orig = note.refinedText ?: note.original
+        val src = sourceFor(note, l)
+        if (src !== orig) Diagnostics.info("Каскад ($l): источник — ${if (l == Level.BRIEF) "Чисто" else "Кратко"} (${src.length} симв)")
         // Роутинг: локальный ИИ (если выбран офлайн) или облачный.
         if (settings.useAI && settings.localAi &&
             LocalAiModelManager.isReady(context, settings.localAiModel)) {
             return when (l) {
                 Level.CLEAN -> {
-                    // «Обновить» = другая формулировка задачи → другой результат.
+                    // «Обновить» = другая формулировка ТОЙ ЖЕ задачи → другой результат.
+                    // Задача везде одна: восстановить речь, а не улучшить текст.
                     val prompts = listOf(
                         LOCAL_CLEAN,
-                        "Расставь знаки препинания по смыслу и исправь ошибки распознавания. Не убирай слова. Выведи только текст.",
-                        "Раздели текст на предложения по смыслу, поставь точки и запятые, исправь окончания слов. Выведи только текст."
+                        "Это машинная расшифровка речи с ошибками. Напиши, что человек сказал на самом деле. " +
+                            "Непонятное слово замени созвучным. Знаки препинания — по смыслу. В ответе только текст.",
+                        "Восстанови речь по этой расшифровке: исправь неверно распознанные слова на созвучные, " +
+                            "раздели на предложения по смыслу. Слова не выбрасывай. В ответе только текст."
                     )
                     localClean(note, orig, if (vary) prompts.random() else prompts[0])
                 }
                 Level.VERBATIM -> { lastEngine = "правила"; Punctuator.punctuate(orig) }
-                else -> localSummary(note, orig, l, note.isLecture)
+                else -> localSummary(note, src, l, note.isLecture)
             }
         }
         val result = if (settings.useAI) {
             lastEngine = "облако"
-            AiClient.process(orig, l, t, settings.apiKey, vary)
-        } else { lastEngine = "правила"; TextCondenser.condense(orig, l) }
+            val r0 = AiClient.process(src, l, t, settings.apiKey, vary)
+            if (l == Level.BRIEF || l == Level.GIST) stripMetaPreamble(r0) else r0
+        } else { lastEngine = "правила"; TextCondenser.condense(src, l) }
 
-        if (l != Level.VERBATIM && result.length > orig.length) {
+        if (l != Level.VERBATIM && result.length > src.length) {
             return if (settings.useAI) {
                 try {
-                    val shorter = AiClient.process(orig, l, t, settings.apiKey, vary = true)
-                    if (shorter.length <= orig.length) capLength(shorter, orig, l) else TextCondenser.condense(orig, l)
-                } catch (_: Exception) { TextCondenser.condense(orig, l) }
-            } else TextCondenser.condense(orig, l)
+                    val shorter = AiClient.process(src, l, t, settings.apiKey, vary = true)
+                    if (shorter.length <= src.length) capLength(shorter, src, l) else TextCondenser.condense(src, l)
+                } catch (_: Exception) { TextCondenser.condense(src, l) }
+            } else TextCondenser.condense(src, l)
         }
-        return capLength(result, orig, l)
+        return capLength(result, src, l)
     }
 
     /**
@@ -412,6 +554,140 @@ class VariantProcessor(
         return unknown.toDouble() / resWords.size > 0.4
     }
 
+    // ══ ЗАЩИТА ОТ ПОРЧИ СЛОВ (v118) ═══════════════════════════════════════════
+    // Проверка «результат не длиннее оригинала» пропускала подмену смысла: в тесте
+    // «погода» модель заменила ПРАВИЛЬНОЕ слово «дождь» на «бешен», длина совпала —
+    // и это ушло пользователю. При этом та же модель верно восстановила «какой машине
+    // и плетью» → «Машу и Петю», и такие правки терять нельзя.
+    //
+    // Отличаем одно от другого по СОЗВУЧИЮ. Слово сводим к «скелету»: убираем гласные
+    // и мягкие знаки, схлопываем оглушение (б/п, д/т, в/ф, ж/ш, з/с, г/к). Замена
+    // принимается, только если скелеты близки:
+    //     плетью → плт   ≈  Петю → пт      расстояние 1  → принимаем
+    //     дождь  → джд   ≠  бешен → пшн    расстояние 3  → откат к «дождь»
+    private fun skeleton(w: String): String {
+        val sb = StringBuilder()
+        for (c in w.lowercase().replace('ё', 'е')) {
+            if (c in "аеиоуыэюяьъй") continue
+            sb.append(when (c) {
+                'б' -> 'п'; 'д' -> 'т'; 'в' -> 'ф'; 'ж' -> 'ш'; 'з' -> 'с'; 'г' -> 'к'
+                else -> c
+            })
+        }
+        return sb.toString()
+    }
+
+    private fun lev(a: String, b: String): Int {
+        if (a.isEmpty()) return b.length
+        if (b.isEmpty()) return a.length
+        var prev = IntArray(b.length + 1) { it }
+        val cur = IntArray(b.length + 1)
+        for (i in 1..a.length) {
+            cur[0] = i
+            for (j in 1..b.length) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                cur[j] = minOf(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+            }
+            prev = cur.copyOf()
+        }
+        return prev[b.length]
+    }
+
+    /** Созвучны ли слова настолько, чтобы считать замену восстановлением, а не порчей. */
+    private fun soundsAlike(a: String, b: String): Boolean {
+        val sa = skeleton(a); val sb2 = skeleton(b)
+        if (sa.isEmpty() || sb2.isEmpty()) return sa == sb2
+        if (sa == sb2) return true
+        val allowed = maxOf(1, minOf(sa.length, sb2.length) / 3)
+        return lev(sa, sb2) <= allowed
+    }
+
+    private val wordRe = Regex("[А-Яа-яЁёA-Za-z0-9]+")
+
+    /**
+     * Сверяет результат «Чисто» с исходником по словам и откатывает несозвучные замены.
+     * Выравнивание — расстоянием Левенштейна по словам (кусок ~130 слов, считается мгновенно).
+     * Возвращает исправленный текст и число откатов.
+     */
+    private fun restoreWords(result: String, source: String): Pair<String, Int> {
+        val rTokens = wordRe.findAll(result).map { it.value }.toList()
+        val sTokens = wordRe.findAll(source).map { it.value }.toList()
+        if (rTokens.isEmpty() || sTokens.isEmpty() || rTokens.size > 400 || sTokens.size > 400)
+            return result to 0
+        val n = sTokens.size; val m = rTokens.size
+        // Таблица правок: 0 — совпало/замена, 1 — пропуск, 2 — вставка.
+        val d = Array(n + 1) { IntArray(m + 1) }
+        for (i in 0..n) d[i][0] = i
+        for (j in 0..m) d[0][j] = j
+        for (i in 1..n) for (j in 1..m) {
+            val same = sTokens[i - 1].equals(rTokens[j - 1], true)
+            d[i][j] = minOf(d[i - 1][j - 1] + (if (same) 0 else 1), d[i - 1][j] + 1, d[i][j - 1] + 1)
+        }
+        // Обратный ход: собираем замены result-слово → source-слово.
+        val fix = HashMap<Int, String>()   // индекс слова в result → чем заменить
+        var i = n; var j = m; var rolled = 0
+        while (i > 0 && j > 0) {
+            val same = sTokens[i - 1].equals(rTokens[j - 1], true)
+            when {
+                d[i][j] == d[i - 1][j - 1] + (if (same) 0 else 1) -> {
+                    if (!same && !soundsAlike(sTokens[i - 1], rTokens[j - 1])) {
+                        fix[j - 1] = sTokens[i - 1]; rolled++
+                    }
+                    i--; j--
+                }
+                d[i][j] == d[i - 1][j] + 1 -> i--
+                else -> j--
+            }
+        }
+        if (fix.isEmpty()) return result to 0
+        // Собираем текст обратно, сохраняя всю пунктуацию и пробелы результата.
+        val sb = StringBuilder(); var last = 0; var idx = 0
+        for (mt in wordRe.findAll(result)) {
+            sb.append(result, last, mt.range.first)
+            val repl = fix[idx]
+            if (repl != null) {
+                // сохраняем заглавную букву, если она была в результате
+                sb.append(if (mt.value.firstOrNull()?.isUpperCase() == true)
+                    repl.replaceFirstChar { it.uppercaseChar() } else repl)
+            } else sb.append(mt.value)
+            last = mt.range.last + 1; idx++
+        }
+        sb.append(result, last, result.length)
+        return sb.toString() to rolled
+    }
+
+    // ══ ФИЛЬТР МЕТА-РЕЧИ (v118) ═══════════════════════════════════════════════
+    // «Кратко» и «Суть» должны продолжать речь человека, а не рассказывать о ней.
+    // В тесте «Умом Россию» модель выдала «Автор сравнивает Россию с умом и аршином…» —
+    // это анализ текста, а не изложение, и пользователю он не нужен.
+    private val META_STARTS = listOf(
+        "этот текст", "это текст", "данный текст", "в тексте", "в данном тексте", "текст -", "текст —",
+        "текст представляет", "текст является", "речь идёт", "речь идет", "здесь говорится",
+        "автор ", "рассказчик", "говорящий", "в этом видео", "это сообщение", "это стихотворение",
+        "в лекции говорится", "лектор рассказывает")
+    private val META_PREAMBLES = listOf("краткий пересказ", "короткий пересказ", "кратко:", "суть:", "пересказ:")
+    // «Вот краткий пересказ:», «Вот краткое изложение:», «Вот суть:» — любая связка
+    // «Вот …:» в начале. Отдельным списком все формы не перечислить (модель склоняет
+    // как хочет: «краткий», «краткое», «изложение»), поэтому шаблоном.
+    private val META_PREFIX_RE = Regex("^вот\\s[^:]{0,50}:", RegexOption.IGNORE_CASE)
+
+    /** Срезает зачин вида «Вот краткий пересказ:» — сам текст после него обычно годный. */
+    private fun stripMetaPreamble(t: String): String {
+        val head = t.trimStart()
+        val low = head.lowercase()
+        val byRe = META_PREFIX_RE.find(head)
+        if (byRe != null) return head.substring(byRe.range.last + 1).trimStart()
+        if (META_PREAMBLES.none { low.startsWith(it) }) return t
+        val colon = head.indexOf(':')
+        return if (colon in 0..60) head.substring(colon + 1).trimStart() else t
+    }
+
+    /** Ответ — рассуждение О тексте, а не изложение текста. */
+    private fun isMetaTalk(t: String): Boolean {
+        val l = t.trim().lowercase().take(80)
+        return META_STARTS.any { l.startsWith(it) }
+    }
+
     // Детект ЯВНОГО зацикливания (одна фраза повторяется много раз подряд).
     private fun isLoopy(text: String): Boolean {
         // Мусор-абракадабра: много латиницы/цифр вместо русского («alpha 2023 Cre01»).
@@ -454,6 +730,7 @@ class VariantProcessor(
         states.keys.filter { it.startsWith(prefix) }.forEach { states.remove(it) }
         progressDone.remove(noteId)
         progressTotal.remove(noteId)
+        partDone.remove(noteId); partTotal.remove(noteId)
         activeNote.remove(noteId)
         activeEngineOf.remove(noteId); stageOf.remove(noteId)
     }

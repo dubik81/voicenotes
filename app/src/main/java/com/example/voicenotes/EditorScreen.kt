@@ -831,19 +831,34 @@ fun EditorScreen(
                         processing -> {
                             val d = processor.doneCount(note.id)
                             val tot = processor.totalCount(note.id)
+                            // Прогресс в два уровня: полоса — по готовым вариантам (растёт
+                            // только вперёд), «часть N из M» — по кускам внутри ступени.
+                            // Раньше оба писались в один счётчик, и полоса откатывалась с
+                            // 100% на каждом новом варианте.
+                            val pd = processor.partDoneCount(note.id)
+                            val ptot = processor.partTotalCount(note.id)
                             refreshTick
                             WaitingScreen(
                                 accent = accent,
                                 seconds = progressSeconds,
-                                percent = if (tot > 0) (d * 100 / tot).coerceIn(0, 100) else -1,
+                                percent = if (tot > 0) {
+                                    // Внутри текущей ступени добавляем её долю — полоса
+                                    // движется плавно, а не скачками по вариантам.
+                                    val stepShare = if (ptot > 0) pd.toDouble() / ptot else 0.0
+                                    val perLevel = tot / 3.0            // 3 ступени × тона
+                                    (((d + stepShare * perLevel) * 100 / tot).toInt()).coerceIn(0, 100)
+                                } else -1,
                                 label = when (activeEngine.ifBlank { processor.activeEngine(note.id) }) {
                                     "local" -> "ИИ на устройстве работает…"
                                     "cloud" -> "Облачный ИИ обрабатывает…"
                                     "rules" -> "Обрабатываю по правилам…"
                                     else -> if (voskRerunning || whisperRunning) "Перераспознаю аудио…" else "Обрабатываю…"
                                 },
-                                detail = processor.stage(note.id).ifBlank {
-                                    if (tot > 0) "Готово вариантов: $d из $tot" else "" },
+                                detail = buildString {
+                                    if (tot > 0) append("Готово вариантов: $d из $tot")
+                                    val st = processor.stage(note.id)
+                                    if (st.isNotBlank()) { if (isNotEmpty()) append(" · "); append(st) }
+                                },
                                 preview = original,
                                 onCancel = {
                                     processor.cancel(note.id)

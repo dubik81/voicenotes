@@ -339,6 +339,27 @@ fun SettingsScreen(
                             shape = RoundedCornerShape(12.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) { Text("🔍 Проверить локальный ИИ", fontSize = 13.sp) }
+                        Spacer(Modifier.height(6.dp))
+                        // Разведка моделей: приложение само спрашивает у HuggingFace список
+                        // .pte файлов с размерами. Нужна, чтобы найти квантованную (быструю)
+                        // версию Qwen — из среды разработки интернет недоступен, с телефона да.
+                        var scanning by remember { mutableStateOf(false) }
+                        OutlinedButton(
+                            onClick = {
+                                scanning = true; testReport = "Спрашиваю HuggingFace…"
+                                appScope.launch {
+                                    testReport = try { LocalAiModelManager.discoverModels(context) }
+                                        catch (e: Exception) { "Разведка не удалась: ${e.message}" }
+                                    scanning = false
+                                }
+                            },
+                            enabled = !scanning,
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("📡 Проверить доступные модели (нужен интернет)", fontSize = 13.sp) }
+                        Text("Ищет более быстрые (квантованные) версии модели. Результат попадает " +
+                             "в чёрный ящик — пришлите архив, и модель можно будет подключить.",
+                            fontSize = 10.sp, color = cs.onSurfaceVariant)
                         if (testReport.isNotBlank()) {
                             Spacer(Modifier.height(6.dp))
                             Text(testReport, fontSize = 10.sp, color = cs.onSurface,

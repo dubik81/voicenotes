@@ -114,6 +114,13 @@ object Diagnostics {
         info("Whisper скачан: ${WhisperModelManager.isReady(context, settings.whisperModel)}")
         info("Локальный ИИ скачан: ${LocalAiModelManager.isReady(context, settings.localAiModel)}, токенизатор: ${LocalAiModelManager.tokenizerFile(context, settings.localAiModel).let { if (it.exists()) "${it.name} (${it.length()} б)" else "НЕТ" }}")
         info("Локальный ИИ статус: ${LocalAiEngine.lastStatus}; рабочий вызов: ${LocalAiEngine.workingCall}")
+        // v118: контроль изоляции заметок и экономии на перезагрузках.
+        // Перезагрузок должно быть примерно столько же, сколько обработанных заметок
+        // (раньше — по одной на КАЖДЫЙ вызов модели). Утечек должно быть 0.
+        info("Локальный ИИ: перезагрузок модели за сессию: ${LocalAiEngine.reloads}, " +
+             "генераций: ${LocalAiEngine.generations}, утечек поймано: ${LocalAiEngine.leaksCaught}")
+        info("Локальный ИИ: сгенерировано символов за сессию: ${LocalAiEngine.charsGenerated}, " +
+             "машинного времени: ${LocalAiEngine.genMillis / 1000} с")
     }
 
     fun availMemMb(context: Context): Long = try {
