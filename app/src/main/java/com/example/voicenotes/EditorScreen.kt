@@ -907,7 +907,11 @@ fun EditorScreen(
                                     val st = processor.stage(note.id)
                                     if (st.isNotBlank()) { if (isNotEmpty()) append(" · "); append(st) }
                                 },
-                                preview = original,
+                                // Показываем РОВНО тот текст, который уходит в обработку:
+                                // выбранную версию «Дословно», а не первую запись. Раньше
+                                // здесь стоял note.original, и при листании версий стрелками
+                                // подпись «Обрабатываемый текст» показывала не то.
+                                preview = processor.verbatimShown(note),
                                 onCancel = {
                                     processor.cancel(note.id)
                                     aiRunning = false; activeEngine = ""; cornerIndicator = ""

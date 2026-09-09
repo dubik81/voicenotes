@@ -69,11 +69,16 @@ object AiClient {
     )
 
     // Запасные конкретные модели (на случай, если роутер недоступен).
-    private val BACKUP_MODELS = listOf(
-        "nvidia/nemotron-3-nano-30b:free",
-        "google/gemma-4-31b-it:free",
-        "openai/gpt-oss-120b:free"
-    )
+    // v126: список выкинут почти целиком. В логе теста КАЖДАЯ из этих моделей отвечала
+    // «Ошибка 400: … is not a valid model ID» — их уже нет в OpenRouter. Мало того, что
+    // попытки тратились впустую: пользователю показывалась ошибка ПОСЛЕДНЕЙ модели
+    // («Модель стала платной (404)»), хотя настоящей причиной был лимит 429 у роутера.
+    // Роутер openrouter/free сам выбирает живую бесплатную модель — он и есть запас.
+    private val BACKUP_MODELS = emptyList<String>()
+
+    // До какого момента бессмысленно стучаться: сервер ответил 429 (лимит 20 запросов
+    // в минуту). Раньше приложение продолжало долбить и загоняло себя глубже в лимит.
+    @Volatile private var rateLimitedUntil: Long = 0L
 
     /** Основной вызов обработки текста. vary=true просит переформулировать иначе. */
     suspend fun process(rawText: String, level: Level, tone: Tone, apiKey: String, vary: Boolean = false): String =
@@ -340,15 +345,33 @@ object AiClient {
         val tried = ArrayList<String>()
         fun left() = deadline - System.currentTimeMillis()
 
+        fun attempt(models: List<String>): Pair<String, String> {
+            val slice = left().coerceIn(10_000, 75_000)
+            return withHardLimit(slice) {
+                requestOnce(models, messages, apiKey, temperature, maxTokens, slice)
+            }
+        }
+
+        // ЛИМИТ ЗАПРОСОВ (429). Раньше при «слишком часто» код тут же повторял запрос,
+        // потом перебирал запасные модели — и каждая попытка ещё глубже загоняла в лимит.
+        // В логе видно, как из-за этого целая серия действий подряд заканчивалась 429.
+        // Теперь: увидели 429 — прекращаем немедленно и говорим, сколько ждать.
+        if (System.currentTimeMillis() < rateLimitedUntil) {
+            val sec = (rateLimitedUntil - System.currentTimeMillis()) / 1000 + 1
+            throw RuntimeException("Лимит бесплатных запросов. Подождите ~$sec с.")
+        }
+        fun noteRateLimit() { rateLimitedUntil = System.currentTimeMillis() + 60_000 }
+
         // 1) основные (openrouter/free): при 404 роутер иногда «прогревается» —
         // делаем до 2 попыток, чтобы успех был с первого нажатия пользователя.
         repeat(2) {
             if (left() > 5_000) {
                 try {
-                    return requestOnce(FREE_MODELS, messages, apiKey, temperature, maxTokens, left())
+                    return attempt(FREE_MODELS)
                 } catch (e: Exception) {
                     lastError = e.message ?: lastError
                     tried.add("openrouter/free: $lastError")
+                    if (lastError.contains("429")) { noteRateLimit(); throw RuntimeException(lastError) }
                     if (!lastError.contains("404")) return@repeat
                 }
             }
@@ -357,10 +380,11 @@ object AiClient {
         for (m in BACKUP_MODELS) {
             if (left() <= 5_000) break
             try {
-                return requestOnce(listOf(m), messages, apiKey, temperature, maxTokens, left())
+                return attempt(listOf(m))
             } catch (e: Exception) {
                 lastError = e.message ?: lastError
                 tried.add("$m: $lastError")
+                if (lastError.contains("429")) { noteRateLimit(); throw RuntimeException(lastError) }
             }
         }
         // Честный отчёт: какие модели пробовали и что ответили. Раньше в лог уходила
@@ -368,6 +392,30 @@ object AiClient {
         Diagnostics.error("Облако: ни одна модель не ответила за ${(budgetMs - left()) / 1000} с. " +
             tried.joinToString(" | ").take(300))
         throw RuntimeException(lastError)
+    }
+
+    /**
+     * ЖЁСТКИЙ предел времени на сетевой вызов (v126).
+     *
+     * Бюджет проверялся только МЕЖДУ попытками, а зависал сам сокет: в логе теста
+     * «Обновление CLEAN заняло 498557 мс» при заявленном лимите 150 с, и отдельно
+     * «Проверка облака … [500898 мс]». Причина — «Failed to connect to openrouter.ai»:
+     * при полуживой сети (VPN) connectTimeout у HttpURLConnection не срабатывает.
+     * Поэтому вызов уходит в отдельный поток-демон, а мы ждём его ровно отведённое
+     * время. Не ответил — бросаем поток и идём дальше; приложение он не держит.
+     */
+    private fun <T> withHardLimit(sliceMs: Long, block: () -> T): T {
+        val box = arrayOfNulls<Any>(2)          // [0] — результат, [1] — ошибка
+        val th = Thread {
+            try { box[0] = block() } catch (e: Throwable) { box[1] = e }
+        }
+        th.isDaemon = true
+        th.start()
+        th.join(sliceMs + 5_000)
+        if (th.isAlive) throw RuntimeException("Сеть не отвечает (предел ${sliceMs / 1000} с)")
+        (box[1] as? Throwable)?.let { throw RuntimeException(it.message ?: "ошибка сети") }
+        @Suppress("UNCHECKED_CAST")
+        return box[0] as T
     }
 
     private fun requestOnce(
@@ -389,7 +437,9 @@ object AiClient {
 
         val conn = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
-            connectTimeout = 15000
+            // 8 с вместо 15: при неполадках сети (VPN) соединение всё равно не установится,
+            // а ждать полминуты на каждой из пяти моделей — это минуты впустую.
+            connectTimeout = 8000
             // Ждём не дольше, чем осталось на всю операцию (и не дольше 75 с на модель:
             // бесплатная модель, молчащая больше минуты, обычно уже не ответит).
             readTimeout = timeLeftMs.coerceIn(10_000, 75_000).toInt()
@@ -484,7 +534,10 @@ object AiClient {
                 val messages = JSONArray().apply {
                     put(JSONObject().put("role", "user").put("content", "ping"))
                 }
-                val (_, model) = requestOnce(FREE_MODELS, messages, apiKey, 0.0, 1, timeLeftMs = 12_000)
+                // Тот же жёсткий сторож: в логе сама ПРОВЕРКА висела 500 секунд.
+                val (_, model) = withHardLimit(12_000) {
+                    requestOnce(FREE_MODELS, messages, apiKey, 0.0, 1, timeLeftMs = 12_000)
+                }
                 true to "облачный ИИ отвечает ($model, ${System.currentTimeMillis() - t0} мс)"
             } catch (e: Exception) {
                 false to (e.message ?: "облако не отвечает")

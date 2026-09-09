@@ -379,7 +379,7 @@ class VariantProcessor(
                         if (note.getVariant(l, t) == null) states[k(note.id, l, t)] = State.RUNNING
                     }
                     try {
-                        val srcText = note.refinedText ?: note.original
+                        val srcText = verbatimShown(note)
                         Diagnostics.info("В обработку ушёл текст (${srcText.length} симв): \"${srcText.take(50)}...\"")
                         // Смена заметки = принудительная перезагрузка модели (изоляция).
                         LocalAiEngine.beginNote(note.id, srcText)
@@ -446,7 +446,7 @@ class VariantProcessor(
                 // Считаем правилами и ЧЕСТНО подписываем движок: пользователь видит, что
                 // это запасной вариант, а не работа ИИ (в истории версий метка «правила»).
                 if (!settings.localAi && combos.any { (l, t) -> note.getVariant(l, t) == null }) {
-                    val src = note.refinedText ?: note.original
+                    val src = verbatimShown(note)
                     var n = 0
                     for ((l, t) in combos) {
                         if (note.getVariant(l, t) == null) {
@@ -486,7 +486,9 @@ class VariantProcessor(
     private fun isHopeless(msg: String?): Boolean {
         val m = (msg ?: "").lowercase()
         return listOf("нет интернета", "ключ отклонён", "закончились бесплатные",
-            "сеть недоступна", "ключ openrouter не задан", "защищённого соединения")
+            "сеть недоступна", "ключ openrouter не задан", "защищённого соединения",
+            // 429: повтор через 6 секунд только глубже загоняет в лимит — ждать надо минуту
+            "слишком часто", "лимит бесплатных запросов", "сеть не отвечает")
             .any { m.contains(it) }
     }
 
@@ -515,7 +517,7 @@ class VariantProcessor(
             states[key] = State.RUNNING
             var ok = false
             try {
-                LocalAiEngine.beginNote(note.id, note.refinedText ?: note.original)
+                LocalAiEngine.beginNote(note.id, verbatimShown(note))
                 val text = computeOne(note, l, t, vary = true)
                 note.putVariant(l, t, text, lastEngine)
                 states[k(note.id, l, t)] = State.DONE
@@ -577,7 +579,7 @@ class VariantProcessor(
      * Если предыдущая ступень ещё не посчитана, откатываемся к Дословно.
      */
     private fun sourceFor(note: Note, l: Level): String {
-        val orig = note.refinedText ?: note.original
+        val orig = verbatimShown(note)
         fun v(lv: Level) = note.getVariant(lv, Tone.NEUTRAL)?.takeIf { it.isNotBlank() }
         return when (l) {
             Level.BRIEF -> v(Level.CLEAN) ?: orig
@@ -586,9 +588,22 @@ class VariantProcessor(
         }
     }
 
+    /**
+     * Текст «Дословно» ТОТ, ЧТО ВИДЕН НА ЭКРАНЕ (v126).
+     *
+     * Жалоба пользователя: «обрабатываться должен тот текст, который был выбран из
+     * нескольких вариантов, тот который был виден на экране в Дословно». Так и было
+     * задумано, но код брал note.original — исходную запись, игнорируя выбор версии
+     * стрелками ‹ ›. Если человек листал историю «Дословно» и выбирал другую версию,
+     * в обработку всё равно уходила первая. Теперь берём выбранную версию.
+     */
+    fun verbatimShown(note: Note): String =
+        note.getVariant(Level.VERBATIM, Tone.NEUTRAL)?.takeIf { it.isNotBlank() }
+            ?: note.refinedText ?: note.original
+
     /** Вычисление одного варианта с проверкой длины. */
     private suspend fun computeOne(note: Note, l: Level, t: Tone, vary: Boolean = false): String {
-        val orig = note.refinedText ?: note.original
+        val orig = verbatimShown(note)
         val src = sourceFor(note, l)
         if (src !== orig) Diagnostics.info("Каскад ($l): источник — ${if (l == Level.BRIEF) "Чисто" else "Кратко"} (${src.length} симв)")
         // Роутинг: локальный ИИ (если выбран офлайн) или облачный.
@@ -618,13 +633,25 @@ class VariantProcessor(
                 LocalAiEngine.cutSecondVariant(stripMetaPreamble(r0)) else r0
         } else { lastEngine = "правила"; TextCondenser.condense(src, l) }
 
-        if (l != Level.VERBATIM && result.length > src.length) {
+        // Повтор «результат длиннее источника» — ТОЛЬКО для Кратко и Суть (v126).
+        // Для «Чисто» ответ ДОЛЖЕН быть примерно равен входу и часто чуть длиннее:
+        // добавляются знаки препинания и заглавные. В логе теста: облако вернуло 423
+        // символа на 410 исходных — совершенно нормальный результат, но правило считало
+        // его провалом, слало ВТОРОЙ запрос, тот упирался в лимит 429, и «Чисто»
+        // молча подменялось правилами. Отсюда жалоба «при обновлении текст стал хуже».
+        if ((l == Level.BRIEF || l == Level.GIST) && result.length > src.length) {
             return if (settings.useAI) {
                 try {
                     val shorter = AiClient.process(src, l, t, settings.apiKey, vary = true)
-                    if (shorter.length <= src.length) capLength(shorter, src, l) else TextCondenser.condense(src, l)
-                } catch (_: Exception) { TextCondenser.condense(src, l) }
-            } else TextCondenser.condense(src, l)
+                    if (shorter.length <= src.length) capLength(shorter, src, l)
+                    else { lastEngine = "правила"; TextCondenser.condense(src, l) }
+                } catch (_: Exception) {
+                    // Запасной путь — правила. Метку движка ОБЯЗАТЕЛЬНО меняем: раньше
+                    // оставалось «облако», и в истории версий текст правил значился
+                    // как работа облачного ИИ.
+                    lastEngine = "правила"; TextCondenser.condense(src, l)
+                }
+            } else { lastEngine = "правила"; TextCondenser.condense(src, l) }
         }
         return capLength(result, src, l)
     }
