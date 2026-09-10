@@ -124,6 +124,14 @@ object Diagnostics {
              "генераций: ${LocalAiEngine.generations}, утечек поймано: ${LocalAiEngine.leaksCaught}")
         info("Локальный ИИ: сгенерировано символов за сессию: ${LocalAiEngine.charsGenerated}, " +
              "машинного времени: ${LocalAiEngine.genMillis / 1000} с")
+        // v132: остальные настройки, влияющие на результат. Раньше их приходилось
+        // угадывать при разборе архива — теперь протокол проверки видит всё.
+        info("настройки: автозапуск ИИ=${settings.autoAi}, досчёт в фоне=${settings.precomputeAll}, " +
+             "пауза до остановки=${settings.pauseSeconds} с, сохранять аудио=${settings.saveAudio}, " +
+             "подтверждать удаление=${settings.confirmDelete}, ИИ включён=${settings.useAI}")
+        info("параметры генерации: температура модели=${LocalAiEngine.modelTemp}, " +
+             "бюджет токенов=${LocalAiEngine.seqBudgetPublic()}, кусок Чисто≈${LocalAiEngine.cleanChunkHint()} симв, " +
+             "кусок сжатия≈${LocalAiEngine.condenseChunkHint()} симв")
     }
 
     fun availMemMb(context: Context): Long = try {

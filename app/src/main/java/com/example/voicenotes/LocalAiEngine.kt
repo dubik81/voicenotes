@@ -127,6 +127,12 @@ object LocalAiEngine {
     // (об этом прямо предупреждают сами разработчики моделей), а зацикливание мы уже
     // ловили в ранних версиях. 0.2 — компромисс между точностью и устойчивостью.
     private const val MODEL_TEMP = 0.2f
+    // Публичные «окна» для протокола разбора: значения настроек, влияющих на текст,
+    // должны попадать в чёрный ящик, иначе при разборе архива их приходится угадывать.
+    val modelTemp: Float get() = MODEL_TEMP
+    fun seqBudgetPublic(): Int = seqBudget()
+    fun cleanChunkHint(): Int = chunkChars("x".repeat(280), outRatio = 1.1)
+    fun condenseChunkHint(): Int = minOf(chunkChars("x".repeat(200), outRatio = 0.5), CONDENSE_CHUNK)
     /** Какой вызов generate реально работает: "" (не известно), "4arg", "cfg", "2arg". */
     @Volatile var workingCall: String = ""
         private set
@@ -784,6 +790,13 @@ object LocalAiEngine {
         for (m in markers) {
             val i = low.indexOf(m)
             if (i > 40 && (cut < 0 || i < cut)) cut = i
+        }
+        // Общий случай «Вот <что-то>:» в СЕРЕДИНЕ ответа — модель начинает новый блок.
+        // Из архива v131: «…Сроки обычно от 3 до 6 месяцев. Вот короткие описания
+        // ключевых тем лекции: 1. **Теряется текст**: …». Перечислять все формулировки
+        // бессмысленно, поэтому шаблоном.
+        Regex("вот\\s[^:]{0,60}:").findAll(low).forEach { m ->
+            if (m.range.first > 40 && (cut < 0 || m.range.first < cut)) cut = m.range.first
         }
         return if (cut > 0) t.substring(0, cut).trim().trimEnd(':', '-', '—') else t
     }

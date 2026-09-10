@@ -110,6 +110,8 @@ class VariantProcessor(
         stageOf[note.id] = "Запрос облаку (все 9 вариантов одним запросом)…"
         // В облако, как и в модель на устройстве, уходит поток слов без машинных знаков.
         val stream = asrStream(text)
+        Diagnostics.info("В облако ушёл поток без знаков (${text.length}→${stream.length} симв): " +
+            "\"${stream.take(60)}…\"")
         val all = cleanupMeta(AiClient.processAll(stream, settings.apiKey)).toMutableMap()
         // Облачные результаты проходят ТУ ЖЕ проверку, что и локальные: качество не
         // должно зависеть от того, какую бесплатную модель выбрал роутер в этот раз.
@@ -359,11 +361,13 @@ class VariantProcessor(
         val raw = LocalAiEngine.condense(context, prompt, text, settings.localAiModel, ratio, note.id,
             onProgress = { d, t, _ -> partDone[note.id] = d; partTotal[note.id] = t
                 stageOf[note.id] = "$name: часть $d из $t" })
-        // Срезаем зачин «Вот краткий пересказ:» — сам текст после него обычно годный.
-        val r: String = raw?.let { stripMetaPreamble(it) }.orEmpty()
-        val meta = r.isNotBlank() && isMetaTalk(r)
-        if (meta) Diagnostics.error("$name: ответ — рассуждение О тексте («${r.take(45)}…») → правила")
-        val ok = r.isNotBlank() && !isLoopy(r) && !meta &&
+        // ЕДИНАЯ проверка для обоих движков (v132). Раньше локальный путь имел свою,
+        // урезанную: он не убирал markdown-разметку, не резал нумерованный список, не
+        // склеивал обрывки предложений и не ловил мета-врезку в середине. В архиве v131
+        // это видно прямо: «Суть» пришла как «…Вот короткие описания ключевых тем лекции:
+        // 1. **Теряется текст**: …» — облачный путь такое отбраковывал, локальный пропускал.
+        val r: String = raw?.let { verifySummary(text, it, "на устройстве") }.orEmpty()
+        val ok = r.isNotBlank() && !isLoopy(r) &&
             r.length >= (if (l == Level.BRIEF) 10 else 5) && r.length < text.length
         return if (ok) {
             Diagnostics.engine("$l: локальный ИИ, ${text.length}→${r.length} симв (цель ${(ratio * 100).toInt()}%)")
@@ -761,7 +765,12 @@ class VariantProcessor(
                         "Оформи эту речь как читаемый текст: границы предложений — по смыслу, " +
                             "неверно распознанные слова замени созвучными. Слова не выбрасывай. В ответе только текст."
                     )
-                    localClean(note, orig, if (vary) prompts.random() else prompts[0])
+                    val idx = if (vary) prompts.indices.random() else 0
+                    // В ЧЯ — какой именно вариант формулировки использован: без этого при
+                    // разборе архива нельзя понять, почему два «Обновить» дали разное.
+                    Diagnostics.info("Чисто: вариант промпта №${idx + 1} из ${prompts.size}" +
+                        if (vary) " (повторная попытка)" else " (основной)")
+                    localClean(note, orig, prompts[idx])
                 }
                 Level.VERBATIM -> { lastEngine = "правила"; Punctuator.punctuate(orig) }
                 else -> localSummary(note, src, l, note.isLecture)
