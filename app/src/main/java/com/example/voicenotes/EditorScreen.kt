@@ -1001,9 +1001,12 @@ fun EditorScreen(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        // Стрелки истории версий (если есть история назад/вперёд)
+                        // Панель версий: стрелки истории + замок. Показывается, когда есть
+                        // текст — замок нужен и при единственной версии (v134), иначе
+                        // закрепить удачный результат было бы нельзя.
                         if (shown.isNotBlank() &&
-                            (note.canGoBack(level, tone) || note.canGoForward(level, tone))) {
+                            (level != Level.VERBATIM ||
+                             note.canGoBack(level, tone) || note.canGoForward(level, tone))) {
                             Surface(color = Palette.Ink, shape = RoundedCornerShape(16.dp),
                                 shadowElevation = 6.dp, modifier = Modifier.height(56.dp)) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1012,6 +1015,23 @@ fun EditorScreen(
                                     if (vLabel.isNotBlank()) {
                                         Text(vLabel, color = Color.White.copy(alpha = 0.8f), fontSize = 10.sp,
                                             modifier = Modifier.padding(start = 10.dp, end = 2.dp))
+                                    }
+                                    // ЗАМОК (v134): закрепить удачную версию, чтобы её не
+                                    // перезаписали ни фон, ни каскад, ни «Обновить».
+                                    if (level != Level.VERBATIM) {
+                                        val lockedNow = note.isLocked(level, tone)
+                                        Box(Modifier.size(width = 36.dp, height = 56.dp)
+                                            .clickable {
+                                                val on = note.toggleLock(level, tone)
+                                                onChanged(); refreshTick++
+                                                status = if (on) "Вариант закреплён — не будет перезаписан"
+                                                         else "Закрепление снято"
+                                                Diagnostics.action("Замок ($level/$tone): ${if (on) "закреплён" else "снят"}")
+                                            },
+                                            contentAlignment = Alignment.Center) {
+                                            Text(if (lockedNow) "🔒" else "🔓", fontSize = 14.sp,
+                                                color = Color.White.copy(alpha = if (lockedNow) 1f else 0.45f))
+                                        }
                                     }
                                     // Пока этот вариант пересчитывается, листать историю нельзя:
                                     // новая версия допишется в историю и сдвинет позицию —

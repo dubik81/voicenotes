@@ -619,6 +619,53 @@ class VariantProcessor(
         }
     }
 
+    /**
+     * ОЦЕНКА ВАРИАНТА (v134) — чем больше, тем лучше. Считает по тем же признакам, что
+     * и наши защиты, только не «принять/отклонить», а числом.
+     *
+     * Зачем: пользователь заметил, что удачные варианты появляются не всегда, а «Обновить»
+     * молча затирал хороший результат худшим. В архиве это видно прямо: версия 1 —
+     * «…починить микроволновку в пятницу. А еду на дачу приготовим…» (смысл сломан),
+     * версия 2 — «…починить микроволновку. В пятницу еду на дачу…» (идеально). Теперь
+     * новый вариант заменяет прежний ТОЛЬКО если он не хуже.
+     */
+    fun scoreVariant(source: String, text: String, l: Level): Int {
+        if (text.isBlank()) return -1000
+        var s = 0
+        // 1. Обрывки предложений — главный признак плохой разбивки.
+        val parts = text.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
+        val frags = parts.count { it.trim().split(Regex("\\s+")).size <= 2 && it.trim().endsWith(".") }
+        s -= frags * 25
+        // 2. Потеря фрагмента исходника.
+        val (lost, _) = longestLostRun(source, text)
+        if (lost >= 6) s -= 200 else s -= lost * 8
+        // 3. Мусор и разметка.
+        if (LocalAiEngine.looksGarbled(text)) s -= 300
+        if (text.contains("**")) s -= 50
+        if (isMetaTalk(text)) s -= 150
+        // 4. Отрицания: потеря «не» переворачивает смысл.
+        fun neg(t: String) = Regex("\\b(не|ни|нельзя|невозможно|нет)\\b").findAll(t.lowercase()).count()
+        val ns = neg(source); val nt = neg(text)
+        if (ns >= 2 && nt < ns) s -= (ns - nt) * 30
+        // 5. Заканчивается законченным предложением.
+        if (!text.trim().endsWith(".") && !text.trim().endsWith("!") && !text.trim().endsWith("?")) s -= 40
+        // 6. Соответствие длины задаче уровня.
+        val ratio = if (source.isEmpty()) 1.0 else text.length.toDouble() / source.length
+        s -= when (l) {
+            Level.CLEAN -> (Math.abs(ratio - 1.0) * 100).toInt()          // должен быть примерно равен
+            Level.BRIEF -> (Math.abs(ratio - 0.5) * 120).toInt()
+            else -> (Math.abs(ratio - 0.25) * 120).toInt()
+        }
+        // 7. Знаки препинания расставлены (для «Чисто» это и есть работа).
+        if (l == Level.CLEAN) {
+            val dots = text.count { it == '.' || it == '!' || it == '?' }
+            val words = text.split(Regex("\\s+")).size
+            if (dots == 0 && words > 20) s -= 120          // сплошной поток без точек
+            s += minOf(dots, words / 8) * 5                // разумное число предложений
+        }
+        return s
+    }
+
     /** Ошибки, при которых повтор через 6 секунд заведомо бесполезен. */
     private fun isHopeless(msg: String?): Boolean {
         val m = (msg ?: "").lowercase()
@@ -656,7 +703,28 @@ class VariantProcessor(
             try {
                 LocalAiEngine.beginNote(note.id, verbatimShown(note))
                 val text = computeOne(note, l, t, vary = true)
-                note.putVariant(l, t, text, lastEngine)
+                // ХРАПОВИК КАЧЕСТВА (v134): новый вариант принимается, только если он не
+                // ХУЖЕ текущего по нашим же метрикам. Раньше «Обновить» молча затирал
+                // удачный результат неудачным — и вернуть его было нельзя.
+                val src = sourceFor(note, l)
+                val prev = note.getVariant(l, t)
+                val sNew = scoreVariant(src, text, l)
+                val sOld = prev?.let { scoreVariant(src, it, l) } ?: Int.MIN_VALUE
+                if (prev != null && sNew < sOld) {
+                    Diagnostics.engine("Обновление ($l/$t): новый вариант хуже (оценка $sNew против $sOld) — " +
+                        "оставляю прежний. Текст сохранён в истории.")
+                    // Всё равно кладём в историю: пользователь сможет посмотреть стрелками.
+                    note.putVariant(l, t, text, lastEngine)
+                    note.goBack(l, t)
+                    lastAiError = "Новый вариант получился хуже — оставлен прежний"
+                } else {
+                    val added = note.putVariant(l, t, text, lastEngine)
+                    if (!added) {
+                        Diagnostics.engine("Обновление ($l/$t): модель выдала УЖЕ ИМЕЮЩИЙСЯ вариант — " +
+                            "новая версия не создана")
+                        lastAiError = "Модель выдала тот же вариант"
+                    }
+                }
                 states[k(note.id, l, t)] = State.DONE
                 clearStale(note.id, l, t)
                 // Каскад: пересчитали «Чисто» — «Кратко» и «Суть» построены на прежнем

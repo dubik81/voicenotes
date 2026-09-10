@@ -61,22 +61,52 @@ data class Note(
         if (level == Level.VERBATIM) (variants[variantKey(level, tone)] ?: original)
         else variants[variantKey(level, tone)]
 
-    fun putVariant(level: Level, tone: Tone, text: String, engine: String = "") {
+    /**
+     * ЗАКРЕПЛЁННЫЕ ВАРИАНТЫ (v134). Ключи «уровень:тон», которые пользователь пометил
+     * замком: их не перезаписывает ни фоновый расчёт, ни каскад, ни «Обновить».
+     * Причина: удачный вариант получается не всегда, и потерять его нельзя.
+     */
+    val locked: MutableSet<String> = mutableSetOf()
+    fun isLocked(level: Level, tone: Tone) = variantKey(level, tone) in locked
+    fun toggleLock(level: Level, tone: Tone): Boolean {
         val key = variantKey(level, tone)
+        return if (key in locked) { locked.remove(key); false } else { locked.add(key); true }
+    }
+
+    /**
+     * @param force записать даже поверх закреплённого (осознанное действие пользователя)
+     * @return true если добавлена НОВАЯ версия; false если такой текст уже был в истории
+     *         (тогда просто переключаемся на него) или вариант закреплён
+     */
+    fun putVariant(level: Level, tone: Tone, text: String, engine: String = "", force: Boolean = false): Boolean {
+        val key = variantKey(level, tone)
+        if (!force && key in locked) return false
+        // ДУБЛИКАТЫ (v134). Пользователь: «варианты повторяются». Так и было: «Обновить»
+        // выбирает промпт из трёх наугад, и модель нередко выдаёт текст, который в истории
+        // уже есть — в архиве версии 2 и 4 совпадали дословно. Такой ответ в историю не
+        // добавляем: просто показываем ту версию, что уже была.
+        val histExisting = history[key]
+        val same = histExisting?.indexOfFirst { it.trim() == text.trim() } ?: -1
+        if (same >= 0) {
+            variants[key] = histExisting!![same]
+            historyIndex[key] = same
+            return false
+        }
         variants[key] = text
         // добавляем в историю (если это новая версия, не дубль текущей)
         val hist = history.getOrPut(key) { mutableListOf() }
         val eng = historyEngine.getOrPut(key) { mutableListOf() }
         while (eng.size < hist.size) eng.add("")           // выравниваем со старыми данными
         if (hist.isEmpty() || hist.last() != text) {
-            // если мы не в конце истории — обрезаем «будущее» перед добавлением
-            val idx = historyIndex[key] ?: (hist.size - 1)
-            while (hist.size > idx + 1) { hist.removeAt(hist.size - 1); if (eng.size > hist.size) eng.removeAt(eng.size - 1) }
+            // v134: «будущее» больше НЕ обрезаем. Раньше при добавлении версии из
+            // середины истории всё, что было дальше, стиралось — и удачный вариант,
+            // до которого пользователь долистал назад, пропадал безвозвратно.
             hist.add(text); eng.add(engine)
             historyIndex[key] = hist.size - 1
         } else if (engine.isNotBlank() && eng.isNotEmpty()) {
             eng[eng.size - 1] = engine
         }
+        return true
     }
 
     /** Подпись текущей версии: «2/4 · облако» (для стрелок истории). */
@@ -156,6 +186,9 @@ data class Note(
         val hi = JSONObject()
         historyIndex.forEach { (k, idx) -> hi.put(k, idx) }
         put("historyIndex", hi)
+        // Закреплённые варианты должны переживать перезапуск приложения.
+        val lk = JSONArray(); locked.forEach { lk.put(it) }
+        put("locked", lk)
         val he = JSONObject()
         historyEngine.forEach { (k, list) ->
             val arr = JSONArray(); list.forEach { arr.put(it) }; he.put(k, arr)
@@ -191,6 +224,10 @@ data class Note(
                     historyEngine[k] = list
                 }
             }
+            val locked = mutableSetOf<String>()
+            o.optJSONArray("locked")?.let { arr ->
+                for (i in 0 until arr.length()) locked.add(arr.getString(i))
+            }
             return Note(
                 id = o.getLong("id"),
                 title = o.getString("title"),
@@ -205,7 +242,7 @@ data class Note(
                 history = history,
                 historyIndex = historyIndex,
                 historyEngine = historyEngine
-            )
+            ).also { it.locked.addAll(locked) }
         }
 
         fun listToJson(notes: List<Note>): String {
