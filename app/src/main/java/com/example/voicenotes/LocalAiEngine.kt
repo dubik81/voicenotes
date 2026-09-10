@@ -775,7 +775,10 @@ object LocalAiEngine {
     /** Модель выдала несколько пересказов подряд — оставляем первый. */
     fun cutSecondVariant(t: String): String {
         val markers = listOf("второй вариант", "вариант 2", "вариант второй",
-            "другой вариант", "или так:", "альтернатива:")
+            "другой вариант", "или так:", "альтернатива:",
+            // v131: из архива — «…от трех до шести месяцев. Вот текст лекции: Дальше…».
+            // Мета-фраза стояла НЕ в начале, поэтому фильтр зачинов её не видел.
+            "вот текст лекции", "вот текст:", "вот пересказ:", "итоговый текст:")
         val low = t.lowercase()
         var cut = -1
         for (m in markers) {
@@ -809,6 +812,19 @@ object LocalAiEngine {
      * ловила только «больше половины латиницы» и такое пропускала.
      */
     fun looksGarbled(text: String): Boolean {
+        // v131: чужие алфавиты. В архиве пользователя облако выдало «Премия мира не授予
+        // решениям» — китайские иероглифы посреди русской фразы. Прежняя проверка ловила
+        // только латиницу и слипшиеся слова и такое пропускала.
+        for (c in text) {
+            val cp = c.code
+            if (cp in 0x4E00..0x9FFF ||      // китайские иероглифы
+                cp in 0x3040..0x30FF ||      // японские каны
+                cp in 0xAC00..0xD7AF ||      // корейский
+                cp in 0x0590..0x05FF ||      // иврит
+                cp in 0x0600..0x06FF) {      // арабица
+                return true
+            }
+        }
         for (w in text.split(Regex("\\s+"))) {
             if (w.length > 30) return true                       // слова без пробелов
             val cyr = w.count { it in 'а'..'я' || it in 'А'..'Я' || it == 'ё' || it == 'Ё' }
@@ -816,6 +832,51 @@ object LocalAiEngine {
             if (cyr >= 2 && lat >= 2) return true                // «ветerpятнадцать»
         }
         return false
+    }
+
+    /**
+     * СКЛЕЙКА ОБРЫВКОВ ПРЕДЛОЖЕНИЙ (v131).
+     *
+     * Модели иногда ставят точку посреди фразы, и получаются куски в одно-два слова:
+     * «В субботу. Мы едем на дачу», «Конец. Второй части.», «Далее.» — всё это реальные
+     * примеры из архивов. Читать такое неприятно, а смысл дробится.
+     *
+     * Правило простое и безопасное: предложение короче трёх слов приклеиваем к следующему,
+     * первую букву следующего опускаем в строчную. Не трогаем куски, оканчивающиеся на
+     * «!» или «?» (это может быть осмысленное восклицание) и последний кусок текста.
+     */
+    fun mergeShortSentences(text: String): String {
+        val parts = text.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
+        if (parts.size < 2) return text
+        val out = ArrayList<String>()
+        var i = 0
+        while (i < parts.size) {
+            val cur = parts[i].trim()
+            val words = cur.split(Regex("\\s+")).size
+            val mergeable = words <= 2 && cur.endsWith(".") && i < parts.size - 1
+            if (mergeable) {
+                val next = parts[i + 1].trim()
+                val head = cur.dropLast(1).trim()
+                val tail = if (next.isNotEmpty()) next[0].lowercaseChar() + next.substring(1) else next
+                out.add("$head $tail")
+                i += 2
+            } else { out.add(cur); i++ }
+        }
+        return out.joinToString(" ")
+    }
+
+    /**
+     * Чистит ответ пересказа от разметки и обрывков списка (v131).
+     * В архиве «Суть» пришла в виде «1. **Разработка…** 2. **Я проверяю…** 3.» — модель
+     * начала нумерованный список, обрезалась на «3.», а звёздочки markdown остались.
+     */
+    fun stripListMarkup(text: String): String {
+        var t = text.replace("**", "").replace("__", "")
+        t = t.replace(Regex("(?m)^\\s*\\d+[.)]\\s*"), "")      // «1. » в начале строки
+        t = t.replace(Regex("\\s\\d+[.)]\\s+(?=[А-ЯA-Z])"), " ")  // «… 2. Текст» внутри строки
+        t = t.replace(Regex("\\s\\d+[.)]\\s*$"), "")            // висящий «3.» в конце
+        t = t.replace(Regex("(?m)^\\s*[-*•]\\s+"), "")          // маркеры списка
+        return t.replace(Regex("\\s+"), " ").trim()
     }
 
     // Детект зацикливания (фраза повторяется).

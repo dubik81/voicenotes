@@ -108,13 +108,15 @@ class VariantProcessor(
         Diagnostics.engine("Обработка вариантов: ОБЛАЧНЫЙ ИИ")
         lastEngine = "облако"
         stageOf[note.id] = "Запрос облаку (все 9 вариантов одним запросом)…"
-        val all = cleanupMeta(AiClient.processAll(text, settings.apiKey)).toMutableMap()
+        // В облако, как и в модель на устройстве, уходит поток слов без машинных знаков.
+        val stream = asrStream(text)
+        val all = cleanupMeta(AiClient.processAll(stream, settings.apiKey)).toMutableMap()
         // Облачные результаты проходят ТУ ЖЕ проверку, что и локальные: качество не
         // должно зависеть от того, какую бесплатную модель выбрал роутер в этот раз.
         for (tn in Tone.entries) {
             val cKey = "${Level.CLEAN.ordinal}:${tn.ordinal}"
             all[cKey]?.let { cand ->
-                val ok = verifyClean(text, cand, "облако")
+                val ok = verifyClean(stream, cand, "облако")
                 all[cKey] = ok ?: CleanProcessor.clean(text, note.recordMode == "google")
                 if (ok == null) engineOf["${Level.CLEAN.ordinal}"] = "правила (облако исказило)"
             }
@@ -129,6 +131,36 @@ class VariantProcessor(
             }
         }
         return all
+    }
+
+    /**
+     * ПОТОК СЛОВ БЕЗ МАШИННОЙ ПУНКТУАЦИИ (v128).
+     *
+     * Жалоба пользователя, которая держалась несколько версий: «Чисто» подтягивает
+     * пунктуацию из «Дословно», предложения не делятся по смыслу. Промптом это лечится
+     * плохо — сколько ни пиши «не верь точкам», точки стоят прямо в тексте, и модель
+     * держится за них как за подсказку. Отсюда обрывки вроде «Впускные и выпускные.» и
+     * сохранённые машинные запятые «клапан на, которые».
+     *
+     * Убираем подсказку физически: перед отправкой в ИИ снимаем точки, запятые и
+     * заглавные, оставляя чистый поток слов. Тогда модель не может ни за что зацепиться
+     * и вынуждена расставить знаки по смыслу — это и есть штатная постановка задачи
+     * восстановления пунктуации, ровно в таком виде её решают специализированные системы.
+     *
+     * Слова НЕ трогаем: защита слов и проверка потерь сравнивают именно слова, поэтому
+     * продолжают работать без изменений.
+     */
+    fun asrStream(text: String): String {
+        val sb = StringBuilder(text.length)
+        for (c in text) {
+            when {
+                c in ".,!?;:…" -> sb.append(' ')
+                c == '«' || c == '»' || c == '"' -> sb.append(' ')
+                c == '—' || c == '–' -> sb.append(' ')
+                else -> sb.append(c)
+            }
+        }
+        return sb.toString().lowercase().replace(Regex("\\s+"), " ").trim()
     }
 
     /**
@@ -150,7 +182,15 @@ class VariantProcessor(
             Diagnostics.error("Чисто ($who): выброшен фрагмент из $lost слов — «${lostTxt.take(60)}» → отклонено")
             return null
         }
-        return fixed
+        if (LocalAiEngine.looksGarbled(fixed)) {
+            Diagnostics.error("Чисто ($who): чужой алфавит или слипшийся текст → отклонено")
+            return null
+        }
+        // Склеиваем обрывки: «В субботу. Мы едем…» и «Конец. Второй части.» — реальные
+        // примеры из архивов, где модель ставила точку посреди фразы.
+        val merged = LocalAiEngine.mergeShortSentences(fixed)
+        if (merged != fixed) Diagnostics.info("Чисто ($who): склеены обрывки предложений")
+        return merged
     }
 
     /**
@@ -163,8 +203,16 @@ class VariantProcessor(
      * изложения. Возвращает null, если результат не годится: вызывающий берёт правила.
      */
     private fun verifySummary(source: String, candidate: String, who: String): String? {
-        val t = LocalAiEngine.cutSecondVariant(stripMetaPreamble(candidate)).trim()
+        // Порядок: срезать зачин → срезать «второй вариант»/мета-врезку → убрать разметку
+        // и обрывки нумерованного списка → склеить обрывки предложений.
+        var t = LocalAiEngine.stripListMarkup(
+            LocalAiEngine.cutSecondVariant(stripMetaPreamble(candidate))).trim()
+        t = LocalAiEngine.mergeShortSentences(t)
         if (t.isBlank()) return null
+        if (LocalAiEngine.looksGarbled(t)) {
+            Diagnostics.error("Пересказ ($who): чужой алфавит или слипшийся текст → отклонено")
+            return null
+        }
         if (isMetaTalk(t)) {
             Diagnostics.error("Пересказ ($who): рассуждение О тексте («${t.take(40)}…») → отклонено")
             return null
@@ -211,19 +259,28 @@ class VariantProcessor(
     // v120: добавлена одна фраза про происхождение точек. Пользователь: «Он как будто бы не
     // понимает, что исходная пунктуация — это предложение от программы, которая глупее ИИ».
     // Формулировка короткая намеренно: на длинных инструкциях Qwen 1.5B теряется (урок v106).
-    private val LOCAL_CLEAN = "Программа распознала речь с ошибками. Восстанови, что человек сказал. " +
-        "Точки в тексте поставила программа — не верь им, расставь заново по смыслу речи. " +
+    // v128: текст приходит УЖЕ без знаков и заглавных (asrStream), поэтому фраза
+    // «не верь точкам» больше не нужна — точек нет. Вместо неё прямая задача:
+    // расставить знаки и заглавные самому. Промпт стал даже короче, что для 1.5B плюс.
+    private val LOCAL_CLEAN = "Это распознанная речь без знаков препинания. " +
+        "Раздели её на предложения по смыслу, расставь точки, запятые и заглавные буквы. " +
         "Бессмысленное слово замени похожим по звучанию. Понятные слова не трогай. " +
         "Ничего не сокращай и не добавляй. В ответе только текст."
     // «Кратко» — то же самое вдвое короче, БЕЗ анализа и пересказа со стороны.
     // v122: добавлены два запрета по итогам теста — «не переписывай теми же словами»
     // (модель копировала вход вместо пересказа) и «пиши полными предложениями»
     // (облако выдавало телеграф: «куплен чай бергамотом и виолончель дочка»).
+    // v131: добавлено требование сохранять отрицания. В архиве «Чисто» говорило «это
+    // вообще НЕ означает, что системы способны на автономное исследование», а «Суть» —
+    // «они МОГУТ полностью автономно проводить исследования». Смысл перевернулся.
+    private val KEEP_NEGATION = "Обязательно сохраняй отрицания: если в тексте «не», «нельзя», " +
+        "«невозможно» — они должны остаться, менять утверждение на противоположное запрещено. "
     private val LOCAL_BRIEF = "Перескажи этот текст СВОИМИ словами вдвое короче. " +
         "Не переписывай теми же словами. Полными предложениями, от того же лица, в том же порядке. " +
-        "Не анализируй и не объясняй. Смысл не меняй. В ответе только текст."
+        KEEP_NEGATION + "Не анализируй и не объясняй. В ответе только текст."
     private val LOCAL_GIST = "Скажи своими словами, о чём главное в этом тексте — одним-двумя предложениями. " +
-        "Полными предложениями, от того же лица. Не пиши «в тексте говорится». В ответе только текст."
+        "Полными предложениями, от того же лица. " + KEEP_NEGATION +
+        "Не пиши «в тексте говорится». В ответе только текст."
     private val LOCAL_LECTURE_BRIEF = "Это запись лекции. Перескажи её своими словами вдвое короче, " +
         "сохранив все темы и их порядок. Полными предложениями. Не анализируй. В ответе только текст."
     private val LOCAL_LECTURE_GIST = "Это запись лекции. Назови своими словами главное по каждой её теме, " +
@@ -249,7 +306,11 @@ class VariantProcessor(
         val googleCaps = note.recordMode == "google"
         stageOf[note.id] = "Чисто: модель на устройстве…"
         var rolledTotal = 0
-        val res = LocalAiEngine.processLong(context, prompt, text, settings.localAiModel, noteId = note.id,
+        // В модель уходит поток слов БЕЗ машинных знаков — иначе она копирует чужую
+        // разбивку вместо того, чтобы делить по смыслу (см. asrStream).
+        val stream = asrStream(text)
+        Diagnostics.info("Чисто: машинная пунктуация снята перед отправкой (${text.length}→${stream.length} симв)")
+        val res = LocalAiEngine.processLong(context, prompt, stream, settings.localAiModel, noteId = note.id,
             onProgress = { d, t, _ -> partDone[note.id] = d; partTotal[note.id] = t
                 stageOf[note.id] = "Чисто: часть $d из $t" },
             chunkOk = { chunk, r ->
@@ -408,9 +469,11 @@ class VariantProcessor(
         } else readyBrief
 
         if (missing(Level.GIST)) {
-            val gist = localSummary(note, briefText, Level.GIST, lecture)
+            // Суть считаем от «Чисто», а не от «Кратко»: меньше перегонок — меньше
+            // накопленных искажений (в архиве на второй перегонке терялось «не»).
+            val gist = localSummary(note, cleanText, Level.GIST, lecture)
             put(Level.GIST, gist)
-            Diagnostics.info("Каскад: Суть ← Кратко (${briefText.length}→${gist.length} симв)")
+            Diagnostics.info("Каскад: Суть ← Чисто (${cleanText.length}→${gist.length} симв)")
         }
         return result
     }
@@ -595,15 +658,15 @@ class VariantProcessor(
                 // Каскад: пересчитали «Чисто» — «Кратко» и «Суть» построены на прежнем
                 // источнике. Помечаем их устаревшими, но НЕ трогаем: текст остаётся виден,
                 // пересчитает пользователь кнопкой «Обновить» на нужном уровне.
-                if (l == Level.CLEAN || l == Level.BRIEF) markStaleBelow(note, l)
+                if (l == Level.CLEAN) markStaleBelow(note, l)
                 persist()
                 ok = true
                 Diagnostics.engine("Обновлён вариант ($l/$t): ${text.length} симв, движок: $lastEngine")
             } catch (e: Exception) {
                 if (e is kotlinx.coroutines.CancellationException) throw e
                 states[key] = State.FAILED
-                lastAiError = e.message?.take(50)
-                Diagnostics.error("Обновление варианта ($l) не удалось: ${e.message?.take(50)}")
+                lastAiError = e.message
+                Diagnostics.error("Обновление варианта ($l) не удалось: ${e.message}")
             } finally {
                 // Снимаем признак ТОЛЬКО после того, как текст записан и сохранён —
                 // иначе индикация гаснет раньше, чем пользователь видит новый текст.
@@ -629,9 +692,11 @@ class VariantProcessor(
      * прежний вариант остаётся видимым и обновляется по желанию.
      */
     private fun markStaleBelow(note: Note, l: Level) {
+        // v131: «Суть» больше НЕ зависит от «Кратко» (она считается от «Чисто»),
+        // поэтому обновление «Кратко» её не устаревает — иначе мы помечали бы
+        // как устаревший текст, который на самом деле в порядке.
         val below = when (l) {
             Level.CLEAN -> listOf(Level.BRIEF, Level.GIST)
-            Level.BRIEF -> listOf(Level.GIST)
             else -> emptyList()
         }
         var n = 0
@@ -653,7 +718,13 @@ class VariantProcessor(
         fun v(lv: Level) = note.getVariant(lv, Tone.NEUTRAL)?.takeIf { it.isNotBlank() }
         return when (l) {
             Level.BRIEF -> v(Level.CLEAN) ?: orig
-            Level.GIST -> v(Level.BRIEF) ?: v(Level.CLEAN) ?: orig
+            // v131: «Суть» теперь считается ОТ «ЧИСТО», а не от «Кратко».
+            // Цепочка Дословно→Чисто→Кратко→Суть означала три пересказа подряд, и ошибки
+            // копились. В архиве это видно прямо: «Чисто» — «Это вообще НЕ означает, что
+            // такие системы способны на полностью автономное исследование», а «Суть» —
+            // «Они МОГУТ полностью автономно проводить научные исследования». Смысл
+            // перевернулся на второй перегонке. Меньше звеньев — меньше искажений.
+            Level.GIST -> v(Level.CLEAN) ?: v(Level.BRIEF) ?: orig
             else -> orig
         }
     }
@@ -675,7 +746,7 @@ class VariantProcessor(
     private suspend fun computeOne(note: Note, l: Level, t: Tone, vary: Boolean = false): String {
         val orig = verbatimShown(note)
         val src = sourceFor(note, l)
-        if (src !== orig) Diagnostics.info("Каскад ($l): источник — ${if (l == Level.BRIEF) "Чисто" else "Кратко"} (${src.length} симв)")
+        if (src !== orig) Diagnostics.info("Каскад ($l): источник — Чисто (${src.length} симв)")
         // Роутинг: локальный ИИ (если выбран офлайн) или облачный.
         if (settings.useAI && settings.localAi &&
             LocalAiModelManager.isReady(context, settings.localAiModel)) {
@@ -685,10 +756,10 @@ class VariantProcessor(
                     // Задача везде одна: восстановить речь, а не улучшить текст.
                     val prompts = listOf(
                         LOCAL_CLEAN,
-                        "Это машинная расшифровка речи с ошибками. Напиши, что человек сказал на самом деле. " +
-                            "Непонятное слово замени созвучным. Знаки препинания — по смыслу. В ответе только текст.",
-                        "Восстанови речь по этой расшифровке: исправь неверно распознанные слова на созвучные, " +
-                            "раздели на предложения по смыслу. Слова не выбрасывай. В ответе только текст."
+                        "Перед тобой речь без знаков препинания. Расставь точки, запятые и заглавные, " +
+                            "разделив по смыслу. Непонятное слово замени созвучным. В ответе только текст.",
+                        "Оформи эту речь как читаемый текст: границы предложений — по смыслу, " +
+                            "неверно распознанные слова замени созвучными. Слова не выбрасывай. В ответе только текст."
                     )
                     localClean(note, orig, if (vary) prompts.random() else prompts[0])
                 }
@@ -698,12 +769,14 @@ class VariantProcessor(
         }
         val result = if (settings.useAI) {
             lastEngine = "облако"
-            val r0 = AiClient.process(src, l, t, settings.apiKey, vary)
+            // Для «Чисто» в облако тоже уходит поток слов без машинных знаков.
+            val toSend = if (l == Level.CLEAN) asrStream(src) else src
+            val r0 = AiClient.process(toSend, l, t, settings.apiKey, vary)
             when (l) {
                 Level.BRIEF, Level.GIST -> verifySummary(src, r0, "облако")
                     ?: run { lastEngine = "правила"; TextCondenser.condense(src, l) }
                 // «Чисто» из облака проходит ту же верификацию, что и локальное.
-                Level.CLEAN -> verifyClean(src, r0, "облако")
+                Level.CLEAN -> verifyClean(asrStream(src), r0, "облако")
                     ?: run { lastEngine = "правила"; CleanProcessor.clean(src, note.recordMode == "google") }
                 else -> r0
             }

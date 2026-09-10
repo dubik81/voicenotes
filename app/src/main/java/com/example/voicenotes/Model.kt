@@ -89,6 +89,22 @@ data class Note(
         return "${idx + 1}/${hist.size}" + if (eng.isNotBlank()) " · $eng" else ""
     }
 
+    /**
+     * Чем сделана ТЕКУЩАЯ показанная версия: «облако», «на устройстве (qwen)»,
+     * «правила», «правила (облако не ответило)». Пустая строка — метки нет.
+     *
+     * v130: раньше это было видно только в мелкой подписи у стрелок истории, и то лишь
+     * когда версий больше одной. Из-за этого запасной результат правил выглядел как
+     * работа ИИ — пользователь оценивал текст, не зная, что ИИ вообще не отвечал.
+     */
+    fun engineOf(level: Level, tone: Tone): String {
+        val key = variantKey(level, tone)
+        val eng = historyEngine[key] ?: return ""
+        val hist = history[key] ?: return ""
+        val idx = (historyIndex[key] ?: (hist.size - 1)).coerceIn(0, maxOf(0, eng.size - 1))
+        return eng.getOrNull(idx).orEmpty()
+    }
+
     /** Можно ли шагнуть к предыдущей версии. */
     fun canGoBack(level: Level, tone: Tone): Boolean {
         val key = variantKey(level, tone)

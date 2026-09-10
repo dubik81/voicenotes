@@ -582,6 +582,17 @@ fun EditorScreen(
     fun doExportZip() {
         try {
             Diagnostics.snapshot(context, settings)
+            // ИТОГ ПО ЗАМЕТКЕ (v130). Разбирая архив, приходилось вычитывать по всему логу,
+            // чем в итоге сделан каждый уровень. Теперь при экспорте пишем сводку: сразу
+            // видно, где работал ИИ, а где показан запасной результат правил.
+            Diagnostics.info("=== ИТОГ ПО ЗАМЕТКЕ «${note.title.take(40)}» ===")
+            Diagnostics.info("Дословно: ${note.original.length} симв, режим записи=${note.recordMode.ifBlank { "импорт" }}, лекция=${note.isLecture}")
+            for (l in listOf(Level.CLEAN, Level.BRIEF, Level.GIST)) {
+                val txt = note.getVariant(l, Tone.NEUTRAL)
+                val eng = note.engineOf(l, Tone.NEUTRAL).ifBlank { "?" }
+                val stale = if (processor.isStale(note.id, l, Tone.NEUTRAL)) ", УСТАРЕЛ (источник менялся)" else ""
+                Diagnostics.info("  $l: ${txt?.length ?: 0} симв, движок: $eng$stale")
+            }
             Diagnostics.action("Экспорт заметки (zip)")
             val file = NoteExporter.exportFull(context, note)
             val uri = androidx.core.content.FileProvider.getUriForFile(
@@ -1126,7 +1137,15 @@ fun EditorScreen(
                         downloadProgress in 0..100 -> status
                         original.isBlank() -> "Нажмите «Запись»"
                         active && total > 0 -> "Обрабатываю варианты: $done из $total"
-                        total > 0 && done >= total -> "Все варианты готовы"
+                        // v131: строка «Все варианты готовы» стояла рядом с предупреждением
+                        // «Облачный ИИ недоступен» — экран сообщал об успехе и об отказе
+                        // одновременно. Если варианты собраны правилами, так и пишем.
+                        total > 0 && done >= total -> {
+                            val byRules = listOf(Level.CLEAN, Level.BRIEF, Level.GIST)
+                                .all { note.engineOf(it, tone).startsWith("правила") }
+                            if (byRules) "Готово, но БЕЗ ИИ — собрано по правилам"
+                            else "Все варианты готовы"
+                        }
                         total > 0 && done < total && processor.lastAiError != null ->
                             "ИИ: ${processor.lastAiError}"
                         total > 0 && done < total -> "Готово: $done из $total"
@@ -1141,15 +1160,35 @@ fun EditorScreen(
                         Text("Построено на прежнем «Чисто» — нажмите ↻, чтобы пересчитать",
                             color = Palette.Amber, fontSize = 10.sp, maxLines = 2)
                     }
+                    // ЗАПАСНОЙ РЕЗУЛЬТАТ (v130). Когда ИИ не ответил, текст считают правила.
+                    // Раньше это было видно только мелкой подписью у стрелок истории, и то
+                    // не всегда: пользователь оценивал текст, не зная, что ИИ не работал —
+                    // отсюда «кажется, онлайн-ИИ не сработал, но показывается коряво».
+                    val engNow = note.engineOf(level, tone)
+                    if (level != Level.VERBATIM && engNow.startsWith("правила")) {
+                        Surface(color = Palette.Amber.copy(alpha = 0.18f),
+                            shape = RoundedCornerShape(10.dp), modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                if (engNow.contains("облако"))
+                                    "⚠ Это НЕ работа ИИ. Облако не ответило, текст собран по правилам. Нажмите ↻, чтобы попробовать снова."
+                                else "⚠ Это НЕ работа ИИ: текст собран по правилам (модель не справилась). Нажмите ↻ для повтора.",
+                                color = cs.onSurface, fontSize = 11.sp,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                            )
+                        }
+                    }
                     // Облако не отвечает — говорим сразу, до отправки текста, и даём
                     // перепроверить одним касанием (проверка занимает секунду).
+                    // v131: было в одну строку с кнопкой справа — текст обрезался на
+                    // полуслове («…временный лимит провайдера —») и налезал на кнопку.
+                    // Теперь сообщение целиком, в столбик, кнопка под ним.
                     if (cloudProblem.isNotBlank() && !localAi) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("⚠ Облачный ИИ: ${cloudProblem.take(80)}",
-                                color = Palette.Amber, fontSize = 10.sp, maxLines = 2,
-                                modifier = Modifier.weight(1f))
-                            TextButton(onClick = { checkCloud(force = true) }) {
-                                Text("Проверить", fontSize = 10.sp)
+                        Column(Modifier.fillMaxWidth()) {
+                            Text("⚠ Облачный ИИ: $cloudProblem",
+                                color = Palette.Amber, fontSize = 11.sp)
+                            TextButton(onClick = { checkCloud(force = true) },
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp)) {
+                                Text("Проверить ещё раз", fontSize = 11.sp)
                             }
                         }
                     }
