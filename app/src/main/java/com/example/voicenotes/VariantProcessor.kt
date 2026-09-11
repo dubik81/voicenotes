@@ -63,6 +63,16 @@ class VariantProcessor(
 
     // Последняя ошибка ИИ (для показа причины пользователю).
     var lastAiError: String? = null
+
+    /**
+     * ЧТО СКАЗАТЬ ЧЕЛОВЕКУ ПОСЛЕ «ОБНОВИТЬ» (v136), если произошло не просто «готово».
+     *
+     * Зачем отдельно от lastAiError: тот показывается только пока расчёт НЕ закончен
+     * (done < total), поэтому сообщения храповика «новый вариант хуже — оставлен прежний»
+     * человек на экране не видел ни разу — текст не менялся, и нажатие выглядело как
+     * «ничего не произошло». А приложение должно реагировать всегда.
+     */
+    var lastNotice: String? = null
         private set
 
     fun isActive(noteId: Long): Boolean = activeNote[noteId] == true
@@ -126,7 +136,7 @@ class VariantProcessor(
             for (l in listOf(Level.BRIEF, Level.GIST)) {
                 val sKey = "${l.ordinal}:${tn.ordinal}"
                 all[sKey]?.let { cand ->
-                    val ok = verifySummary(cleanSrc, cand, "облако")
+                    val ok = verifySummary(cleanSrc, cand, "облако", l)
                     all[sKey] = ok ?: TextCondenser.condense(cleanSrc, l)
                     if (ok == null) engineOf["${l.ordinal}"] = "правила (облако не пересказало)"
                 }
@@ -204,7 +214,7 @@ class VariantProcessor(
      * лекции начиналось с «Лекция охватывает две темы» — описание со стороны вместо
      * изложения. Возвращает null, если результат не годится: вызывающий берёт правила.
      */
-    private fun verifySummary(source: String, candidate: String, who: String): String? {
+    private fun verifySummary(source: String, candidate: String, who: String, l: Level): String? {
         // Порядок: срезать зачин → срезать «второй вариант»/мета-врезку → убрать разметку
         // и обрывки нумерованного списка → склеить обрывки предложений.
         var t = LocalAiEngine.stripListMarkup(
@@ -222,6 +232,24 @@ class VariantProcessor(
         if (LocalAiEngine.isCopyNotSummary(source, t)) {
             Diagnostics.error("Пересказ ($who): это копия источника, а не изложение → отклонено")
             return null
+        }
+        // ПОТОЛОК ДЛИНЫ (v136). Замер по всем архивам: Кратко выходило 0.61–0.67 от
+        // «Чисто» при задаче ~0.5, Суть 0.42–0.53 при задаче ~0.25 — и одинаково у Qwen,
+        // облака и правил. Значит просьбой в промпте это не решается. Переросший текст
+        // не выбрасываем (там нормальные формулировки) — укладываем в бюджет по ключевым
+        // предложениям. Это ровно то, чего просил пользователь: «та же подача, короче».
+        val cap = if (l == Level.BRIEF) 0.65 else 0.38
+        val target = if (l == Level.BRIEF) 0.52f else 0.28f
+        if (source.isNotEmpty() && t.length > source.length * cap) {
+            val trimmed = TextCondenser.keepKeySentences(t, source.length * target / t.length)
+            if (trimmed.length in 40 until t.length) {
+                Diagnostics.engine("Пересказ ($who, $l): ${t.length} симв при потолке " +
+                    "${(source.length * cap).toInt()} — ужато до ${trimmed.length} по ключевым предложениям")
+                t = trimmed
+            } else {
+                Diagnostics.engine("Пересказ ($who, $l): ${t.length} симв при потолке " +
+                    "${(source.length * cap).toInt()}, ужать не удалось (мало предложений)")
+            }
         }
         return t
     }
@@ -366,7 +394,7 @@ class VariantProcessor(
         // склеивал обрывки предложений и не ловил мета-врезку в середине. В архиве v131
         // это видно прямо: «Суть» пришла как «…Вот короткие описания ключевых тем лекции:
         // 1. **Теряется текст**: …» — облачный путь такое отбраковывал, локальный пропускал.
-        val r: String = raw?.let { verifySummary(text, it, "на устройстве") }.orEmpty()
+        val r: String = raw?.let { verifySummary(text, it, "на устройстве", l) }.orEmpty()
         val ok = r.isNotBlank() && !isLoopy(r) &&
             r.length >= (if (l == Level.BRIEF) 10 else 5) && r.length < text.length
         return if (ok) {
@@ -488,6 +516,12 @@ class VariantProcessor(
     fun ensureAll(note: Note, priorityLevel: Level, priorityTone: Tone) {
         if (note.original.isBlank()) return
         if (jobs[note.id]?.isActive == true) return
+        // Открыли заметку — сначала показываем лучшее из того, что уже посчитано.
+        // Заметки, сделанные прошлыми версиями, тоже подтягиваются: у них в истории
+        // лежат хорошие тексты, которых человек не видел.
+        // В фоне: на лекции это сравнение сотен слов, на главном потоке оно бы подвесило
+        // открытие заметки.
+        scope.launch { pickBestAll(note) }
 
         val combos = allCombos(note.isLecture)
         for ((l, t) in combos) {
@@ -543,6 +577,7 @@ class VariantProcessor(
                             }
                         }
                         Diagnostics.engine("Пакет вариантов записан: $filled${if (skipped > 0) ", пропущено уже готовых: $skipped" else ""} (движок: $lastEngine)")
+                        pickBestAll(note)   // в истории уже может лежать вариант лучше свежего
                         // «Дословно» (VERBATIM) НЕ трогаем — оно всегда исходный текст,
                         // не меняется после ИИ (требование пользователя).
                         progressTotal[note.id] = combos.size
@@ -650,20 +685,86 @@ class VariantProcessor(
         // 5. Заканчивается законченным предложением.
         if (!text.trim().endsWith(".") && !text.trim().endsWith("!") && !text.trim().endsWith("?")) s -= 40
         // 6. Соответствие длины задаче уровня.
+        // Для «Чисто» есть мёртвая зона ±12%: восстановление сказанного законно делает
+        // текст чуть длиннее или короче потока распознавания, и штрафовать за это нельзя —
+        // иначе побеждает вариант, который просто ближе по числу букв, а не по смыслу.
         val ratio = if (source.isEmpty()) 1.0 else text.length.toDouble() / source.length
         s -= when (l) {
-            Level.CLEAN -> (Math.abs(ratio - 1.0) * 100).toInt()          // должен быть примерно равен
+            Level.CLEAN -> ((Math.abs(ratio - 1.0) - 0.12).coerceAtLeast(0.0) * 200).toInt()
             Level.BRIEF -> (Math.abs(ratio - 0.5) * 120).toInt()
             else -> (Math.abs(ratio - 0.25) * 120).toInt()
         }
-        // 7. Знаки препинания расставлены (для «Чисто» это и есть работа).
+        val words = Regex("[А-Яа-яЁёA-Za-z0-9]+").findAll(text).map { it.value }.toList()
+        // 7. ПОВТОР СЛОВА РЯДОМ — надёжный признак сломанного текста. В архиве v134:
+        // «Основная основной частью», «результаты. Результаты нельзя доверять». Сравниваем
+        // фонетические скелеты, чтобы ловить и разные формы одного слова; скелеты короче
+        // трёх букв (и, ни, им, то, ту) не в счёт — там совпадения случайны.
+        var dup = 0
+        for (i in words.indices) {
+            val sk = skeleton(words[i])
+            if (sk.length < 3) continue
+            val lim = minOf(words.lastIndex, i + 3)
+            for (j in i + 1..lim) if (sk == skeleton(words[j])) { dup++; break }
+        }
+        s -= minOf(dup, 3) * 35
+        // 8. Границы предложений расставлены (для «Чисто» это и есть работа).
+        // Раньше штраф был только за «вообще ни одной точки». Но в архиве проигрывал
+        // хорошо разбитый текст тексту-потоку с одной точкой в конце: формально точка
+        // есть. Теперь считаем плотность: примерно одно предложение на 12 слов.
         if (l == Level.CLEAN) {
             val dots = text.count { it == '.' || it == '!' || it == '?' }
-            val words = text.split(Regex("\\s+")).size
-            if (dots == 0 && words > 20) s -= 120          // сплошной поток без точек
-            s += minOf(dots, words / 8) * 5                // разумное число предложений
+            val expected = words.size / 12.0
+            if (dots < expected) s -= ((expected - dots) * 25).toInt()
+            s += minOf(dots, words.size / 8) * 5           // разумное число предложений
         }
         return s
+    }
+
+    /**
+     * АВТОВЫБОР ЛУЧШЕЙ ВЕРСИИ (v136). Пользователь: «в вариантах есть хорошие результаты,
+     * их нужно поймать и зафиксировать». В архиве v134 в 6 случаях из 30 хороший текст уже
+     * лежал в истории, а показывался испорченный — человек про это не знал, потому что
+     * стрелки версий он не листает.
+     *
+     * Почему здесь, а не в каждом месте записи: за прошлые версии защиту трижды ставили
+     * на один путь из двух, и второй путь её обходил. Этот выбор работает ПОСЛЕ любой
+     * записи, чем бы она ни была сделана — каскадом, «Обновить», облаком или правилами.
+     *
+     * Порог 30 проверен на архиве v134: разница меньше — это шум (запятая вместо точки,
+     * «решение» вместо «решения»), там оценка не умнее человека и лезть не надо. Разница
+     * больше — это всегда была настоящая поломка: пересказ, подменённый первой фразой
+     * исходника, «Основная основной частью», потерянное «ни… ни».
+     *
+     * Закреплённый замком вариант не трогаем: это осознанный выбор человека.
+     */
+    private val BEST_MARGIN = 30
+
+    fun pickBest(note: Note, l: Level, t: Tone): Boolean {
+        if (l == Level.VERBATIM || note.isLocked(l, t)) return false
+        val key = note.variantKey(l, t)
+        val hist = note.history[key] ?: return false
+        if (hist.size < 2) return false
+        val shown = (note.historyIndex[key] ?: (hist.size - 1)).coerceIn(0, hist.lastIndex)
+        val src = sourceFor(note, l)
+        if (src.isBlank()) return false
+        val scores = hist.map { scoreVariant(src, it, l) }
+        val bestI = scores.indices.maxByOrNull { scores[it] } ?: return false
+        if (bestI == shown || scores[bestI] - scores[shown] < BEST_MARGIN) return false
+        note.historyIndex[key] = bestI
+        note.variants[key] = hist[bestI]
+        lastNotice = "Показан лучший вариант из истории (${bestI + 1}/${hist.size})"
+        Diagnostics.engine("Автовыбор ($l/$t): показана была версия ${shown + 1} (оценка " +
+            "${scores[shown]}), в истории есть лучше — версия ${bestI + 1} (оценка " +
+            "${scores[bestI]}). Переключено на неё; прежнюю видно стрелками.")
+        return true
+    }
+
+    /** Автовыбор по всем уровням и тонам заметки. Возвращает число переключений. */
+    fun pickBestAll(note: Note): Int {
+        var n = 0
+        for (l in Level.entries) for (t in Tone.entries) if (pickBest(note, l, t)) n++
+        if (n > 0) persist()
+        return n
     }
 
     /** Ошибки, при которых повтор через 6 секунд заведомо бесполезен. */
@@ -697,9 +798,17 @@ class VariantProcessor(
             return
         }
         updating[key] = true
+        lastNotice = null
+        // ЖИЗНЕННЫЙ ЦИКЛ ПЕРЕСЧЁТА (v135). В логе теста нашлось нажатие «Обновить»,
+        // после которого НЕ БЫЛО НИЧЕГО: ни результата, ни ошибки, ни отметки времени —
+        // 3.5 минуты тишины, потом человек нажал ещё раз. Разобрать такое по логу
+        // невозможно. Теперь у каждого пересчёта есть начало И конец с причиной.
+        val tStart = System.currentTimeMillis()
+        Diagnostics.event("Пересчёт ($l/$t) НАЧАТ, движок=${if (settings.localAi) "локальный" else "облачный"}")
         oneJobs[key] = scope.launch {
             states[key] = State.RUNNING
             var ok = false
+            var finish = "неизвестно"
             try {
                 LocalAiEngine.beginNote(note.id, verbatimShown(note))
                 val text = computeOne(note, l, t, vary = true)
@@ -717,12 +826,14 @@ class VariantProcessor(
                     note.putVariant(l, t, text, lastEngine)
                     note.goBack(l, t)
                     lastAiError = "Новый вариант получился хуже — оставлен прежний"
+                    lastNotice = "Новый вариант хуже — оставлен прежний (новый в истории ‹ ›)"
                 } else {
                     val added = note.putVariant(l, t, text, lastEngine)
                     if (!added) {
                         Diagnostics.engine("Обновление ($l/$t): модель выдала УЖЕ ИМЕЮЩИЙСЯ вариант — " +
                             "новая версия не создана")
                         lastAiError = "Модель выдала тот же вариант"
+                        lastNotice = "Модель выдала тот же вариант — новой версии нет"
                     }
                 }
                 states[k(note.id, l, t)] = State.DONE
@@ -731,15 +842,30 @@ class VariantProcessor(
                 // источнике. Помечаем их устаревшими, но НЕ трогаем: текст остаётся виден,
                 // пересчитает пользователь кнопкой «Обновить» на нужном уровне.
                 if (l == Level.CLEAN) markStaleBelow(note, l)
+                // Храповик выше сравнил новый вариант с ПОКАЗАННЫМ. Но лучший может лежать
+                // и глубже в истории — например, если прошлое «Обновить» уже сдвинуло показ
+                // назад. Смотрим всю историю целиком.
+                pickBest(note, l, t)
                 persist()
                 ok = true
+                finish = "успешно"
                 Diagnostics.engine("Обновлён вариант ($l/$t): ${text.length} симв, движок: $lastEngine")
-            } catch (e: Exception) {
-                if (e is kotlinx.coroutines.CancellationException) throw e
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // Отмена — не ошибка, но пользователь должен видеть, что пересчёт прерван,
+                // а не «ничего не произошло».
+                finish = "ОТМЕНЁН"
+                lastAiError = "Пересчёт прерван"
+                Diagnostics.error("Пересчёт ($l/$t) ОТМЕНЁН (выход из заметки, отмена или новый запуск)")
+                throw e
+            } catch (e: Throwable) {
+                // Ловим Throwable, а не Exception: раньше Error (например, нехватка памяти)
+                // уносил корутину молча — в логе не оставалось ни строчки.
+                finish = "ОШИБКА"
                 states[key] = State.FAILED
-                lastAiError = e.message
-                Diagnostics.error("Обновление варианта ($l) не удалось: ${e.message}")
+                lastAiError = e.message ?: e.javaClass.simpleName
+                Diagnostics.error("Пересчёт ($l/$t) УПАЛ: ${e.javaClass.simpleName}: ${e.message}")
             } finally {
+                Diagnostics.event("Пересчёт ($l/$t) ЗАВЕРШЁН: $finish за ${System.currentTimeMillis() - tStart} мс")
                 // Снимаем признак ТОЛЬКО после того, как текст записан и сохранён —
                 // иначе индикация гаснет раньше, чем пользователь видит новый текст.
                 updating.remove(key)
@@ -850,7 +976,7 @@ class VariantProcessor(
             val toSend = if (l == Level.CLEAN) asrStream(src) else src
             val r0 = AiClient.process(toSend, l, t, settings.apiKey, vary)
             when (l) {
-                Level.BRIEF, Level.GIST -> verifySummary(src, r0, "облако")
+                Level.BRIEF, Level.GIST -> verifySummary(src, r0, "облако", l)
                     ?: run { lastEngine = "правила"; TextCondenser.condense(src, l) }
                 // «Чисто» из облака проходит ту же верификацию, что и локальное.
                 Level.CLEAN -> verifyClean(asrStream(src), r0, "облако")

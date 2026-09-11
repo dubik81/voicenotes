@@ -59,6 +59,16 @@ object NoteExporter {
                 hist.put(key, arr)
             }
             put("history", hist)
+            // КАКАЯ ВЕРСИЯ ПОКАЗАНА и что закреплено замком (v136). Без этого по архиву
+            // нельзя отличить «показан лучший вариант» от «лучший лежит в истории, а на
+            // экране испорченный» — приходилось угадывать сравнением текстов.
+            val hIdx = JSONObject()
+            note.history.keys.forEach { key ->
+                hIdx.put(key, note.historyIndex[key] ?: ((note.history[key]?.size ?: 1) - 1))
+            }
+            put("history_shown_index", hIdx)
+            put("locked", org.json.JSONArray().also { a -> note.locked.forEach { a.put(it) } })
+            put("has_non_audio_text", note.hasNonAudioText)
         }
 
         val dir = File(context.cacheDir, "exports").apply { mkdirs() }

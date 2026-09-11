@@ -151,6 +151,16 @@ fun EditorScreen(
         // Словарь исправлений частых ошибок распознавания (офлайн, мгновенно).
         val fixed = RecognitionDictionary.apply(text)
         original = if (original.isBlank()) fixed else "$original $fixed"
+        // Онлайн-распознавание (Google) аудио НЕ сохраняет: помечаем заметку, чтобы
+        // «Обновить» в «Дословно» предупредил о возможной потере этой части текста.
+        // (режим берём у самой заметки: локальная переменная isOnline объявлена ниже)
+        if (note.recordMode == "google" || !settings.saveAudio) {
+            if (!note.hasNonAudioText) {
+                note.hasNonAudioText = true
+                Diagnostics.info("Заметка: добавлен текст БЕЗ аудио (онлайн-запись) — " +
+                    "перераспознавание его не восстановит")
+            }
+        }
         if (note.title == "Заметка" || note.title == "Лекция") {
             val t = original.take(30).trim()
             if (t.isNotBlank()) note.title = t
@@ -407,6 +417,21 @@ fun EditorScreen(
                 Diagnostics.action("Обновить (импорт): чистка правилами")
                 return
             }
+            // ЗАЩИТА ОТ ПОТЕРИ ТЕКСТА (v135). «Обновить» здесь перераспознаёт ВЕСЬ
+            // аудиофайл и заменяет текст результатом. Если часть текста пришла не из
+            // аудио — записана онлайн через Google (аудио не сохраняется) или вставлена
+            // вручную — она просто исчезнет. При дозаписи в разных режимах это лёгкий
+            // способ потерять сказанное.
+            if (note.hasNonAudioText) {
+                status = "В тексте есть части не из аудио (онлайн-запись или вставка) — " +
+                         "перераспознавание их сотрёт. Прежний текст останется в истории ‹ ›."
+                Diagnostics.error("Обновить (Дословно): в заметке есть текст не из аудио — предупреждение показано")
+            }
+            // Текущий текст ОБЯЗАТЕЛЬНО кладём в историю ДО замены: иначе первая же
+            // перезапись стирала его безвозвратно (в истории не было ни одной версии).
+            if (original.isNotBlank()) {
+                note.putVariant(Level.VERBATIM, tone, note.original, "запись")
+            }
             voskRerunning = true; cornerIndicator = "vosk"
             scope.launch {
                 try {
@@ -450,7 +475,9 @@ fun EditorScreen(
                 onChanged(); refreshTick++
                 activeEngine = ""; cornerIndicator = ""
                 Diagnostics.event("Обновление $level заняло ${System.currentTimeMillis() - tUpd} мс")
-                status = if (ok) "Готово" else "ИИ не смог обработать"
+                // Если результат не «просто готово» (оставлен прежний вариант, показан
+                // лучший из истории, модель повторилась) — говорим об этом прямо.
+                status = if (ok) (processor.lastNotice ?: "Готово") else "ИИ не смог обработать"
             }
         }
     }

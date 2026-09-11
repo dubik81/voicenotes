@@ -91,16 +91,34 @@ object TextCondenser {
         return out
     }
 
-    private fun keepKeySentences(text: String, fraction: Float): String {
+    /**
+     * Оставляет ключевые предложения так, чтобы уложиться в ДОЛЮ ОТ ДЛИНЫ ТЕКСТА (v136).
+     *
+     * Было: оставляли долю от ЧИСЛА предложений. Но отбирались самые содержательные, то
+     * есть самые длинные, — и «половина предложений» давала 61% букв вместо 50%. По
+     * архивам это видно прямо: Кратко 0.61–0.67 от Чисто при норме 0.40–0.65, Суть
+     * 0.42–0.53 при норме 0.15–0.35, и одинаково у всех трёх движков — значит дело не в
+     * промптах, а здесь. Теперь набираем предложения по убыванию содержательности, пока
+     * не выбран бюджет знаков, и возвращаем их в исходном порядке.
+     *
+     * Самое содержательное предложение берётся всегда, даже если одно оно уже длиннее
+     * бюджета: пустой результат хуже длинного.
+     */
+    fun keepKeySentences(text: String, fraction: Float): String {
         val sentences = text.split(Regex("(?<=[.!?])\\s+"))
             .map { it.trim() }.filter { it.isNotBlank() }
         if (sentences.size <= 1) return text
+        val budget = (text.length * fraction).toInt().coerceAtLeast(sentences[0].length)
         val scored = sentences.mapIndexed { i, s ->
             Triple(i, s, s.split(Regex("\\s+")).count { it.length > 3 })
         }
-        val keepCount = (sentences.size * fraction).toInt().coerceAtLeast(1)
-        val kept = scored.sortedByDescending { it.third }.take(keepCount)
-            .map { it.first }.toSet()
+        val kept = LinkedHashSet<Int>()
+        var used = 0
+        for ((i, s, _) in scored.sortedByDescending { it.third }) {
+            if (used > 0 && used + s.length + 1 > budget) continue
+            kept.add(i); used += s.length + 1
+        }
+        if (kept.isEmpty()) kept.add(0)
         return scored.filter { it.first in kept }.sortedBy { it.first }
             .joinToString(" ") { it.second }
     }

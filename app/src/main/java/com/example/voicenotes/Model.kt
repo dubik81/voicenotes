@@ -67,6 +67,16 @@ data class Note(
      * Причина: удачный вариант получается не всегда, и потерять его нельзя.
      */
     val locked: MutableSet<String> = mutableSetOf()
+
+    /**
+     * В тексте есть части, которых НЕТ в аудиофайле: записанные онлайн через Google
+     * (аудио при этом не сохраняется) или вставленные вручную (v135).
+     *
+     * Зачем: «Обновить» в «Дословно» перераспознаёт ВЕСЬ аудиофайл и заменяет текст
+     * результатом. Если часть текста пришла не из аудио, она при этом просто исчезнет.
+     * При дозаписи в разных режимах это лёгкий способ потерять сказанное.
+     */
+    var hasNonAudioText: Boolean = false
     fun isLocked(level: Level, tone: Tone) = variantKey(level, tone) in locked
     fun toggleLock(level: Level, tone: Tone): Boolean {
         val key = variantKey(level, tone)
@@ -189,6 +199,7 @@ data class Note(
         // Закреплённые варианты должны переживать перезапуск приложения.
         val lk = JSONArray(); locked.forEach { lk.put(it) }
         put("locked", lk)
+        put("hasNonAudioText", hasNonAudioText)
         val he = JSONObject()
         historyEngine.forEach { (k, list) ->
             val arr = JSONArray(); list.forEach { arr.put(it) }; he.put(k, arr)
@@ -242,7 +253,7 @@ data class Note(
                 history = history,
                 historyIndex = historyIndex,
                 historyEngine = historyEngine
-            ).also { it.locked.addAll(locked) }
+            ).also { it.locked.addAll(locked); it.hasNonAudioText = o.optBoolean("hasNonAudioText", false) }
         }
 
         fun listToJson(notes: List<Note>): String {
