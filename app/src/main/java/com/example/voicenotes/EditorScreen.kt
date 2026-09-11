@@ -85,6 +85,29 @@ fun EditorScreen(
     var voskPreparing by remember { mutableStateOf(false) }
     var liveText by remember { mutableStateOf("") }
     var status by remember { mutableStateOf(if (note.original.isBlank()) "Нажмите «Запись»" else "Готово") }
+    /**
+     * «ДОСЛОВНО» НА ЭКРАНЕ И note.original — ОДНО И ТО ЖЕ (v138).
+     *
+     * Стрелки ‹ › меняли только показанную версию, а note.original оставался прежним.
+     * В обработку, в экспорт и в архив при этом уходил note.original — то есть НЕ тот
+     * текст, что видит человек. В тесте 136 на экране было «…Видит грека в реке Трак.
+     * Тест закончен.» (Whisper), а в архиве и в пересчётах — «…визит грека в реке рак
+     * тест закончен» (Vosk). Отсюда и «локальный ИИ ухудшил текст»: он работал с другим.
+     */
+    fun syncVerbatim() {
+        if (level != Level.VERBATIM) return
+        val shown = note.getVariant(Level.VERBATIM, tone)?.takeIf { it.isNotBlank() } ?: return
+        if (shown != note.original) {
+            note.original = shown
+            original = shown
+            Diagnostics.action("Дословно: показана версия ${note.versionLabel(Level.VERBATIM, tone)} " +
+                "(${shown.length} симв) — она же идёт в обработку и в экспорт")
+        }
+    }
+
+    // Прежнее «Дословно» уже сохранено в историю в ЭТОМ сеансе записи (v136).
+    // Одна запись = одна версия в истории, а не по версии на каждую распознанную фразу.
+    var appendSaved by remember { mutableStateOf(false) }
     var showRename by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
     // тикер, чтобы UI перечитывал note.variants при обновлениях процессора
@@ -147,14 +170,43 @@ fun EditorScreen(
         processor.ensureAll(note, level, tone)
     }
 
-    fun onRecognized(text: String) {
+    /**
+     * ЛОГИКА ВВОДА В «ДОСЛОВНО» (v136). Правило одно: «Дословно» — это то, что человек
+     * сказал, и оно только НАКАПЛИВАЕТСЯ. Отсюда три обязанности при каждой дозаписи:
+     *
+     * 1. Прежний текст уходит в историю ДО того, как вырастет. Случайно включённая запись
+     *    больше не невосстановима: шаг стрелкой ‹ возвращает то, что было.
+     * 2. Все смыслы помечаются устаревшими: они посчитаны по короткому тексту, и в них
+     *    физически нет того, что только что наговорено. Сам текст смыслов не трогаем.
+     * 3. Режим записи заметки — факт о ТЕКСТЕ, а не положение тумблера. Если куски
+     *    наговорены разными движками, режим становится «смешанный».
+     *
+     * @param fromGoogle кусок распознан онлайн (Google), а не Vosk. Приходит от того, кто
+     *        распознавал: локальная переменная isOnline объявлена ниже по файлу, и брать
+     *        её отсюда Kotlin не даёт.
+     */
+    fun onRecognized(text: String, fromGoogle: Boolean) {
         // Словарь исправлений частых ошибок распознавания (офлайн, мгновенно).
         val fixed = RecognitionDictionary.apply(text)
+        val hadText = original.isNotBlank()
+        if (hadText && !appendSaved) {
+            appendSaved = true
+            note.putVariant(Level.VERBATIM, tone, note.original, "запись")
+            processor.markStaleAllMeanings(note)
+            Diagnostics.action("Дозапись: прежнее «Дословно» (${note.original.length} симв) " +
+                "сохранено в историю, смыслы помечены устаревшими")
+        }
         original = if (original.isBlank()) fixed else "$original $fixed"
+        // Чем сделан ЭТОТ кусок.
+        val piece = if (fromGoogle) "google" else if (note.isLecture) "lecture" else "vosk"
+        if (!hadText || note.recordMode.isBlank()) note.recordMode = piece
+        else if (note.recordMode != piece && note.recordMode != "mixed") {
+            note.recordMode = "mixed"
+            Diagnostics.info("Заметка собрана РАЗНЫМИ движками речи — режим «смешанный»")
+        }
         // Онлайн-распознавание (Google) аудио НЕ сохраняет: помечаем заметку, чтобы
         // «Обновить» в «Дословно» предупредил о возможной потере этой части текста.
-        // (режим берём у самой заметки: локальная переменная isOnline объявлена ниже)
-        if (note.recordMode == "google" || !settings.saveAudio) {
+        if (fromGoogle || !settings.saveAudio) {
             if (!note.hasNonAudioText) {
                 note.hasNonAudioText = true
                 Diagnostics.info("Заметка: добавлен текст БЕЗ аудио (онлайн-запись) — " +
@@ -263,7 +315,7 @@ fun EditorScreen(
             override fun onResults(results: android.os.Bundle?) {
                 val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
                 liveText = ""
-                if (t.isNotBlank()) onRecognized(t)
+                if (t.isNotBlank()) onRecognized(t, fromGoogle = true)
                 if (keepListening) recognizer.startListening(buildIntent())
                 else { isListening = false; if (t.isBlank()) status = "Ничего не распознано" }
             }
@@ -384,7 +436,7 @@ fun EditorScreen(
             try {
                 engine.start(
                     onPartial = { p -> liveText = p; lastSpeechAt = System.currentTimeMillis() },
-                    onFinal = { t -> if (t.isNotBlank()) { onRecognized(t); lastSpeechAt = System.currentTimeMillis() }; liveText = "" },
+                    onFinal = { t -> if (t.isNotBlank()) { onRecognized(t, fromGoogle = false); lastSpeechAt = System.currentTimeMillis() }; liveText = "" },
                     onError = { msg -> status = msg; isListening = false; Diagnostics.error("Vosk: $msg") }
                 )
                 Diagnostics.event("Vosk: запись идёт (аудио=${audioFile != null})")
@@ -438,19 +490,34 @@ fun EditorScreen(
                     val model = VoskHolder.getModel(context)
                     val better = RecognitionEnsemble.refine(model, File(path), thorough = true)
                     if (!better.isNullOrBlank()) {
-                        original = better
                         val punct = Punctuator.punctuate(better)
-                        note.original = punct
                         note.putVariant(Level.VERBATIM, tone, punct, "Vosk")  // версия в историю → стрелки ‹ ›
-                        Diagnostics.action("Дословно изменено: перераспознавание Vosk (кнопка Обновить)")
+                        Diagnostics.action("Перераспознавание Vosk: ${punct.length} симв")
                     }
                     cornerIndicator = "whisper"
                     val wt = WhisperEngine.transcribe(context, path, settings.whisperModel)
                     if (!wt.isNullOrBlank()) {
                         whisperText = wt
-                        note.putVariant(Level.VERBATIM, tone, Punctuator.punctuate(wt), "Whisper")  // ещё версия
+                        note.putVariant(Level.VERBATIM, tone, Punctuator.punctuate(wt), "Whisper")
+                        Diagnostics.action("Перераспознавание Whisper: ${wt.length} симв")
                     }
-                    status = "Дословный текст обновлён"
+                    // СОГЛАСОВАНИЕ (v138). Какая расшифровка вернее — Vosk или Whisper —
+                    // программно не определить: это качество распознавания, а не
+                    // структура текста. Проверял на архиве: любая формальная оценка
+                    // выбирает Vosk, хотя у Whisper «Видит грека в реке Трак», а у Vosk
+                    // «визит грека в реке рак». Поэтому выбор оставляем человеку —
+                    // обе версии в истории, под стрелками честно подписан движок.
+                    //
+                    // Чинится другое: раньше на экране оставалась версия Whisper, а
+                    // note.original — от Vosk. В обработку, в экспорт и в архив уходил
+                    // note.original, то есть НЕ тот текст, что видит человек. Отсюда и
+                    // «локальный ИИ ухудшил текст»: он работал с другой расшифровкой.
+                    original = processor.verbatimShown(note)
+                    note.original = original
+                    Diagnostics.action("Дословно: показана и принята версия " +
+                        "${note.versionLabel(Level.VERBATIM, tone)} (${original.length} симв) — " +
+                        "она же идёт в обработку и в экспорт")
+                    status = "Дословно обновлено: ${note.versionLabel(Level.VERBATIM, tone).ifBlank { "1 версия" }}"
                 } catch (e: Exception) {
                     status = "Ошибка: ${e.message}"
                 } finally { voskRerunning = false; cornerIndicator = "" }
@@ -596,7 +663,9 @@ fun EditorScreen(
     }
 
     fun startRecording() {
-        Diagnostics.action("Запись СТАРТ (режим=${if (isOnline) "онлайн/Google" else "офлайн/Vosk"})")
+        Diagnostics.action("Запись СТАРТ (режим=${if (isOnline) "онлайн/Google" else "офлайн/Vosk"}, " +
+            "уже есть текст=${original.length} симв)")
+        appendSaved = false   // новый сеанс записи — прежний текст сохраним заново
         val useOffline = !isOnline
         if (useOffline) startVosk() else startListening()
     }
@@ -703,17 +772,28 @@ fun EditorScreen(
             },
             confirmButton = {
                 TextButton(onClick = {
-                    if (importText.isNotBlank()) {
-                        original = importText.trim()
-                        note.original = importText.trim()
-                        note.refinedText = null  // сброс собранного текста от прошлого
-                        note.variants.clear(); note.history.clear(); note.historyIndex.clear()
-                        processor.reset(note.id)
-                        Diagnostics.action("Импорт текста (${importText.length} симв) для теста")
-                        onChanged()
-                        // Раньше после вставки ничего не запускалось — обработка стартует, как после записи.
-                        if (settings.useAI && settings.autoAi) startProcessingAll()
+                    if (importText.isBlank()) {
+                        // Раньше при пустом поле окно просто закрывалось: нажатие
+                        // выглядело как «ничего не произошло» (v136).
+                        status = "Поле пустое — вставлять нечего"
+                        Diagnostics.action("Импорт: поле пустое, вставка отклонена")
+                        showImport = false
+                        return@TextButton
                     }
+                    original = importText.trim()
+                    note.original = importText.trim()
+                    note.refinedText = null  // сброс собранного текста от прошлого
+                    note.variants.clear(); note.history.clear(); note.historyIndex.clear()
+                    note.locked.clear()      // замки прежнего текста к новому не относятся
+                    // Вставленного текста НЕТ в аудиофайле (v136). Без этой пометки
+                    // «Обновить» в «Дословно» перераспознал бы аудио и молча стёр вставку.
+                    note.hasNonAudioText = true
+                    processor.reset(note.id)
+                    Diagnostics.action("Импорт текста (${importText.length} симв) для теста")
+                    onChanged()
+                    status = "Текст вставлен (${importText.trim().length} симв)"
+                    // Раньше после вставки ничего не запускалось — обработка стартует, как после записи.
+                    if (settings.useAI && settings.autoAi) startProcessingAll()
                     showImport = false
                 }) { Text("Вставить") }
             },
@@ -765,7 +845,8 @@ fun EditorScreen(
             text = {
                 Column {
                     Text("Тип: ${if (note.isLecture) "Лекция" else "Заметка"}")
-                    Text("Режим: ${if (note.recordMode == "google") "онлайн" else "офлайн"}")
+                    Text("Режим: " + when (note.recordMode) {
+                        "google" -> "онлайн"; "mixed" -> "смешанный (онлайн + офлайн)"; else -> "офлайн" })
                     Text("Создана: ${dateFmt.format(java.util.Date(note.createdAt))}")
                     Text("Слов: $words")
                     Text("Символов: ${note.original.length}")
@@ -822,6 +903,7 @@ fun EditorScreen(
                 Spacer(Modifier.width(8.dp))
                 val modeLabel = when {
                     note.isLecture -> "лекция"
+                    note.recordMode == "mixed" -> "смешанный"
                     note.recordMode == "google" -> "онлайн"
                     else -> "офлайн"
                 }
@@ -874,8 +956,8 @@ fun EditorScreen(
                     Text("Речь", fontSize = 11.sp, color = cs.onSurfaceVariant)
                     SegOffOn(
                         offSelected = !isOnline,
-                        onOff = { isOnline = false; note.recordMode = if (note.isLecture) "lecture" else "vosk"; Diagnostics.action("Речь → Офлайн") },
-                        onOn = { isOnline = true; note.recordMode = "google"; Diagnostics.action("Речь → Онлайн") }
+                        onOff = { isOnline = false; Diagnostics.action("Речь → Офлайн (режим самой заметки не меняем: он описывает уже записанный текст)") },
+                        onOn = { isOnline = true; Diagnostics.action("Речь → Онлайн (режим самой заметки не меняем: он описывает уже записанный текст)") }
                     )
                     Spacer(Modifier.width(4.dp))
                     // Работа со смыслом: Офлайн (локальный ИИ) / Онлайн (облачный)
@@ -1066,16 +1148,45 @@ fun EditorScreen(
                                     val histBusy = processor.isUpdating(note.id, level, tone)
                                     val canBack = note.canGoBack(level, tone) && !histBusy
                                     val canFwd = note.canGoForward(level, tone) && !histBusy
+                                    // Стрелки нажимаются ВСЕГДА (v136). Раньше у серой
+                                    // стрелки не было обработчика вовсе: палец попадает в
+                                    // кнопку, и ничего не происходит — ни подписи, ни следа
+                                    // в чёрном ящике. Теперь отказ тоже ответ, с причиной.
+                                    val versions = note.history[note.variantKey(level, tone)]?.size ?: 0
+                                    val histBlocked: (Boolean) -> Unit = { back ->
+                                        status = when {
+                                            histBusy -> "Идёт пересчёт этого варианта — подождите"
+                                            versions < 2 -> "Другой версии нет: этот вариант посчитан один раз"
+                                            back -> "Это самая первая версия"
+                                            else -> "Это самая последняя версия"
+                                        }
+                                        Diagnostics.action("История ($level/$tone): шаг ${if (back) "назад" else "вперёд"} " +
+                                            "невозможен — $status")
+                                    }
                                     Box(Modifier.size(width = 40.dp, height = 56.dp)
-                                        .clickable(enabled = canBack) {
-                                            note.goBack(level, tone); onChanged(); refreshTick++ },
+                                        .clickable {
+                                            if (!canBack) histBlocked(true)
+                                            else {
+                                                note.goBack(level, tone)
+                                                syncVerbatim(); onChanged(); refreshTick++
+                                                status = "Версия ${note.versionLabel(level, tone)}"
+                                                Diagnostics.action("История ($level/$tone): шаг назад")
+                                            }
+                                        },
                                         contentAlignment = Alignment.Center) {
                                         Icon(Icons.Filled.ChevronLeft, "Назад",
                                             tint = if (canBack) Color.White else Color.White.copy(alpha = 0.3f))
                                     }
                                     Box(Modifier.size(width = 40.dp, height = 56.dp)
-                                        .clickable(enabled = canFwd) {
-                                            note.goForward(level, tone); onChanged(); refreshTick++ },
+                                        .clickable {
+                                            if (!canFwd) histBlocked(false)
+                                            else {
+                                                note.goForward(level, tone)
+                                                syncVerbatim(); onChanged(); refreshTick++
+                                                status = "Версия ${note.versionLabel(level, tone)}"
+                                                Diagnostics.action("История ($level/$tone): шаг вперёд")
+                                            }
+                                        },
                                         contentAlignment = Alignment.Center) {
                                         Icon(Icons.Filled.ChevronRight, "Вперёд",
                                             tint = if (canFwd) Color.White else Color.White.copy(alpha = 0.3f))
@@ -1107,7 +1218,11 @@ fun EditorScreen(
                         // «ИИ» — запустить первичную обработку (только если смыслов ещё нет)
                         if (showAiBtn) {
                             FloatingActionButton(
-                                onClick = { if (!aiRunning) sendToAi() },
+                                onClick = {
+                                    Diagnostics.action("Тап ИИ: идёт обработка=$aiRunning")
+                                    if (!aiRunning) sendToAi()
+                                    else status = "Обработка уже идёт — дождитесь или отмените её"
+                                },
                                 containerColor = Palette.Amber,
                                 contentColor = Color.White
                             ) {
@@ -1167,7 +1282,11 @@ fun EditorScreen(
                         ToneStepper(
                             selected = toneIdx,
                             enabled = level != Level.VERBATIM,
-                            readyState = { i -> variantStateFor(note, processor, level, Tone.fromIndex(i)) }
+                            readyState = { i -> variantStateFor(note, processor, level, Tone.fromIndex(i)) },
+                            onBlocked = {
+                                status = "Тон меняет только смыслы — перейдите на «Чисто», «Кратко» или «Суть»"
+                                Diagnostics.action("Тон: нажатие на «Дословно» — тон здесь не применяется")
+                            }
                         ) { toneIdx = it }
                         Spacer(Modifier.height(6.dp))
                     }

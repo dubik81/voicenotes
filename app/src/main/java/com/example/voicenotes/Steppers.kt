@@ -72,6 +72,11 @@ fun LevelStepper(
     accent: Color,
     readyState: (Int) -> VariantProcessor.State,
     disabledLevels: Set<Int> = emptySet(),
+    // Что сказать, если по выключенной ступени всё-таки нажали (v136). Раньше у
+    // выключенной ступени вообще не было обработчика: палец попадает в кнопку, и НИЧЕГО
+    // не происходит — ни подписи, ни строки в чёрном ящике. Приложение должно отвечать
+    // всегда, даже отказом.
+    onBlocked: (Int) -> Unit = {},
     onSelect: (Int) -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
@@ -83,7 +88,7 @@ fun LevelStepper(
             Column(
                 Modifier.weight(1f).clip(RoundedCornerShape(10.dp))
                     .background(if (isSel) accent else cs.surfaceVariant)
-                    .then(if (disabled) Modifier else Modifier.clickable { onSelect(i) })
+                    .clickable { if (disabled) onBlocked(i) else onSelect(i) }
                     .alpha(if (disabled) 0.4f else 1f)
             ) {
                 Box(Modifier.fillMaxWidth().height(34.dp), contentAlignment = Alignment.Center) {
@@ -108,6 +113,7 @@ fun ToneStepper(
     selected: Int,
     enabled: Boolean,
     readyState: (Int) -> VariantProcessor.State,
+    onBlocked: (Int) -> Unit = {},
     onSelect: (Int) -> Unit
 ) {
     val cs = MaterialTheme.colorScheme
@@ -128,7 +134,7 @@ fun ToneStepper(
             Column(
                 Modifier.weight(1f).clip(RoundedCornerShape(8.dp))
                     .background(bg)
-                    .then(if (enabled) Modifier.clickable { onSelect(i) } else Modifier)
+                    .clickable { if (enabled) onSelect(i) else onBlocked(i) }
             ) {
                 Box(Modifier.fillMaxWidth().height(28.dp), contentAlignment = Alignment.Center) {
                     Text(

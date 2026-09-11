@@ -128,7 +128,7 @@ class VariantProcessor(
         for (tn in Tone.entries) {
             val cKey = "${Level.CLEAN.ordinal}:${tn.ordinal}"
             all[cKey]?.let { cand ->
-                val ok = verifyClean(stream, cand, "облако")
+                val ok = verifyClean(stream, cand, "облако", fullSource = text)
                 all[cKey] = ok ?: CleanProcessor.clean(text, note.recordMode == "google")
                 if (ok == null) engineOf["${Level.CLEAN.ordinal}"] = "правила (облако исказило)"
             }
@@ -186,7 +186,7 @@ class VariantProcessor(
      *   • выброшенный фрагмент (6+ слов подряд) — результат не принимается.
      * Так качество перестаёт зависеть от того, кто именно ответил.
      */
-    private fun verifyClean(source: String, candidate: String, who: String): String? {
+    private fun verifyClean(source: String, candidate: String, who: String, fullSource: String? = null): String? {
         val (fixed, rolled) = restoreWords(candidate, source)
         if (rolled > 0) Diagnostics.info("Защита слов ($who): откачено $rolled замен(ы)")
         val (lost, lostTxt) = longestLostRun(source, fixed)
@@ -202,6 +202,36 @@ class VariantProcessor(
         // примеры из архивов, где модель ставила точку посреди фразы.
         val merged = LocalAiEngine.mergeShortSentences(fixed)
         if (merged != fixed) Diagnostics.info("Чисто ($who): склеены обрывки предложений")
+        // ГЛАВНАЯ ПРОВЕРКА «ЧИСТО» (v138): границы предложений расставлены?
+        //
+        // Мы СНИМАЕМ машинную пунктуацию перед отправкой (иначе модель просто копирует
+        // чужие границы). Расплата: если модель их не вернула, на выходе получается тот
+        // же текст БЕЗ точек и заглавных — то есть заведомо хуже «Дословно». В тесте
+        // 136 это видно прямо: «Дословно» от Whisper — «Тестовая запись. Проверка после
+        // внесённых корректировок. Мне нужно наговорить…», а «Чисто» — тот же текст
+        // сплошным потоком. Раньше это принималось: слова-то все на месте.
+        //
+        // Считаем по исходному тексту ДО снятия пунктуации (fullSource): если там
+        // предложения были, в ответе их должно быть не меньше половины. Иначе работа
+        // не сделана — отдаём правилам, а те расставят пунктуацию по исходному тексту.
+        if (fullSource != null) {
+            val need = fullSource.count { it == '.' || it == '!' || it == '?' }
+            val got = merged.count { it == '.' || it == '!' || it == '?' }
+            if (need >= 2 && got * 2 < need) {
+                Diagnostics.error("Чисто ($who): границы предложений НЕ расставлены " +
+                    "($got знаков конца против $need в источнике) → отклонено, берём правила")
+                return null
+            }
+        }
+        // Ожидаемая плотность: примерно одно предложение на 12 слов. Если источник сам
+        // был без пунктуации (Vosk), сравнивать не с чем — смотрим на длину текста.
+        val words = Regex("[А-Яа-яЁёA-Za-z0-9]+").findAll(merged).count()
+        val dots = merged.count { it == '.' || it == '!' || it == '?' }
+        if (words > 30 && dots * 12 < words / 2) {
+            Diagnostics.error("Чисто ($who): $words слов и всего $dots предложени(я/й) — " +
+                "границы не расставлены → отклонено, берём правила")
+            return null
+        }
         return merged
     }
 
@@ -358,11 +388,16 @@ class VariantProcessor(
                 fixed
             })
         if (rolledTotal > 0) Diagnostics.engine("Чисто: защита слов вернула $rolledTotal слов(а) из Дословно")
-        return if (!res.isNullOrBlank() && res != text) {
+        // ОБЩАЯ ПРОВЕРКА (v138). До этого локальный путь имел только покусочные проверки,
+        // а итоговый текст не проверял ВООБЩЕ — verifyClean стоял лишь на облачном пути.
+        // Из-за этого «Чисто» выходило потоком слов без единой точки и принималось.
+        val checked = if (res.isNullOrBlank()) null
+                      else verifyClean(stream, res, "на устройстве", fullSource = text)
+        return if (!checked.isNullOrBlank() && checked != text) {
             // финальная косметика правилами (двойная пунктуация, заглавные)
-            Diagnostics.engine("Чисто: локальная модель (${res.length} симв из ${text.length})")
+            Diagnostics.engine("Чисто: локальная модель (${checked.length} симв из ${text.length})")
             lastEngine = localLabel()
-            Punctuator.capitalizeSentences(CleanProcessor.normalizePunct(res))
+            Punctuator.capitalizeSentences(CleanProcessor.normalizePunct(checked))
         } else {
             Diagnostics.engine("Чисто: модель не справилась → правила")
             lastEngine = "правила"
@@ -682,6 +717,10 @@ class VariantProcessor(
         fun neg(t: String) = Regex("\\b(не|ни|нельзя|невозможно|нет)\\b").findAll(t.lowercase()).count()
         val ns = neg(source); val nt = neg(text)
         if (ns >= 2 && nt < ns) s -= (ns - nt) * 30
+        // ДОБАВЛЕННОЕ «не» переворачивает смысл ровно так же, как потерянное. В тесте 136
+        // «Суть» пришла как «мама НЕ мыла раму, а ехал грека через реку» — в источнике
+        // отрицаний не было вовсе. Раньше это ничем не наказывалось.
+        if (nt > ns) s -= (nt - ns) * 40
         // 5. Заканчивается законченным предложением.
         if (!text.trim().endsWith(".") && !text.trim().endsWith("!") && !text.trim().endsWith("?")) s -= 40
         // 6. Соответствие длины задаче уровня.
@@ -782,6 +821,9 @@ class VariantProcessor(
     // снова становилась доступной, второй тап запускал ВТОРУЮ обработку поверх первой
     // (в логе 13:42:43 и 13:43:04 — два параллельных запроса к облаку), а сама работа
     // обрывалась вместе с экраном. Теперь состояние живёт здесь, на уровне приложения.
+    // Какую по счёту формулировку промпта выдали этой заметке (v138): «Обновить»
+    // перебирает их по кругу, иначе случайный выбор повторяется и текст не меняется.
+    private val varyCount = mutableMapOf<Long, Int>()
     private val updating = mutableStateMapOf<String, Boolean>()
     private val oneJobs = mutableMapOf<String, Job>()   // корутины пересчёта одного варианта
     fun isUpdating(noteId: Long, l: Level, t: Tone): Boolean = updating[k(noteId, l, t)] == true
@@ -811,6 +853,19 @@ class VariantProcessor(
             var finish = "неизвестно"
             try {
                 LocalAiEngine.beginNote(note.id, verbatimShown(note))
+                // ЧТО ИМЕННО УШЛО В ОБРАБОТКУ (v138). При «Обновить» такой строки не было
+                // вовсе — по архиву нельзя было понять, от какой версии «Дословно» считался
+                // текст. В тесте 136 из-за этого целый час ушёл на выяснение, почему
+                // пересчёт стал хуже: первичная обработка шла от версии Whisper, а все
+                // «Обновить» — от версии Vosk, на которую переключилась панель версий.
+                val vKey = note.variantKey(Level.VERBATIM, Tone.NEUTRAL)
+                val vNum = (note.historyIndex[vKey] ?: 0) + 1
+                val vAll = note.history[vKey]?.size ?: 1
+                val vEng = note.engineOf(Level.VERBATIM, Tone.NEUTRAL).ifBlank { "запись" }
+                val srcIn = sourceFor(note, l)
+                Diagnostics.info("Обновить ($l/$t): в обработку ушёл текст ${srcIn.length} симв " +
+                    "«${srcIn.take(50)}…»; Дословно показано версия $vNum из $vAll ($vEng, " +
+                    "${verbatimShown(note).length} симв)")
                 val text = computeOne(note, l, t, vary = true)
                 // ХРАПОВИК КАЧЕСТВА (v134): новый вариант принимается, только если он не
                 // ХУЖЕ текущего по нашим же метрикам. Раньше «Обновить» молча затирал
@@ -849,7 +904,14 @@ class VariantProcessor(
                 persist()
                 ok = true
                 finish = "успешно"
-                Diagnostics.engine("Обновлён вариант ($l/$t): ${text.length} симв, движок: $lastEngine")
+                // Честно: «обновлён» только если показанный текст реально сменился.
+                // Раньше строка писалась всегда, в том числе сразу после «новая версия
+                // не создана» — по логу выходило, что вариант обновился, а на экране
+                // ничего не менялось.
+                val nowShown = note.getVariant(l, t)
+                if (nowShown == text) Diagnostics.engine("Обновлён вариант ($l/$t): ${text.length} симв, движок: $lastEngine")
+                else Diagnostics.engine("Вариант ($l/$t) НЕ изменён: на экране прежний текст " +
+                    "(${nowShown?.length ?: 0} симв), новый (${text.length} симв) лежит в истории")
             } catch (e: kotlinx.coroutines.CancellationException) {
                 // Отмена — не ошибка, но пользователь должен видеть, что пересчёт прерван,
                 // а не «ничего не произошло».
@@ -889,6 +951,20 @@ class VariantProcessor(
      * Требование пользователя: кнопка «Обновить» работает ТОЛЬКО со своим уровнем,
      * прежний вариант остаётся видимым и обновляется по желанию.
      */
+    /**
+     * ДОЗАПИСЬ (v136): «Дословно» стало длиннее, значит ВСЕ смыслы посчитаны по старому,
+     * более короткому тексту. Текст у них не трогаем (он может быть хорош), но честно
+     * помечаем устаревшим — иначе человек видит «Кратко», в котором нет того, что он
+     * только что наговорил, и считает это ошибкой пересказа.
+     */
+    fun markStaleAllMeanings(note: Note) {
+        var n = 0
+        for (lv in listOf(Level.CLEAN, Level.BRIEF, Level.GIST)) for (tn in Tone.entries) {
+            if (note.getVariant(lv, tn) != null) { staleSet[k(note.id, lv, tn)] = true; n++ }
+        }
+        if (n > 0) Diagnostics.info("Дозапись: $n вариант(ов) помечены устаревшими (текст сохранён)")
+    }
+
     private fun markStaleBelow(note: Note, l: Level) {
         // v131: «Суть» больше НЕ зависит от «Кратко» (она считается от «Чисто»),
         // поэтому обновление «Кратко» её не устаревает — иначе мы помечали бы
@@ -959,7 +1035,16 @@ class VariantProcessor(
                         "Оформи эту речь как читаемый текст: границы предложений — по смыслу, " +
                             "неверно распознанные слова замени созвучными. Слова не выбрасывай. В ответе только текст."
                     )
-                    val idx = if (vary) prompts.indices.random() else 0
+                    // ПО КРУГУ, А НЕ СЛУЧАЙНО (v138). Было prompts.indices.random(), и в
+                    // тесте 136 подряд выпали №2, №3, №3, №2: два одинаковых промпта дали
+                    // один и тот же текст, новая версия не создалась, и нажатие «Обновить»
+                    // выглядело как «ничего не произошло». Теперь каждое нажатие берёт
+                    // СЛЕДУЮЩУЮ формулировку.
+                    val idx = if (vary) {
+                        val c = (varyCount[note.id] ?: 0) + 1
+                        varyCount[note.id] = c
+                        c % prompts.size
+                    } else 0
                     // В ЧЯ — какой именно вариант формулировки использован: без этого при
                     // разборе архива нельзя понять, почему два «Обновить» дали разное.
                     Diagnostics.info("Чисто: вариант промпта №${idx + 1} из ${prompts.size}" +
@@ -979,7 +1064,7 @@ class VariantProcessor(
                 Level.BRIEF, Level.GIST -> verifySummary(src, r0, "облако", l)
                     ?: run { lastEngine = "правила"; TextCondenser.condense(src, l) }
                 // «Чисто» из облака проходит ту же верификацию, что и локальное.
-                Level.CLEAN -> verifyClean(asrStream(src), r0, "облако")
+                Level.CLEAN -> verifyClean(asrStream(src), r0, "облако", fullSource = src)
                     ?: run { lastEngine = "правила"; CleanProcessor.clean(src, note.recordMode == "google") }
                 else -> r0
             }
